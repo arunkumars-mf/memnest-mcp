@@ -198,10 +198,16 @@ All data is ephemeral — lost on restart. Useful for testing.
 
 ## Kiro Power
 
-This server is also available as a [Kiro Power](https://github.com/arunkumars-mf/memnest-power) with:
-- Pre-configured MCP server
-- Three hooks for automatic memory persistence and recall
-- Steering files with setup guide and Cypher query examples
+This repo includes a ready-to-use [Kiro Power](./power/) in the `power/` directory with:
+
+- Pre-configured MCP server (`power/mcp.json`)
+- Three hooks for automatic memory persistence and recall (`power/hooks/`)
+  - **persist-memory** — stores important info when the agent stops
+  - **recall-memory** — searches memory before responding to each prompt
+  - **auto-dream** — manually trigger consolidation (prune + merge + review)
+- Steering files with setup guide and Cypher query examples (`power/steering/`)
+
+To install: copy or symlink the `power/` directory as a Kiro Power, or reference it in your workspace config.
 
 ## Architecture
 
