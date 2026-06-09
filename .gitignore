@@ -8,6 +8,7 @@ venv/
 .venv/
 *.egg
 .agent-memory/
+.memnest/
 
 # macOS / IDE detritus
 .DS_Store

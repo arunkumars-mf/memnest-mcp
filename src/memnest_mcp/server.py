@@ -56,7 +56,7 @@ logger = logging.getLogger("memnest")
 logger.addHandler(logging.NullHandler())
 
 # --- Configuration ---
-DB_PATH = os.environ.get("MEMORY_DB_PATH", os.path.expanduser("~/.memnest/memory.lbug"))
+DB_PATH = os.environ.get("MEMORY_DB_PATH", os.path.join(os.getcwd(), ".memnest", "memory.lbug"))
 EMBEDDING_MODEL = os.environ.get("MEMORY_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIM = int(os.environ.get("MEMORY_EMBEDDING_DIM", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92"))

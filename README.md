@@ -165,7 +165,7 @@ All settings are optional — defaults work out of the box.
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `MEMORY_DB_PATH` | `~/.memnest/memory.lbug` | LadybugDB database path. Use `:memory:` for ephemeral testing |
+| `MEMORY_DB_PATH` | `.memnest/memory.lbug` (in cwd) | LadybugDB database path. Use `:memory:` for ephemeral testing |
 | `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic similarity threshold for auto-dedup |
 | `MEMORY_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed model for embeddings |
 | `MEMORY_EMBEDDING_DIM` | `384` | Embedding dimension (must match model) |
@@ -243,8 +243,8 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 
 ### 0.3.0
 
-- Default database directory is `~/.memnest/`.
-- Set `MEMORY_DB_PATH` to use a custom location.
+- Default database is now per-workspace: `.memnest/memory.lbug` in the current directory. No more cross-workspace lock conflicts.
+- Set `MEMORY_DB_PATH` to use a custom location (e.g. `~/.memnest/memory.lbug` for global shared memory).
 - Hybrid search: Vector (HNSW) + Full-text (BM25) + Graph scoring with PageRank, Louvain community detection, and K-Core decomposition.
 - LOCOMO benchmark: 82.9% overall score.
 

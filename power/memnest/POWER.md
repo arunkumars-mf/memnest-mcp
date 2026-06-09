@@ -41,7 +41,7 @@ memory, agent memory, persistent memory, graph memory, knowledge graph, vector s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_DB_PATH` | `~/.memnest/memory.lbug` | Database file path. Use `:memory:` for testing |
+| `MEMORY_DB_PATH` | `.memnest/memory.lbug` (in cwd) | Database file path. Use `:memory:` for testing |
 | `MEMORY_WORKSPACE` | Current directory | Scope memories per project |
 | `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic similarity threshold for dedup |
 | `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
