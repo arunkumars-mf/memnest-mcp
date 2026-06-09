@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "memnest": {
+    "memory-mcp": {
       "command": "uvx",
       "args": ["memnest-mcp@latest"],
       "env": {
