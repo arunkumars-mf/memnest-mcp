@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "ladybug-memory-mcp"
-version = "0.1.0"
+name = "memnest-mcp"
+version = "0.3.0"
 description = "Persistent graph memory MCP server for AI agents using LadybugDB"
 readme = "README.md"
 license = "MIT"
@@ -24,10 +24,13 @@ dependencies = [
     "mcp>=1.0.0",
     "fastembed>=0.3.0",
     "real-ladybug>=0.15.0",
+    # toon-format is a beta dependency. Pin to a known-good version to avoid
+    # silent API drift from upstream beta releases.
+    "toon-format==0.9.0b1",
 ]
 
 [project.scripts]
-ladybug-memory-mcp = "ladybug_memory_mcp.server:main"
+memnest-mcp = "memnest_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ladybug_memory_mcp"]
+packages = ["src/memnest_mcp"]

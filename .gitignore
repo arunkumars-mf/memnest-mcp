@@ -8,3 +8,14 @@ venv/
 .venv/
 *.egg
 .agent-memory/
+
+# macOS / IDE detritus
+.DS_Store
+.kiro/
+.pytest_cache/
+.tmp_*
+*.bak
+# Benchmark results (regenerate with: python benchmark/run_benchmark.py)
+benchmark/results/dbs/
+benchmark/results/*.json
+benchmark/results/*.txt

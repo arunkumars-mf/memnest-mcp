@@ -1,0 +1,34 @@
+{
+  "by_category": {
+    "temporal": {
+      "correct": 31,
+      "total": 37,
+      "score_pct": 83.78
+    },
+    "multi_hop": {
+      "correct": 11,
+      "total": 13,
+      "score_pct": 84.62
+    },
+    "single_hop": {
+      "correct": 23,
+      "total": 32,
+      "score_pct": 71.88
+    },
+    "open_domain": {
+      "correct": 58,
+      "total": 70,
+      "score_pct": 82.86
+    },
+    "adversarial": {
+      "correct": 38,
+      "total": 47,
+      "score_pct": 80.85
+    }
+  },
+  "overall": {
+    "correct": 161,
+    "total": 199,
+    "score_pct": 80.9
+  }
+}

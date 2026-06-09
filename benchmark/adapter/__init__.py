@@ -1,0 +1,1 @@
+"""Memnest LOCOMO benchmark adapter."""
