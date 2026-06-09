@@ -2818,9 +2818,16 @@ def main():
         )
 
     # Log resolved configuration so users see what's active
+    from importlib.metadata import version as pkg_version
+    try:
+        _version = pkg_version("memnest-mcp")
+    except Exception:
+        _version = "dev"
+
     ws_default_warning = ""
     if "MEMORY_WORKSPACE" not in os.environ:
         ws_default_warning = " (WARNING: MEMORY_WORKSPACE not set, using cwd)"
+    logger.info(f"Memnest MCP v{_version}")
     logger.info(f"Configuration:")
     logger.info(f"  DB_PATH        = {DB_PATH}")
     logger.info(f"  WORKSPACE      = {WORKSPACE}{ws_default_warning}")
