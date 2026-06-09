@@ -65,7 +65,7 @@ Add to your MCP client config (Kiro, Claude Desktop, Cursor, etc.):
   "mcpServers": {
     "memnest": {
       "command": "uvx",
-      "args": ["memnest-mcp@latest"],
+      "args": ["--prerelease=allow", "memnest-mcp@latest"],
       "env": {
         "FASTMCP_LOG_LEVEL": "ERROR"
       }
