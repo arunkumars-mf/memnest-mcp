@@ -56,7 +56,32 @@ logger = logging.getLogger("memnest")
 logger.addHandler(logging.NullHandler())
 
 # --- Configuration ---
-DB_PATH = os.environ.get("MEMORY_DB_PATH", os.path.join(os.getcwd(), ".memnest", "memory.lbug"))
+def _resolve_db_path() -> str:
+    """Determine the database path with sensible fallbacks.
+    
+    Priority:
+    1. MEMORY_DB_PATH env var (explicit override)
+    2. MEMORY_WORKSPACE/.memnest/memory.lbug (workspace-scoped)
+    3. cwd/.memnest/memory.lbug (if cwd is writable and not '/')
+    4. ~/.memnest/memory.lbug (global fallback)
+    """
+    explicit = os.environ.get("MEMORY_DB_PATH")
+    if explicit:
+        return explicit
+    
+    workspace = os.environ.get("MEMORY_WORKSPACE", "")
+    if workspace and workspace != "/":
+        return os.path.join(workspace, ".memnest", "memory.lbug")
+    
+    cwd = os.getcwd()
+    if cwd != "/" and os.access(cwd, os.W_OK):
+        return os.path.join(cwd, ".memnest", "memory.lbug")
+    
+    # Global fallback
+    return os.path.expanduser("~/.memnest/memory.lbug")
+
+
+DB_PATH = _resolve_db_path()
 EMBEDDING_MODEL = os.environ.get("MEMORY_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIM = int(os.environ.get("MEMORY_EMBEDDING_DIM", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92"))
