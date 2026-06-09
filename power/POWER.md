@@ -1,3 +1,11 @@
+---
+name: "memnest"
+displayName: "Memnest Memory"
+description: "Persistent graph memory for AI agents — hybrid vector + full-text + graph search powered by LadybugDB. Scores 82.9% on LOCOMO benchmark. Zero LLM calls in the server."
+keywords: ["memory", "agent memory", "persistent memory", "graph memory", "knowledge graph", "vector search", "mcp", "recall", "context", "ladybugdb"]
+author: "arunkse"
+---
+
 # Memnest Memory
 
 Persistent graph memory for AI agents — powered by LadybugDB with hybrid vector + full-text + graph search.
