@@ -1,4 +1,4 @@
-name: Publish to PyPI & GitHub Releases
+name: GitHub Release
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write  # needed for GitHub Release creation
+  contents: write
 
 jobs:
   build:
@@ -23,47 +23,6 @@ jobs:
 
       - name: Build sdist and wheel
         run: python -m build
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-  publish-pypi:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install twine
-        run: pip install twine
-
-      - name: Publish to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: twine upload dist/*
-
-  publish-github:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
