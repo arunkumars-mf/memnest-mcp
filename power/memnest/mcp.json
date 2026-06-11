@@ -2,7 +2,7 @@
   "mcpServers": {
     "memory-mcp": {
       "command": "uvx",
-      "args": ["--prerelease=allow", "memnest-mcp@latest"],
+      "args": ["memnest-mcp@latest"],
       "env": {
         "FASTMCP_LOG_LEVEL": "ERROR"
       },

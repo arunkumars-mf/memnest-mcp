@@ -65,7 +65,7 @@ Add to your MCP client config (Kiro, Claude Desktop, Cursor, etc.):
   "mcpServers": {
     "memnest": {
       "command": "uvx",
-      "args": ["--prerelease=allow", "memnest-mcp@latest"],
+      "args": ["memnest-mcp@latest"],
       "env": {
         "FASTMCP_LOG_LEVEL": "ERROR"
       }
@@ -230,6 +230,31 @@ AI Agent (Kiro, Claude, etc.)
 - Python 3.10+
 - Dependencies installed automatically: `real-ladybug`, `fastembed`, `mcp`
 - ~130MB disk for the embedding model (downloaded on first run)
+
+## TOON Format (Optional)
+
+Memnest supports [TOON](https://toonformat.dev/) (Token-Oriented Object Notation) as a response format, reducing token usage by 30–60% compared to JSON. This is useful when memory results are fed back into LLM context.
+
+TOON is **optional** — the server falls back to compact JSON automatically if the package isn't installed. To enable it:
+
+```bash
+pip install "memnest-mcp[toon]"
+```
+
+Or with uvx (requires the `--prerelease=allow` flag since `toon-format` is currently in beta):
+
+```bash
+uvx --prerelease=allow --with "toon-format==0.9.0b1" memnest-mcp@latest
+```
+
+To switch formats at runtime, set the environment variable:
+
+```bash
+MEMORY_RESPONSE_FORMAT=toon   # compact, token-efficient (default when installed)
+MEMORY_RESPONSE_FORMAT=json   # standard JSON (default when toon is not installed)
+```
+
+The official Python implementation of TOON is [toon-format/toon-python](https://github.com/toon-format/toon-python), currently at v0.9.0-beta.1. Once it reaches a stable 1.0 release, the `--prerelease=allow` flag will no longer be necessary.
 
 ## Contributing
 

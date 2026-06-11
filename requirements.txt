@@ -1,7 +1,6 @@
 # Auto-generated mirror of [project.dependencies] in pyproject.toml.
 # Use `pip install .` (or `uv pip install -e .`) for the canonical install;
 # this file is kept for tooling that pre-dates pyproject.toml.
-mcp>=1.0.0
+mcp>=1.0.0,<2
 fastembed>=0.3.0
 real-ladybug>=0.15.0
-toon-format==0.9.0b1
