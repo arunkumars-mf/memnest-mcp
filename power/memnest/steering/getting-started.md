@@ -177,3 +177,13 @@ Three layers — you don't need to check manually:
 ## Workspace Scoping
 
 Memories are scoped to the current workspace (project directory). Pass `global_search=True` to search across all workspaces. Cross-workspace memories still appear in graph traversals.
+
+The workspace is auto-detected: explicit `MEMORY_WORKSPACE` env var, then the MCP client's workspace root (roots/list), then the server's cwd. The database lives at `<workspace>/.memnest/memory.lbug`.
+
+**Verify scoping at the start of a session**: call `memory_stats()` and check the `workspace` field plus `runtime.workspace_source`. If `workspace` is `''` or doesn't match the current project (auto-detection can fail on clients that launch servers from `/` without roots support), pin it yourself:
+
+```
+memory_set_workspace(path="/absolute/path/to/current/project")
+```
+
+This re-homes the database to that project's `.memnest/` directory. Memories stored before the switch stay in the previous database file.

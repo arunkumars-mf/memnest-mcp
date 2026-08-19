@@ -120,16 +120,30 @@ def _resolve_workspace() -> str:
     A workspace of '/' is never legitimate: it would silently merge all
     projects into one shared scope while looking like a real path.
     """
+    global _workspace_source
     workspace = os.environ.get("MEMORY_WORKSPACE", "")
     if workspace and workspace != "/" and not _looks_unsubstituted(workspace):
+        _workspace_source = "env"
         return workspace
 
     cwd = os.getcwd()
     if cwd != "/":
+        _workspace_source = "cwd"
         return cwd
 
+    _workspace_source = "global"
     return ""
 
+
+try:
+    from importlib.metadata import version as _pkg_version
+    SERVER_VERSION = _pkg_version("memnest-mcp")
+except Exception:  # pragma: no cover - dev checkouts without install
+    SERVER_VERSION = "unknown"
+
+# How the current WORKSPACE value was determined:
+# env | cwd | global | roots | manual (see memory_set_workspace)
+_workspace_source: str = "unset"
 
 # WORKSPACE must be resolved before DB_PATH: the DB path derives from it.
 # Both are re-resolved at first connection (get_conn) once the client's
@@ -195,6 +209,12 @@ _roots_attempts: int = 0
 _ROOTS_MAX_ATTEMPTS = 3
 _roots_lock = anyio.Lock()
 
+# Diagnostics captured during adoption, surfaced via memory_stats.runtime so
+# a single stats call answers "which client is this, does it support roots,
+# and why is the workspace what it is?"
+_client_info: Optional[dict] = None
+_client_supports_roots: Optional[bool] = None
+
 
 def _file_uri_to_path(uri) -> Optional[str]:
     """Convert a file:// URI to a local filesystem path, or None if not file://."""
@@ -231,7 +251,8 @@ async def _adopt_client_workspace() -> None:
     (timeouts, transport hiccups) retry up to the attempt cap. When no root
     is adopted, the static _resolve_workspace() baseline stays in effect.
     """
-    global _roots_done, _roots_attempts, WORKSPACE
+    global _roots_done, _roots_attempts, WORKSPACE, _workspace_source
+    global _client_info, _client_supports_roots
     if _roots_done:
         return
 
@@ -252,10 +273,22 @@ async def _adopt_client_workspace() -> None:
         try:
             ctx = mcp.get_context()
             session = ctx.session
-            if not session.check_client_capability(
+
+            # Record who we're talking to — this shows up in memory_stats
+            # so workspace problems can be diagnosed with one call.
+            params = getattr(session, "client_params", None)
+            ci = getattr(params, "clientInfo", None)
+            if ci is not None:
+                _client_info = {"name": ci.name, "version": ci.version}
+
+            _client_supports_roots = session.check_client_capability(
                 mcp_types.ClientCapabilities(roots=mcp_types.RootsCapability())
-            ):
-                logger.debug("MCP client does not support roots; keeping static workspace")
+            )
+            if not _client_supports_roots:
+                logger.info(
+                    "MCP client does not advertise roots support; workspace "
+                    "stays static (use memory_set_workspace to pin one)"
+                )
                 _roots_done = True
                 return
             with anyio.fail_after(5):
@@ -264,6 +297,7 @@ async def _adopt_client_workspace() -> None:
                 path = _file_uri_to_path(root.uri)
                 if path and path != "/":
                     WORKSPACE = path
+                    _workspace_source = "roots"
                     logger.info(f"Workspace adopted from MCP client root: {path}")
                     break
             else:
@@ -1980,6 +2014,83 @@ def memory_stats() -> str:
             "hours_since": round(hours_since_dream, 1) if hours_since_dream is not None else None,
             "due": dream_due,
         },
+        "runtime": {
+            "version": SERVER_VERSION,
+            "db_path": DB_PATH,
+            "workspace_source": _workspace_source,
+            "client": _client_info,
+            "client_supports_roots": _client_supports_roots,
+            "roots_adoption": {"done": _roots_done, "attempts": _roots_attempts},
+        },
+    }
+
+
+@mcp.tool()
+@_timed("memory_set_workspace")
+def memory_set_workspace(path: str) -> str:
+    """Pin the workspace scope (and database location) to a directory.
+
+    Use when auto-detection failed — memory_stats shows workspace '' or a
+    path that doesn't match the current project (check runtime.workspace_source
+    there). The agent always knows its workspace; the server sometimes can't
+    discover it (client without roots support, launched from '/').
+
+    If the database is already open, it is closed and reopened at
+    <path>/.memnest/memory.lbug (unless MEMORY_DB_PATH pins a file, in which
+    case only the workspace tag changes). Memories stored before the switch
+    stay in the previous database file.
+    """
+    global WORKSPACE, DB_PATH, _workspace_source, _roots_done, _conn, _db
+
+    env_ws = os.environ.get("MEMORY_WORKSPACE", "")
+    if env_ws and env_ws != "/" and not _looks_unsubstituted(env_ws):
+        return {
+            "status": "error",
+            "error": f"MEMORY_WORKSPACE is explicitly set to {env_ws!r} in the "
+                     f"server config; that always wins. Change the config to move.",
+        }
+
+    p = os.path.abspath(os.path.expanduser(path))
+    if _looks_unsubstituted(path):
+        return {"status": "error", "error": f"Unexpanded placeholder in path: {path}"}
+    if p == "/":
+        return {"status": "error", "error": "Refusing '/' as a workspace scope"}
+    if not os.path.isdir(p):
+        return {"status": "error", "error": f"Not a directory: {p}"}
+
+    _roots_done = True  # an explicit instruction outranks further adoption
+    if p == WORKSPACE:
+        return {"status": "unchanged", "workspace": WORKSPACE, "db_path": DB_PATH}
+
+    previous_db = DB_PATH
+    WORKSPACE = p
+    _workspace_source = "manual"
+
+    # Relocate the database unless it's in-memory (nothing to relocate —
+    # closing would discard data) or pinned by MEMORY_DB_PATH (get_conn
+    # re-resolves to the same file; only the workspace tag changes).
+    db_reopened = False
+    if _conn is not None and DB_PATH != ":memory:":
+        try:
+            _conn.close()
+        except Exception as e:
+            logger.debug(f"Connection close during workspace switch: {e}")
+        try:
+            if _db is not None:
+                _db.close()
+        except Exception as e:
+            logger.debug(f"Database close during workspace switch: {e}")
+        _conn = None
+        _db = None
+        get_conn()  # reopen eagerly so failures surface here, not later
+        db_reopened = True
+
+    return {
+        "status": "ok",
+        "workspace": WORKSPACE,
+        "db_path": DB_PATH,
+        "previous_db_path": previous_db if db_reopened else None,
+        "db_reopened": db_reopened,
     }
 
 

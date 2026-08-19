@@ -21,7 +21,8 @@
         "memory_graph_html",
         "memory_get",
         "memory_list",
-        "memory_traverse"
+        "memory_traverse",
+        "memory_set_workspace"
       ]
     }
   }
