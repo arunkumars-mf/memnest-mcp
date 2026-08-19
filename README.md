@@ -202,7 +202,7 @@ This repo includes a ready-to-use [Kiro Power](./power/memnest/) in the `power/m
 
 - Plugin manifest with activation keywords (`power/memnest/plugin.json`)
 - Pre-configured MCP server (`power/memnest/mcp.json`)
-- Three Kiro hooks for automatic memory persistence and recall (`power/memnest/dev.kiro/hooks/`)
+- Three Kiro IDE hooks for automatic memory persistence and recall (`power/memnest/dev.kiro/hooks/` — IDE-only; on Kiro Web/CLI the agent follows the same workflow from the getting-started skill)
   - **persist-memory** — stores important info when the agent stops
   - **recall-memory** — searches memory before responding to each prompt
   - **auto-dream** — manually trigger consolidation (prune + merge + review)

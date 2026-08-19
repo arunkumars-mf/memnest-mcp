@@ -26,6 +26,8 @@ You have access to persistent long-term memory via the Memnest MCP server. Memor
 3. **Persist** — After the conversation, store new important information
 4. **Consolidate** — Periodically run `memory_dream` to prune, merge, and recompute graph scores
 
+In the Kiro IDE, the bundled hooks (`dev.kiro/hooks/`) trigger recall and persist automatically. On clients without hook support (Kiro Web, CLI, other Agent Plugins hosts), follow this workflow manually — recall at the start of a task, persist at the end.
+
 ## Step-by-Step Guide
 
 ### Step 1: Verify workspace scoping (start of session)
