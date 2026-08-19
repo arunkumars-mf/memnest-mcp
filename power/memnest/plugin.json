@@ -1,0 +1,46 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "memnest",
+  "version": "1.0.0",
+  "description": "Memnest Memory — persistent graph memory for AI agents with hybrid vector + full-text + graph search powered by LadybugDB. Scores 82.9% on the LOCOMO benchmark. Zero LLM calls in the server.",
+  "author": {
+    "name": "arunkse",
+    "url": "https://github.com/arunkumars-mf"
+  },
+  "keywords": [
+    "memory",
+    "agent memory",
+    "persistent memory",
+    "graph memory",
+    "knowledge graph",
+    "vector search",
+    "mcp",
+    "recall",
+    "context",
+    "ladybugdb"
+  ],
+  "homepage": "https://github.com/arunkumars-mf/memnest-mcp",
+  "repository": "https://github.com/arunkumars-mf/memnest-mcp",
+  "license": "MIT",
+  "extensions": {
+    "dev.kiro": {
+      "autoApprove": [
+        "memory_store",
+        "memory_search",
+        "memory_update",
+        "memory_delete",
+        "memory_relate",
+        "memory_dream",
+        "memory_query",
+        "memory_schema",
+        "memory_topics",
+        "memory_stats",
+        "memory_graph_html",
+        "memory_get",
+        "memory_list",
+        "memory_traverse",
+        "memory_set_workspace"
+      ]
+    }
+  }
+}

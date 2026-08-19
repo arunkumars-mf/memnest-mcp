@@ -198,14 +198,15 @@ All data is ephemeral — lost on restart. Useful for testing.
 
 ## Kiro Power
 
-This repo includes a ready-to-use [Kiro Power](./power/memnest/) in the `power/memnest/` directory with:
+This repo includes a ready-to-use [Kiro Power](./power/memnest/) in the `power/memnest/` directory, packaged in the [Agent Plugins](https://agent-plugins.org/) v1.0.0 format with:
 
+- Plugin manifest with activation keywords (`power/memnest/plugin.json`)
 - Pre-configured MCP server (`power/memnest/mcp.json`)
-- Three hooks for automatic memory persistence and recall (`power/memnest/hooks/`)
+- Three Kiro hooks for automatic memory persistence and recall (`power/memnest/dev.kiro/hooks/`)
   - **persist-memory** — stores important info when the agent stops
   - **recall-memory** — searches memory before responding to each prompt
   - **auto-dream** — manually trigger consolidation (prune + merge + review)
-- Steering files with setup guide and Cypher query examples (`power/memnest/steering/`)
+- Agent Skills with the setup guide and Cypher query examples (`power/memnest/skills/`)
 
 **Install in Kiro:** Add Custom Power → `https://github.com/arunkumars-mf/memnest-mcp/tree/main/power/memnest`
 

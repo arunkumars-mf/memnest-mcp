@@ -1,14 +1,35 @@
 ---
-inclusion: manual
+name: "graph-queries"
+description: "Run Cypher graph queries against Memnest memory — traversals, correction chains, PageRank/Louvain analytics, workspace-scoped queries. Use when memory_search is not enough and you need graph traversal, aggregation, or relationship-based filtering."
+license: "MIT"
+metadata:
+  author: "arunkse"
+  version: "1.0.0"
 ---
 
-# Memnest — Graph Query Examples
+# Memnest — Graph Queries
 
 ## Overview
 
-Memnest stores memories as a graph with typed relationships. Use `memory_query` for complex traversals that go beyond what `memory_search` provides.
+Memnest stores memories as a graph with typed relationships. Use `memory_query` for complex traversals that go beyond what `memory_search` provides. For most use cases, `memory_search` is sufficient — reach for Cypher only when you need graph traversal, aggregation, or relationship-based filtering.
 
-**Note:** For most use cases, `memory_search` is sufficient. Use `memory_query` only when you need graph traversal, aggregation, or relationship-based filtering.
+## Prerequisites Checklist
+
+- [ ] Call `memory_schema()` first to get live table/column names
+- [ ] Use `read_only=True` for exploration (rejects DELETE/DROP/TRUNCATE)
+- [ ] Never SET `m.embedding` via Cypher (fails silently due to the HNSW vector index) — use `memory_update` for content changes
+
+## Graph Data Model
+
+```
+(:Memory) — content, embedding, category, tags, importance, timestamps
+(:Topic)  — auto-created from tags
+
+(:Memory)-[:ABOUT]->(:Topic)
+(:Memory)-[:RELATED_TO]->(:Memory)
+(:Memory)-[:SUPERSEDES]->(:Memory)
+(:Memory)-[:EXPLAINS]->(:Memory)
+```
 
 ## Common Queries
 
@@ -171,3 +192,17 @@ CALL k_core('Memory', 'RELATED_TO')
 RETURN node.id, node.content, core_number
 ORDER BY core_number DESC;
 ```
+
+## Troubleshooting
+
+### Query rejected as destructive
+
+`memory_traverse` and `read_only=True` always reject DELETE/DROP/TRUNCATE. Use `memory_query` without `read_only` for writes; destructive operations additionally require `MEMORY_ALLOW_DESTRUCTIVE=true`.
+
+### SET on m.embedding has no effect
+
+The HNSW vector index makes direct embedding writes fail. Use `memory_update` — it recreates the node with a fresh embedding while preserving relationships.
+
+### pagerank/community_id/k_degree are NULL
+
+Graph scores are computed by `memory_dream`. Run `memory_dream(force=True)` to populate them.

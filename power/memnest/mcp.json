@@ -1,29 +1,13 @@
 {
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
   "mcpServers": {
     "memory-mcp": {
+      "type": "stdio",
       "command": "uvx",
       "args": ["memnest-mcp@latest"],
       "env": {
         "FASTMCP_LOG_LEVEL": "ERROR"
-      },
-      "disabled": false,
-      "autoApprove": [
-        "memory_store",
-        "memory_search",
-        "memory_update",
-        "memory_delete",
-        "memory_relate",
-        "memory_dream",
-        "memory_query",
-        "memory_schema",
-        "memory_topics",
-        "memory_stats",
-        "memory_graph_html",
-        "memory_get",
-        "memory_list",
-        "memory_traverse",
-        "memory_set_workspace"
-      ]
+      }
     }
   }
 }

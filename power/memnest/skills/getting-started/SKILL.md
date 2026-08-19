@@ -1,12 +1,23 @@
 ---
-inclusion: auto
+name: "getting-started"
+description: "Use Memnest persistent memory — recall context before responding, store learnings after tasks, verify workspace scoping. Use when working with agent memory, recalling past context, or storing preferences, decisions, and learnings."
+license: "MIT"
+metadata:
+  author: "arunkse"
+  version: "1.0.0"
 ---
 
 # Memnest Memory — Getting Started
 
 ## Overview
 
-You have access to persistent long-term memory via the Memnest MCP server. Memory persists across sessions and is scoped to the current workspace by default. The system uses hybrid search (vector + full-text + graph algorithms) scoring 82.9% on the LOCOMO benchmark.
+You have access to persistent long-term memory via the Memnest MCP server. Memory persists across sessions and is scoped to the current workspace by default. The system uses hybrid search (vector + full-text + graph algorithms) scoring 82.9% on the LOCOMO benchmark. Zero LLM calls in the server — all intelligence lives in the agent.
+
+## Prerequisites Checklist
+
+- [ ] Python 3.10+ available (`uvx` runs the server automatically)
+- [ ] ~130MB disk for the embedding model (auto-downloaded on first run)
+- [ ] No Docker, no external services required
 
 ## Core Workflow
 
@@ -15,9 +26,23 @@ You have access to persistent long-term memory via the Memnest MCP server. Memor
 3. **Persist** — After the conversation, store new important information
 4. **Consolidate** — Periodically run `memory_dream` to prune, merge, and recompute graph scores
 
-## Tool Quick Reference
+## Step-by-Step Guide
 
-### memory_search (primary retrieval tool)
+### Step 1: Verify workspace scoping (start of session)
+
+Call `memory_stats()` and check the `workspace` field plus `runtime.workspace_source`. The workspace is auto-detected: explicit `MEMORY_WORKSPACE` env var, then the MCP client's workspace root (roots/list), then the server's cwd. The database lives at `<workspace>/.memnest/memory.lbug`.
+
+If `workspace` is `''` or doesn't match the current project (auto-detection can fail on clients that launch servers from `/` without roots support), pin it yourself:
+
+```
+memory_set_workspace(path="/absolute/path/to/current/project")
+```
+
+This re-homes the database to that project's `.memnest/` directory. Memories stored before the switch stay in the previous database file.
+
+### Step 2: Recall relevant context
+
+`memory_search` is the primary retrieval tool:
 
 ```
 memory_search(query="user's tech stack preferences", top_k=5, preview_chars=300)
@@ -31,16 +56,19 @@ Hybrid scoring pipeline:
 - **Recency** (10%) — Exponential decay, 30-day half-life
 - **Importance** (5%) — User-assigned 1-5 normalized
 
-**Tips:**
-- Use natural language queries — vector component handles semantic matching
+Tips:
+- Use natural language queries — the vector component handles semantic matching
 - Add `tags=["python", "backend"]` to disambiguate overloaded terms (e.g. "workspace" could mean Brazil, Kiro, or ATX)
 - Set `global_search=True` to search across all workspaces
 - Adjust `preview_chars` (default 200) if you need more context per result
 - `top_k` caps at 10; use 5 for focused retrieval, 10 when exploring
+- Use `memory_get(memory_id=42)` for full untruncated content after search returns previews
+- Use `memory_topics(limit=20, min_count=2)` to discover existing tag filters
 
-### memory_store (persist new information)
+### Step 3: Store new information
 
 Single mode:
+
 ```
 memory_store(
     content="User prefers Python for backend, TypeScript for frontend",
@@ -50,7 +78,8 @@ memory_store(
 )
 ```
 
-**Batch mode** (faster — single embedding call for all items):
+Batch mode (faster — single embedding call for all items):
+
 ```
 memory_store(items=[
     {"content": "CDK uses NpmPrettyMuch for deps", "category": "learning", "tags": ["cdk", "npm", "brazil"], "importance": 3},
@@ -59,16 +88,16 @@ memory_store(items=[
 ])
 ```
 
-**Categories:**
+Categories:
 - `learning` — Facts, how things work, technical knowledge
 - `preference` — User choices and style preferences
 - `decision` — Architecture decisions with rationale (high importance)
 - `pattern` — Recurring workflows, conventions
 - `general` — Everything else (default)
 
-**Importance:** 1=trivial, 2=low, 3=neutral (default), 4=important, 5=critical
+Importance: 1=trivial, 2=low, 3=neutral (default), 4=important, 5=critical
 
-### memory_relate (link memories in the graph)
+### Step 4: Link related memories
 
 ```
 memory_relate(from_id=10, to_id=5, relationship="RELATED_TO", confidence=0.9)
@@ -76,12 +105,13 @@ memory_relate(from_id=10, to_id=3, relationship="SUPERSEDES")  # 10 replaces 3
 memory_relate(from_id=10, to_id=7, relationship="EXPLAINS")    # 10 explains 7
 ```
 
-**Relationship types:**
+Relationship types:
 - `RELATED_TO` — General association. Accepts `confidence` (0-1) and `provenance` (EXTRACTED|INFERRED|AMBIGUOUS)
 - `SUPERSEDES` — Newer memory corrects/replaces older. Creates a correction chain.
 - `EXPLAINS` — One memory explains/elaborates another
 
-**Batch mode:**
+Batch mode:
+
 ```
 memory_relate(relations=[
     {"from_id": 10, "to_id": 5, "relationship": "RELATED_TO", "confidence": 0.8},
@@ -89,21 +119,17 @@ memory_relate(relations=[
 ])
 ```
 
-### memory_update (modify existing)
+### Step 5: Update or delete
 
 ```
 memory_update(memory_id=42, content="Updated preference", importance=5, tags=["new-tag"])
+memory_update(updates=[{"memory_id": 42, "importance": 5}, {"memory_id": 43, "tags": ["deprecated"], "importance": 1}])
+memory_delete(memory_id=42)
 ```
 
-Batch mode:
-```
-memory_update(updates=[
-    {"memory_id": 42, "importance": 5},
-    {"memory_id": 43, "tags": ["deprecated"], "importance": 1}
-])
-```
+Updates preserve relationships across content changes.
 
-### memory_dream (consolidation + graph recomputation)
+### Step 6: Consolidate periodically
 
 ```
 memory_dream(dry_run=True)   # Preview what would happen
@@ -119,33 +145,9 @@ What it does:
 
 Auto-triggers: 10+ operations AND 24h since last run. Use `force=True` to override.
 
-### memory_get (full content by ID)
-
-```
-memory_get(memory_id=42)
-```
-
-Returns untruncated content + metadata. Use after search returns truncated previews.
-
-### memory_topics (discover tags)
-
-```
-memory_topics(limit=20, min_count=2)
-```
-
-Lists all topics (tags) with memory counts. Use to discover available tag filters for search.
-
-### memory_stats (health check)
-
-```
-memory_stats()
-```
-
-Returns total counts, category distribution, importance distribution, top topics, and graph metrics.
-
 ## What to Store
 
-**Do store:**
+Do store:
 - User preferences and choices (importance 4-5)
 - Technical decisions with rationale (importance 4-5)
 - Bug root causes and fixes (importance 3-4)
@@ -153,7 +155,7 @@ Returns total counts, category distribution, importance distribution, top topics
 - Package-specific gotchas and workflows (importance 3)
 - Recurring patterns the user follows (importance 3)
 
-**Don't store:**
+Don't store:
 - Routine greetings and acknowledgments
 - Ephemeral details (today's weather, current time)
 - Information already in project files (code, configs)
@@ -174,16 +176,33 @@ Three layers — you don't need to check manually:
 2. **Semantic** — Cosine similarity > 0.92 auto-merges (keeps longer content, merges tags)
 3. **Dream** — Periodic consolidation handles near-duplicates at 0.95+
 
-## Workspace Scoping
+## Configuration Reference
 
-Memories are scoped to the current workspace (project directory). Pass `global_search=True` to search across all workspaces. Cross-workspace memories still appear in graph traversals.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMORY_DB_PATH` | `<workspace>/.memnest/memory.lbug` | Database file path. Workspace is auto-detected from the MCP client (roots/list), falling back to cwd, then `~/.memnest/`. Use `:memory:` for testing |
+| `MEMORY_WORKSPACE` | Auto-detected | Scope memories per project. Auto-detected from the MCP client's workspace root; set explicitly to override |
+| `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic similarity threshold for dedup |
+| `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
+| `MEMORY_SEARCH_LIMIT` | `10` | Max search results |
 
-The workspace is auto-detected: explicit `MEMORY_WORKSPACE` env var, then the MCP client's workspace root (roots/list), then the server's cwd. The database lives at `<workspace>/.memnest/memory.lbug`.
+## Troubleshooting
 
-**Verify scoping at the start of a session**: call `memory_stats()` and check the `workspace` field plus `runtime.workspace_source`. If `workspace` is `''` or doesn't match the current project (auto-detection can fail on clients that launch servers from `/` without roots support), pin it yourself:
+### Memory database is locked
 
-```
-memory_set_workspace(path="/absolute/path/to/current/project")
-```
+LadybugDB allows a single read-write process per database file. Another memnest server (usually another IDE window on the same project) is holding it. Close the other session, or give this one its own database via `memory_set_workspace` / `MEMORY_DB_PATH`.
 
-This re-homes the database to that project's `.memnest/` directory. Memories stored before the switch stay in the previous database file.
+### Search returns results from other projects, or workspace is ''
+
+Auto-detection failed (client launched the server from `/` without roots support). Check `memory_stats().runtime.workspace_source`, then pin with `memory_set_workspace(path=...)`.
+
+### First call is slow
+
+`uvx` downloads the package and the ~130MB embedding model on first run. Subsequent starts are fast.
+
+## Best Practices
+
+- Verify workspace scoping once at session start (Step 1) before storing anything
+- Prefer batch mode for multi-item stores — single embedding call
+- Record corrections with `SUPERSEDES` instead of deleting old memories — the chain preserves history
+- For graph traversal, aggregation, or relationship-based filtering beyond search, see the [graph-queries skill](../graph-queries/SKILL.md)
