@@ -186,8 +186,14 @@ _dream_ops_lock = threading.Lock()
 _dream_ops_since_last: int = 0
 _dream_last_time: float = 0.0
 
-# Workspace adoption from MCP client roots — attempted once per process.
-_roots_checked: bool = False
+# Workspace adoption from MCP client roots.
+# _roots_done goes True only when an attempt COMPLETES (adopted, client
+# lacks the capability, or the attempt cap is hit) — never on cancellation,
+# so a user-cancelled first tool call can't permanently disable adoption.
+_roots_done: bool = False
+_roots_attempts: int = 0
+_ROOTS_MAX_ATTEMPTS = 3
+_roots_lock = anyio.Lock()
 
 
 def _file_uri_to_path(uri) -> Optional[str]:
@@ -206,43 +212,72 @@ def _file_uri_to_path(uri) -> Optional[str]:
 async def _adopt_client_workspace() -> None:
     """Adopt the MCP client's first workspace root as the memory scope.
 
-    Runs once per server process, on the first tool call (roots/list is only
+    Runs on tool calls until an attempt completes (roots/list is only
     available after the session is initialized, so this can't happen at
-    startup). Does nothing when:
+    startup). Concurrent first calls (e.g. a recall hook racing the user's
+    call) serialize on a lock, so no call proceeds with an un-adopted
+    workspace while another is still asking the client.
+
+    Adoption finishes permanently when:
     - MEMORY_WORKSPACE is explicitly set (env var always wins), or
+    - the DB connection is already open (adopting after that would tag
+      memories with a workspace whose DB file was never opened), or
     - the client doesn't advertise the roots capability, or
-    - the roots request fails or returns no usable file:// root.
+    - the client answered (with or without a usable file:// root), or
+    - _ROOTS_MAX_ATTEMPTS transient failures accumulated.
 
-    On any of those, the static _resolve_workspace() baseline stays in effect.
+    Cancellation (user aborts the tool call mid-request) propagates WITHOUT
+    marking adoption done, so the next call retries. Transient errors
+    (timeouts, transport hiccups) retry up to the attempt cap. When no root
+    is adopted, the static _resolve_workspace() baseline stays in effect.
     """
-    global _roots_checked, WORKSPACE
-    if _roots_checked:
-        return
-    _roots_checked = True
-
-    env_ws = os.environ.get("MEMORY_WORKSPACE", "")
-    if env_ws and env_ws != "/" and not _looks_unsubstituted(env_ws):
+    global _roots_done, _roots_attempts, WORKSPACE
+    if _roots_done:
         return
 
-    try:
-        ctx = mcp.get_context()
-        session = ctx.session
-        if not session.check_client_capability(
-            mcp_types.ClientCapabilities(roots=mcp_types.RootsCapability())
-        ):
-            logger.debug("MCP client does not support roots; keeping static workspace")
+    async with _roots_lock:
+        if _roots_done:
             return
-        with anyio.fail_after(5):
-            result = await session.list_roots()
-        for root in result.roots:
-            path = _file_uri_to_path(root.uri)
-            if path and path != "/":
-                WORKSPACE = path
-                logger.info(f"Workspace adopted from MCP client root: {path}")
+
+        env_ws = os.environ.get("MEMORY_WORKSPACE", "")
+        if env_ws and env_ws != "/" and not _looks_unsubstituted(env_ws):
+            _roots_done = True
+            return
+
+        if _conn is not None:
+            _roots_done = True
+            return
+
+        _roots_attempts += 1
+        try:
+            ctx = mcp.get_context()
+            session = ctx.session
+            if not session.check_client_capability(
+                mcp_types.ClientCapabilities(roots=mcp_types.RootsCapability())
+            ):
+                logger.debug("MCP client does not support roots; keeping static workspace")
+                _roots_done = True
                 return
-        logger.debug("MCP client returned no usable file:// roots")
-    except Exception as e:
-        logger.debug(f"Could not adopt workspace from client roots: {e}")
+            with anyio.fail_after(5):
+                result = await session.list_roots()
+            for root in result.roots:
+                path = _file_uri_to_path(root.uri)
+                if path and path != "/":
+                    WORKSPACE = path
+                    logger.info(f"Workspace adopted from MCP client root: {path}")
+                    break
+            else:
+                logger.debug("MCP client returned no usable file:// roots")
+            _roots_done = True  # the client answered definitively
+        except Exception as e:
+            # Transient failure — retry on a later call, up to the cap.
+            # (Cancellation is a BaseException: it propagates and is NOT
+            # counted as done, by design.)
+            if _roots_attempts >= _ROOTS_MAX_ATTEMPTS:
+                _roots_done = True
+            logger.debug(
+                f"Workspace adoption attempt {_roots_attempts} failed: {e}"
+            )
 
 
 def _dream_state_path() -> Optional[str]:
