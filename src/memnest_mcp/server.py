@@ -72,6 +72,31 @@ def _looks_unsubstituted(value: str) -> bool:
     return "${" in value
 
 
+def _is_bogus_workspace(path: str) -> bool:
+    """Paths that can never be a real project workspace.
+
+    - '' or '/': MCP hosts often launch servers from '/'
+    - unexpanded ${...} config placeholders
+    - the home directory itself: hosts also launch from $HOME; a project
+      that IS the home directory is pathological
+    - anything under ~/.kiro: Kiro launches Agent Plugins-format power
+      servers with cwd set to the power's INSTALL directory
+      (~/.kiro/powers/installed/<name>). Accepting it would make every
+      window share one database inside the install tree.
+    """
+    if not path or path == "/":
+        return True
+    if _looks_unsubstituted(path):
+        return True
+    home = os.path.expanduser("~")
+    if path == home:
+        return True
+    kiro_dir = os.path.join(home, ".kiro")
+    if path == kiro_dir or path.startswith(kiro_dir + os.sep):
+        return True
+    return False
+
+
 def _resolve_db_path() -> str:
     """Determine the database path with sensible fallbacks.
 
@@ -95,8 +120,8 @@ def _resolve_db_path() -> str:
     if explicit:
         logger.warning(f"Ignoring MEMORY_DB_PATH with unexpanded placeholder: {explicit}")
 
-    if WORKSPACE and WORKSPACE != "/" and os.path.isdir(WORKSPACE) \
-            and os.access(WORKSPACE, os.W_OK):
+    if WORKSPACE and not _is_bogus_workspace(WORKSPACE) \
+            and os.path.isdir(WORKSPACE) and os.access(WORKSPACE, os.W_OK):
         return os.path.join(WORKSPACE, ".memnest", "memory.lbug")
 
     # Global fallback
@@ -122,12 +147,12 @@ def _resolve_workspace() -> str:
     """
     global _workspace_source
     workspace = os.environ.get("MEMORY_WORKSPACE", "")
-    if workspace and workspace != "/" and not _looks_unsubstituted(workspace):
+    if workspace and not _is_bogus_workspace(workspace):
         _workspace_source = "env"
         return workspace
 
     cwd = os.getcwd()
-    if cwd != "/":
+    if not _is_bogus_workspace(cwd):
         _workspace_source = "cwd"
         return cwd
 
@@ -261,7 +286,7 @@ async def _adopt_client_workspace() -> None:
             return
 
         env_ws = os.environ.get("MEMORY_WORKSPACE", "")
-        if env_ws and env_ws != "/" and not _looks_unsubstituted(env_ws):
+        if env_ws and not _is_bogus_workspace(env_ws):
             _roots_done = True
             return
 
@@ -295,7 +320,7 @@ async def _adopt_client_workspace() -> None:
                 result = await session.list_roots()
             for root in result.roots:
                 path = _file_uri_to_path(root.uri)
-                if path and path != "/":
+                if path and not _is_bogus_workspace(path):
                     WORKSPACE = path
                     _workspace_source = "roots"
                     logger.info(f"Workspace adopted from MCP client root: {path}")
@@ -2043,18 +2068,22 @@ def memory_set_workspace(path: str) -> str:
     global WORKSPACE, DB_PATH, _workspace_source, _roots_done, _conn, _db
 
     env_ws = os.environ.get("MEMORY_WORKSPACE", "")
-    if env_ws and env_ws != "/" and not _looks_unsubstituted(env_ws):
+    if env_ws and not _is_bogus_workspace(env_ws):
         return {
             "status": "error",
             "error": f"MEMORY_WORKSPACE is explicitly set to {env_ws!r} in the "
                      f"server config; that always wins. Change the config to move.",
         }
 
-    p = os.path.abspath(os.path.expanduser(path))
     if _looks_unsubstituted(path):
         return {"status": "error", "error": f"Unexpanded placeholder in path: {path}"}
-    if p == "/":
-        return {"status": "error", "error": "Refusing '/' as a workspace scope"}
+    p = os.path.abspath(os.path.expanduser(path))
+    if _is_bogus_workspace(p):
+        return {
+            "status": "error",
+            "error": f"Refusing {p!r} as a workspace scope: '/', the home "
+                     f"directory, and paths under ~/.kiro are never projects",
+        }
     if not os.path.isdir(p):
         return {"status": "error", "error": f"Not a directory: {p}"}
 
