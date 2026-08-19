@@ -2,6 +2,7 @@
 name: "getting-started"
 description: "Use Memnest persistent memory — recall context before responding, store learnings after tasks, verify workspace scoping. Use when working with agent memory, recalling past context, or storing preferences, decisions, and learnings."
 license: "MIT"
+compatibility: "Requires the memory-mcp server from this plugin (uvx, Python 3.10+). Automatic recall/persist hooks are Kiro IDE-only; other clients follow the workflow manually."
 metadata:
   author: "arunkse"
   version: "1.0.0"

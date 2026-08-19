@@ -11,13 +11,10 @@
     "memory",
     "agent memory",
     "persistent memory",
-    "graph memory",
     "knowledge graph",
     "vector search",
-    "mcp",
     "recall",
-    "context",
-    "ladybugdb"
+    "remember"
   ],
   "homepage": "https://github.com/arunkumars-mf/memnest-mcp",
   "repository": "https://github.com/arunkumars-mf/memnest-mcp",

@@ -2,6 +2,7 @@
 name: "graph-queries"
 description: "Run Cypher graph queries against Memnest memory — traversals, correction chains, PageRank/Louvain analytics, workspace-scoped queries. Use when memory_search is not enough and you need graph traversal, aggregation, or relationship-based filtering."
 license: "MIT"
+compatibility: "Requires the memory-mcp server from this plugin (uvx, Python 3.10+). Uses memory_query / memory_traverse tools."
 metadata:
   author: "arunkse"
   version: "1.0.0"
