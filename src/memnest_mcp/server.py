@@ -9,8 +9,12 @@ Graph data model:
   - Relationships: ABOUT, RELATED_TO, SUPERSEDES, EXPLAINS
 
 Workspace namespacing:
-  - MEMORY_WORKSPACE env var scopes memories to a project
-  - Defaults to cwd; pass global_search=True to bypass
+  - MEMORY_WORKSPACE env var scopes memories to a project (always wins)
+  - Otherwise the MCP client's first workspace root is adopted on the
+    first tool call (roots/list), so per-project scoping works even from
+    user-level MCP configs launched with cwd '/'
+  - Falls back to cwd, then to global scope ('') when cwd is '/'
+  - Pass global_search=True to bypass
 
 Response format:
   - MEMORY_RESPONSE_FORMAT=toon (default if installed) for compact LLM-friendly output
@@ -38,8 +42,10 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Literal, Optional
 
+import anyio
 import real_ladybug as lb
 from fastembed import TextEmbedding
+from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
 
 try:
@@ -81,12 +87,40 @@ def _resolve_db_path() -> str:
     return os.path.expanduser("~/.memnest/memory.lbug")
 
 
+def _resolve_workspace() -> str:
+    """Determine the workspace scope at import time, with sensible fallbacks.
+
+    Priority:
+    1. MEMORY_WORKSPACE env var (explicit override), unless it's '/'
+    2. cwd, unless it's '/' (MCP hosts often launch servers from '/')
+    3. '' (global scope — memories are visible to every workspace)
+
+    This is only the static baseline. On the first tool call the server also
+    asks the MCP client for its workspace roots (roots/list) and adopts the
+    first one — see _adopt_client_workspace(). That makes workspace scoping
+    work even when the server is registered in a user-level config and
+    launched with cwd '/'. The env var always wins over roots.
+
+    A workspace of '/' is never legitimate: it would silently merge all
+    projects into one shared scope while looking like a real path.
+    """
+    workspace = os.environ.get("MEMORY_WORKSPACE", "")
+    if workspace and workspace != "/":
+        return workspace
+
+    cwd = os.getcwd()
+    if cwd != "/":
+        return cwd
+
+    return ""
+
+
 DB_PATH = _resolve_db_path()
 EMBEDDING_MODEL = os.environ.get("MEMORY_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIM = int(os.environ.get("MEMORY_EMBEDDING_DIM", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92"))
 LATENCY_WARN_MS = int(os.environ.get("MEMORY_LATENCY_WARN_MS", "200"))
-WORKSPACE = os.environ.get("MEMORY_WORKSPACE", os.getcwd())
+WORKSPACE = _resolve_workspace()
 
 # Response format: 'json' (default) or 'toon' (compact for LLM context)
 RESPONSE_FORMAT = os.environ.get("MEMORY_RESPONSE_FORMAT", "toon" if _TOON_AVAILABLE else "json").lower()
@@ -132,6 +166,64 @@ _db: Optional[lb.Database] = None
 _dream_ops_lock = threading.Lock()
 _dream_ops_since_last: int = 0
 _dream_last_time: float = 0.0
+
+# Workspace adoption from MCP client roots — attempted once per process.
+_roots_checked: bool = False
+
+
+def _file_uri_to_path(uri) -> Optional[str]:
+    """Convert a file:// URI to a local filesystem path, or None if not file://."""
+    from urllib.parse import unquote, urlparse
+    s = str(uri)
+    if not s.startswith("file://"):
+        return None
+    path = unquote(urlparse(s).path)
+    # Windows URIs look like file:///C:/dir — strip the leading slash
+    if re.match(r"^/[A-Za-z]:[/\\]", path):
+        path = path[1:]
+    return path or None
+
+
+async def _adopt_client_workspace() -> None:
+    """Adopt the MCP client's first workspace root as the memory scope.
+
+    Runs once per server process, on the first tool call (roots/list is only
+    available after the session is initialized, so this can't happen at
+    startup). Does nothing when:
+    - MEMORY_WORKSPACE is explicitly set (env var always wins), or
+    - the client doesn't advertise the roots capability, or
+    - the roots request fails or returns no usable file:// root.
+
+    On any of those, the static _resolve_workspace() baseline stays in effect.
+    """
+    global _roots_checked, WORKSPACE
+    if _roots_checked:
+        return
+    _roots_checked = True
+
+    env_ws = os.environ.get("MEMORY_WORKSPACE", "")
+    if env_ws and env_ws != "/":
+        return
+
+    try:
+        ctx = mcp.get_context()
+        session = ctx.session
+        if not session.check_client_capability(
+            mcp_types.ClientCapabilities(roots=mcp_types.RootsCapability())
+        ):
+            logger.debug("MCP client does not support roots; keeping static workspace")
+            return
+        with anyio.fail_after(5):
+            result = await session.list_roots()
+        for root in result.roots:
+            path = _file_uri_to_path(root.uri)
+            if path and path != "/":
+                WORKSPACE = path
+                logger.info(f"Workspace adopted from MCP client root: {path}")
+                return
+        logger.debug("MCP client returned no usable file:// roots")
+    except Exception as e:
+        logger.debug(f"Could not adopt workspace from client roots: {e}")
 
 
 def _dream_state_path() -> Optional[str]:
@@ -256,9 +348,15 @@ def _timed(operation: str):
 
     Tool functions SHOULD return a Python dict or list. Returning a string is supported
     for legacy reasons (the string is passed through unchanged with no timing info).
+
+    The wrapper is async so it can talk to the MCP client (roots/list for
+    workspace adoption) before dispatching to the sync tool body. FastMCP
+    reads the schema from __signature__, so tool parameters are unaffected.
+    Tests bypass this wrapper via __wrapped__.
     """
     def decorator(func):
-        def wrapper(*args, **kwargs):
+        async def wrapper(*args, **kwargs):
+            await _adopt_client_workspace()
             start = time.perf_counter()
             result = func(*args, **kwargs)
             elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
@@ -340,7 +438,9 @@ def get_conn() -> lb.Connection:
 # Schema version — bump when adding migrations to _apply_migrations().
 # v1: workspace column on Memory.
 # v2: provenance + confidence on RELATED_TO.
-SCHEMA_VERSION = 2
+# v3: retag workspace '/' as '' (global). '/' was a bug: MCP hosts launch
+#     servers with cwd '/', which the old code recorded as a real workspace.
+SCHEMA_VERSION = 3
 
 
 def _init_schema(conn: lb.Connection):
@@ -487,6 +587,12 @@ def _apply_migrations(conn: lb.Connection):
                       expected_errors=("already exists", "duplicate", "already has property"))
         _safe_execute(conn, "ALTER TABLE RELATED_TO ADD confidence DOUBLE DEFAULT 1.0;",
                       expected_errors=("already exists", "duplicate", "already has property"))
+
+    # v3: memories written with workspace '/' were a bug (cwd of the MCP host,
+    # not a real project). Retag them as '' so they stay globally visible.
+    if current < 3:
+        _safe_execute(conn,
+                      "MATCH (m:Memory) WHERE m.workspace = '/' SET m.workspace = '';")
 
     _set_schema_version(conn, SCHEMA_VERSION)
     logger.info(f"Schema migrated to v{SCHEMA_VERSION}")

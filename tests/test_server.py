@@ -5,6 +5,7 @@ that key invariants are preserved (especially relationship preservation across
 the delete + recreate workaround for vector-indexed embeddings).
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -222,10 +223,11 @@ def test_toon_format_when_enabled():
 
     # Switch to TOON mode for this test. Call the *decorated* function so we
     # exercise the @_timed serialization path that produces a TOON string.
+    # The @_timed wrapper is async (it consults MCP client roots), so run it.
     original = server.RESPONSE_FORMAT
     server.RESPONSE_FORMAT = "toon"
     try:
-        result = server.memory_stats()
+        result = asyncio.run(server.memory_stats())
         assert isinstance(result, str), f"Expected serialized string, got {type(result)}"
         # TOON output uses key:value or array notation, not JSON's '{'
         assert not result.lstrip().startswith("{"), \
@@ -240,7 +242,7 @@ def test_toon_format_when_enabled():
 def test_elapsed_ms_present_in_json_responses():
     """elapsed_ms must be injected by @_timed regardless of format."""
     server.RESPONSE_FORMAT = "json"
-    raw = server.memory_stats()
+    raw = asyncio.run(server.memory_stats())
     parsed = json.loads(raw)
     assert "elapsed_ms" in parsed, "elapsed_ms missing under JSON format"
     assert isinstance(parsed["elapsed_ms"], (int, float))
