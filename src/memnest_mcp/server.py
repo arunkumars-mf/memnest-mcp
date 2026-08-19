@@ -62,27 +62,43 @@ logger = logging.getLogger("memnest")
 logger.addHandler(logging.NullHandler())
 
 # --- Configuration ---
+def _looks_unsubstituted(value: str) -> bool:
+    """Detect config template placeholders that the MCP host did not expand.
+
+    Users coming from VS Code write things like "${workspaceFolder}" in env
+    values; Kiro (and other hosts) pass the literal string through. Treating
+    it as a real path would scope memories to a directory named '${...}'.
+    """
+    return "${" in value
+
+
 def _resolve_db_path() -> str:
     """Determine the database path with sensible fallbacks.
-    
+
     Priority:
     1. MEMORY_DB_PATH env var (explicit override)
-    2. MEMORY_WORKSPACE/.memnest/memory.lbug (workspace-scoped)
-    3. cwd/.memnest/memory.lbug (if cwd is writable and not '/')
-    4. ~/.memnest/memory.lbug (global fallback)
+    2. WORKSPACE/.memnest/memory.lbug — the resolved workspace scope
+       (env var, adopted client root, or cwd), if it is a writable directory
+    3. ~/.memnest/memory.lbug (global fallback)
+
+    Called lazily at first connection (see get_conn), AFTER the client's
+    workspace root may have been adopted. This gives each project its own
+    database file, which matters beyond tidiness: LadybugDB allows only ONE
+    read-write process per database file, so multiple IDE windows sharing a
+    single global file would fight over the lock and all but one would fail.
+    Per-project files keep windows on different projects out of each other's
+    way.
     """
     explicit = os.environ.get("MEMORY_DB_PATH")
-    if explicit:
+    if explicit and not _looks_unsubstituted(explicit):
         return explicit
-    
-    workspace = os.environ.get("MEMORY_WORKSPACE", "")
-    if workspace and workspace != "/":
-        return os.path.join(workspace, ".memnest", "memory.lbug")
-    
-    cwd = os.getcwd()
-    if cwd != "/" and os.access(cwd, os.W_OK):
-        return os.path.join(cwd, ".memnest", "memory.lbug")
-    
+    if explicit:
+        logger.warning(f"Ignoring MEMORY_DB_PATH with unexpanded placeholder: {explicit}")
+
+    if WORKSPACE and WORKSPACE != "/" and os.path.isdir(WORKSPACE) \
+            and os.access(WORKSPACE, os.W_OK):
+        return os.path.join(WORKSPACE, ".memnest", "memory.lbug")
+
     # Global fallback
     return os.path.expanduser("~/.memnest/memory.lbug")
 
@@ -105,7 +121,7 @@ def _resolve_workspace() -> str:
     projects into one shared scope while looking like a real path.
     """
     workspace = os.environ.get("MEMORY_WORKSPACE", "")
-    if workspace and workspace != "/":
+    if workspace and workspace != "/" and not _looks_unsubstituted(workspace):
         return workspace
 
     cwd = os.getcwd()
@@ -115,12 +131,15 @@ def _resolve_workspace() -> str:
     return ""
 
 
+# WORKSPACE must be resolved before DB_PATH: the DB path derives from it.
+# Both are re-resolved at first connection (get_conn) once the client's
+# workspace root may have been adopted via roots/list.
+WORKSPACE = _resolve_workspace()
 DB_PATH = _resolve_db_path()
 EMBEDDING_MODEL = os.environ.get("MEMORY_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIM = int(os.environ.get("MEMORY_EMBEDDING_DIM", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92"))
 LATENCY_WARN_MS = int(os.environ.get("MEMORY_LATENCY_WARN_MS", "200"))
-WORKSPACE = _resolve_workspace()
 
 # Response format: 'json' (default) or 'toon' (compact for LLM context)
 RESPONSE_FORMAT = os.environ.get("MEMORY_RESPONSE_FORMAT", "toon" if _TOON_AVAILABLE else "json").lower()
@@ -202,7 +221,7 @@ async def _adopt_client_workspace() -> None:
     _roots_checked = True
 
     env_ws = os.environ.get("MEMORY_WORKSPACE", "")
-    if env_ws and env_ws != "/":
+    if env_ws and env_ws != "/" and not _looks_unsubstituted(env_ws):
         return
 
     try:
@@ -400,16 +419,32 @@ def get_embed_model() -> TextEmbedding:
 
 
 def get_conn() -> lb.Connection:
-    global _conn, _db
+    global _conn, _db, DB_PATH
     if _conn is not None:
         return _conn
+
+    # Re-resolve now: the client's workspace root is adopted on the first tool
+    # call (after import), and the DB path derives from the workspace. With an
+    # explicit MEMORY_DB_PATH this is a no-op.
+    DB_PATH = _resolve_db_path()
 
     from pathlib import Path
     if DB_PATH == ":memory:":
         _db = lb.Database(":memory:")
     else:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-        _db = lb.Database(DB_PATH)
+        try:
+            _db = lb.Database(DB_PATH)
+        except Exception as e:
+            if "lock" in str(e).lower():
+                raise RuntimeError(
+                    f"Memory database is locked: {DB_PATH}. LadybugDB allows a "
+                    f"single read-write process per database file, and another "
+                    f"memnest server (likely another IDE window) is using this "
+                    f"one. Close the other session, or give this one its own "
+                    f"database via MEMORY_DB_PATH / MEMORY_WORKSPACE."
+                ) from e
+            raise
 
     _conn = lb.Connection(_db)
 

@@ -41,8 +41,8 @@ memory, agent memory, persistent memory, graph memory, knowledge graph, vector s
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_DB_PATH` | `.memnest/memory.lbug` (in cwd) | Database file path. Use `:memory:` for testing |
-| `MEMORY_WORKSPACE` | Current directory | Scope memories per project |
+| `MEMORY_DB_PATH` | `<workspace>/.memnest/memory.lbug` | Database file path. Workspace is auto-detected from the MCP client (roots/list), falling back to cwd, then `~/.memnest/`. Use `:memory:` for testing |
+| `MEMORY_WORKSPACE` | Auto-detected | Scope memories per project. Auto-detected from the MCP client's workspace root; set explicitly to override |
 | `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic similarity threshold for dedup |
 | `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max search results |
