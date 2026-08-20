@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memnest-mcp"
-version = "0.6.1"
+version = "0.7.0"
 description = "Persistent graph memory MCP server for AI agents using LadybugDB"
 readme = "README.md"
 license = "MIT"
@@ -35,7 +35,7 @@ Repository = "https://github.com/arunkumars-mf/memnest-mcp"
 Issues = "https://github.com/arunkumars-mf/memnest-mcp/issues"
 
 [project.scripts]
-memnest-mcp = "memnest_mcp.server:main"
+memnest-mcp = "memnest_mcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memnest_mcp"]

@@ -56,6 +56,23 @@ pip install memnest-mcp
 memnest-mcp
 ```
 
+### Configure a project (Kiro)
+
+From your project root, one command writes the workspace-level MCP config
+(with the memory scope pinned to the project) plus the recall/persist/dream
+agent hooks:
+
+```bash
+memnest-mcp config kiro            # configure the current directory
+memnest-mcp config kiro --check    # verify only
+memnest-mcp config kiro --no-hooks # MCP server config only
+```
+
+The config is always workspace-level (`<project>/.kiro/`), so each project
+gets its own correctly-scoped memory database at `<project>/.memnest/`.
+Reconnect MCP servers in Kiro afterwards. The Kiro Power (below) remains
+optional on top for keyword activation and skills.
+
 ## MCP Configuration
 
 Add to your MCP client config (Kiro, Claude Desktop, Cursor, etc.):

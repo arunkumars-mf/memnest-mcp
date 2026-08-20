@@ -1,4 +1,6 @@
-"""Allow running as: python -m memnest_mcp"""
-from .server import main
+"""Allow running as: python -m memnest_mcp [serve|config ...]"""
+import sys
 
-main()
+from .cli import main
+
+sys.exit(main())
