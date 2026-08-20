@@ -68,6 +68,11 @@ memnest-mcp config kiro --check    # verify only
 memnest-mcp config kiro --no-hooks # MCP server config only
 ```
 
+This writes `.kiro/settings/mcp.json` (server + pinned workspace),
+`.kiro/hooks/memnest-recall.json` and `memnest-persist.json` (automatic recall
+and persistence), and `.kiro/steering/memnest-dream.md` — a manual steering
+file you invoke with `/memnest-dream` to consolidate memory.
+
 The config is always workspace-level (`<project>/.kiro/`), so each project
 gets its own correctly-scoped memory database at `<project>/.memnest/`.
 Reconnect MCP servers in Kiro afterwards. The Kiro Power (below) remains
@@ -219,10 +224,10 @@ This repo includes a ready-to-use [Kiro Power](./power/memnest/) in the `power/m
 
 - Plugin manifest with activation keywords (`power/memnest/plugin.json`)
 - Pre-configured MCP server (`power/memnest/mcp.json`)
-- Three Kiro IDE hooks for automatic memory persistence and recall (`power/memnest/dev.kiro/hooks/` — IDE-only; on Kiro Web/CLI the agent follows the same workflow from the getting-started skill)
-  - **persist-memory** — stores important info when the agent stops
-  - **recall-memory** — searches memory before responding to each prompt
-  - **auto-dream** — manually trigger consolidation (prune + merge + review)
+- Two Kiro agent hooks for automatic recall and persistence (`power/memnest/dev.kiro/hooks/`, v1 hook schema — IDE/CLI only; on Kiro Web the agent follows the same workflow from the getting-started skill)
+  - **memnest-recall** (`UserPromptSubmit`) — searches memory before responding to each prompt
+  - **memnest-persist** (`Stop`) — stores important info when the agent finishes
+  - consolidation runs on demand via `memory_dream` (see the getting-started skill)
 - Agent Skills with the setup guide and Cypher query examples (`power/memnest/skills/`)
 
 **Install in Kiro:** Add Custom Power → `https://github.com/arunkumars-mf/memnest-mcp/tree/main/power/memnest`

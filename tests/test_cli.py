@@ -41,10 +41,42 @@ def test_fresh_project_configures_server_and_hooks(tmp_path, capsys):
     hooks_dir = tmp_path / ".kiro" / "hooks"
     assert sorted(os.listdir(hooks_dir)) == sorted(cli.KIRO_HOOKS)
     for name in cli.KIRO_HOOKS:
-        hook = json.loads((hooks_dir / name).read_text())
-        assert hook["then"]["type"] == "askAgent"
-        assert "kiroPowers" not in hook["then"]["prompt"], \
+        assert name.endswith(".json"), "hooks must use the v1 JSON format"
+        doc = json.loads((hooks_dir / name).read_text())
+        assert doc["version"] == "v1"
+        hook = doc["hooks"][0]
+        # PascalCase triggers only (IDE 1.0+); no legacy when/then structure
+        assert hook["trigger"] in ("UserPromptSubmit", "Stop")
+        assert "when" not in hook and "then" not in hook
+        assert hook["action"]["type"] == "agent"
+        assert "kiroPowers" not in hook["action"]["prompt"], \
             "CLI hooks must use direct MCP tools, not the power indirection"
+
+
+def test_dream_ships_as_manual_steering_file(tmp_path):
+    """userTriggered hooks were removed in IDE 1.0 -> manual steering file."""
+    assert run_config(tmp_path) == 0
+    steering = tmp_path / ".kiro" / "steering" / "memnest-dream.md"
+    body = steering.read_text()
+    assert body.startswith("---\ninclusion: manual\n---")
+    assert "memory_dream" in body
+    # and it must NOT be a hook any more
+    assert not (tmp_path / ".kiro" / "hooks" / "memnest-dream.json").exists()
+
+
+def test_legacy_hook_files_are_removed(tmp_path):
+    """Upgrading from a pre-1.0 config must not leave double-firing hooks."""
+    hooks_dir = tmp_path / ".kiro" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    for name in cli.LEGACY_KIRO_HOOKS:
+        (hooks_dir / name).write_text('{"when": {"type": "promptSubmit"}}')
+
+    assert run_config(tmp_path, "--check") == 1  # legacy detected as not-configured
+    assert run_config(tmp_path) == 0
+    for name in cli.LEGACY_KIRO_HOOKS:
+        assert not (hooks_dir / name).exists(), f"{name} not cleaned up"
+    assert sorted(os.listdir(hooks_dir)) == sorted(cli.KIRO_HOOKS)
+    assert run_config(tmp_path, "--check") == 0
 
 
 def test_check_mode_fails_then_passes(tmp_path):
@@ -92,7 +124,7 @@ def test_repairs_wrong_workspace_keeps_custom_env(tmp_path):
 
 def test_existing_hooks_skipped_without_force(tmp_path):
     assert run_config(tmp_path) == 0
-    hook = tmp_path / ".kiro" / "hooks" / "memnest-recall.kiro.hook"
+    hook = tmp_path / ".kiro" / "hooks" / "memnest-recall.json"
     hook.write_text('{"custom": true}')
 
     # Force a config change so fix runs again
@@ -108,13 +140,15 @@ def test_existing_hooks_skipped_without_force(tmp_path):
     cfg["mcpServers"]["memnest"]["disabled"] = True
     cfg_path.write_text(json.dumps(cfg))
     assert run_config(tmp_path, "--force") == 0
-    assert json.loads(hook.read_text())["name"].startswith("Memnest"), "not overwritten with --force"
+    doc = json.loads(hook.read_text())
+    assert doc["hooks"][0]["name"].startswith("Memnest"), "not overwritten with --force"
 
 
 def test_no_hooks_flag(tmp_path, capsys):
     assert run_config(tmp_path, "--no-hooks") == 0
     assert "memnest" in read_cfg(tmp_path)["mcpServers"]
     assert not (tmp_path / ".kiro" / "hooks").exists()
+    assert not (tmp_path / ".kiro" / "steering").exists()
     # idempotent under the same flag; hooks absence is not a defect here
     capsys.readouterr()
     assert run_config(tmp_path, "--no-hooks") == 0

@@ -114,35 +114,63 @@ _DREAM_PROMPT = (
     "any contradictions detected."
 )
 
+# Hook files use the v1 schema introduced in Kiro IDE 1.0 / CLI 3.0:
+# standalone .json files in .kiro/hooks/ with PascalCase trigger names.
+# See https://kiro.dev/docs/hooks
 KIRO_HOOKS = {
-    "memnest-recall.kiro.hook": {
-        "name": "Memnest: Recall Relevant Memories",
-        "version": "1.0.0",
-        "description": "Before responding to each user prompt, recall relevant "
-                       "context from Memnest memory using hybrid search "
-                       "(vector + FTS + graph) to provide continuity across sessions.",
-        "when": {"type": "promptSubmit"},
-        "then": {"type": "askAgent", "prompt": _RECALL_PROMPT},
+    "memnest-recall.json": {
+        "version": "v1",
+        "hooks": [
+            {
+                "name": "Memnest: Recall Relevant Memories",
+                "description": "Before responding to each user prompt, recall "
+                               "relevant context from Memnest memory using hybrid "
+                               "search (vector + FTS + graph) to provide continuity "
+                               "across sessions.",
+                "trigger": "UserPromptSubmit",
+                "action": {"type": "agent", "prompt": _RECALL_PROMPT},
+                "enabled": True,
+            }
+        ],
     },
-    "memnest-persist.kiro.hook": {
-        "name": "Memnest: Persist Learnings to Memory",
-        "version": "1.0.0",
-        "description": "After the agent finishes a task, review the conversation "
-                       "for new learnings, preferences, decisions, or patterns and "
-                       "batch-store them in Memnest memory.",
-        "when": {"type": "agentStop"},
-        "then": {"type": "askAgent", "prompt": _PERSIST_PROMPT},
-    },
-    "memnest-dream.kiro.hook": {
-        "name": "Memnest: Consolidate Memory",
-        "version": "1.0.0",
-        "description": "Manually triggered hook to consolidate memories — runs "
-                       "graph algorithms, prunes stale memories, merges "
-                       "near-duplicates, and surfaces clusters for review.",
-        "when": {"type": "userTriggered"},
-        "then": {"type": "askAgent", "prompt": _DREAM_PROMPT},
+    "memnest-persist.json": {
+        "version": "v1",
+        "hooks": [
+            {
+                "name": "Memnest: Persist Learnings to Memory",
+                "description": "After the agent finishes a task, review the "
+                               "conversation for new learnings, preferences, "
+                               "decisions, or patterns and batch-store them in "
+                               "Memnest memory.",
+                "trigger": "Stop",
+                "action": {"type": "agent", "prompt": _PERSIST_PROMPT},
+                "enabled": True,
+            }
+        ],
     },
 }
+
+# The old 'userTriggered' hook trigger was removed in Kiro IDE 1.0 and replaced
+# by manual steering files, invoked as /memnest-dream (or #memnest-dream) in chat.
+KIRO_STEERING = {
+    "memnest-dream.md": (
+        "---\n"
+        "inclusion: manual\n"
+        "---\n"
+        "\n"
+        "# Memnest: Consolidate Memory\n"
+        "\n" + _DREAM_PROMPT + "\n"
+    ),
+}
+
+# Files written by earlier versions of this command (pre-1.0 hook format).
+# Removed on reconfigure so hooks don't double-fire and Kiro stops offering
+# to migrate them.
+LEGACY_KIRO_HOOKS = (
+    "memnest-recall.kiro.hook",
+    "memnest-persist.kiro.hook",
+    "memnest-dream.kiro.hook",
+)
 
 
 def _is_bogus_workspace(path: str) -> bool:
@@ -231,6 +259,21 @@ def _verify_kiro(root: str, require_hooks: bool = True) -> tuple[bool, list[str]
     if require_hooks and len(present) < len(KIRO_HOOKS):
         ok = False
 
+    steering_dir = os.path.join(root, ".kiro", "steering")
+    s_present = [s for s in KIRO_STEERING
+                 if os.path.exists(os.path.join(steering_dir, s))]
+    lines.append(f"steering:     {len(s_present)}/{len(KIRO_STEERING)} installed "
+                 f"(/memnest-dream)")
+    if require_hooks and len(s_present) < len(KIRO_STEERING):
+        ok = False
+
+    stale = [h for h in LEGACY_KIRO_HOOKS
+             if os.path.exists(os.path.join(hooks_dir, h))]
+    if stale:
+        lines.append(f"legacy hooks: {', '.join(stale)} (pre-1.0 format, "
+                     f"will be removed)")
+        ok = False
+
     db = os.path.join(root, ".memnest", "memory.lbug")
     lines.append(f"project DB:   {db} "
                  f"({'exists' if os.path.exists(db) else 'created on first use'})")
@@ -280,6 +323,25 @@ def _fix_kiro(root: str, command_mode: str, with_hooks: bool, force: bool) -> li
                 json.dump(hook, f, indent=2)
                 f.write("\n")
             lines.append(f"hook:         {filename} written")
+
+        # Drop hooks written in the pre-1.0 format by earlier versions of this
+        # command. Leaving them causes duplicate firing and migration prompts.
+        for filename in LEGACY_KIRO_HOOKS:
+            path = os.path.join(hooks_dir, filename)
+            if os.path.exists(path):
+                os.remove(path)
+                lines.append(f"removed:      {filename} (pre-1.0 hook format)")
+
+        steering_dir = os.path.join(root, ".kiro", "steering")
+        os.makedirs(steering_dir, exist_ok=True)
+        for filename, body in KIRO_STEERING.items():
+            path = os.path.join(steering_dir, filename)
+            if os.path.exists(path) and not force:
+                lines.append(f"steering:     {filename} exists, skipped (--force to overwrite)")
+                continue
+            with open(path, "w") as f:
+                f.write(body)
+            lines.append(f"steering:     {filename} written (run with /memnest-dream)")
 
     lines.append("next:         reconnect MCP servers in Kiro (command palette: "
                  "'MCP') or restart the window, then check memory_stats -> runtime")
