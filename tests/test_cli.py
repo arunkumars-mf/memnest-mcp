@@ -58,7 +58,8 @@ def test_dream_ships_as_manual_steering_file(tmp_path):
     assert run_config(tmp_path) == 0
     steering = tmp_path / ".kiro" / "steering" / "memnest-dream.md"
     body = steering.read_text()
-    assert body.startswith("---\ninclusion: manual\n---")
+    assert body.startswith("---\ninclusion: manual\n")
+    assert "description:" in body.split("---")[1]
     assert "memory_dream" in body
     # and it must NOT be a hook any more
     assert not (tmp_path / ".kiro" / "hooks" / "memnest-dream.json").exists()

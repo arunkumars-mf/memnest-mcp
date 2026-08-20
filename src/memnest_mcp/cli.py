@@ -156,6 +156,8 @@ KIRO_STEERING = {
     "memnest-dream.md": (
         "---\n"
         "inclusion: manual\n"
+        'description: "Consolidate Memnest memory — run graph algorithms, prune '
+        'stale memories, merge near-duplicates, and review surfaced clusters."\n'
         "---\n"
         "\n"
         "# Memnest: Consolidate Memory\n"
