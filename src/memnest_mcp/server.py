@@ -252,6 +252,28 @@ _client_supports_roots: Optional[bool] = None
 # Result of the vector-index health check performed at connection time.
 _vector_index_state: dict = {}
 
+# Repair-on-use budget. Rebuilding costs time proportional to memory count, so
+# an index that cannot be fixed must not trigger a rebuild on every query.
+_index_repair_attempts: int = 0
+_index_repair_last: float = 0.0
+INDEX_REPAIR_MAX_ATTEMPTS = int(os.environ.get("MEMORY_INDEX_REPAIR_MAX", "3"))
+INDEX_REPAIR_COOLDOWN_S = float(os.environ.get("MEMORY_INDEX_REPAIR_COOLDOWN_S", "300"))
+
+
+def _index_repair_allowed() -> bool:
+    """Whether search may attempt an automatic index rebuild right now."""
+    if INDEX_REPAIR_MAX_ATTEMPTS <= 0:
+        return False
+    if _index_repair_attempts >= INDEX_REPAIR_MAX_ATTEMPTS:
+        return False
+    return (time.time() - _index_repair_last) >= INDEX_REPAIR_COOLDOWN_S
+
+
+def _note_index_repair_attempt() -> None:
+    global _index_repair_attempts, _index_repair_last
+    _index_repair_attempts += 1
+    _index_repair_last = time.time()
+
 
 def _file_uri_to_path(uri) -> Optional[str]:
     """Convert a file:// URI to a local filesystem path, or None if not file://."""
@@ -716,7 +738,8 @@ def _ensure_vector_index(conn: lb.Connection) -> dict:
     )
     try:
         _safe_execute(conn, "CALL DROP_VECTOR_INDEX('Memory', 'memory_vec_idx');",
-                      expected_errors=("does not exist", "not found"))
+                      expected_errors=("does not exist", "not found",
+                                       "doesn't have an index"))
         conn.execute(
             "CALL CREATE_VECTOR_INDEX('Memory', 'memory_vec_idx', 'embedding', "
             "metric := 'cosine');"
@@ -1391,7 +1414,11 @@ def memory_search(
 
     # --- Channel 1: Vector search (HNSW cosine similarity) ---
     embedding = _embed(query)
-    if embedding is not None and _count_memories(conn) > 0:
+
+    def _run_vector_channel() -> int:
+        """Query the HNSW index into raw_scores. Returns the number of hits."""
+        if embedding is None:
+            return 0
         try:
             if global_search:
                 where_clause = ""
@@ -1424,6 +1451,28 @@ def memory_search(
         except Exception as e:
             # ERROR, not WARNING: this silently degrades search to keyword-only.
             logger.error(f"Vector search failed (semantic channel disabled): {e}")
+        return len(vector_hits)
+
+    if embedding is not None and _count_memories(conn) > 0:
+        _run_vector_channel()
+
+        # Repair on use. A healthy HNSW index always returns the k nearest
+        # neighbours for any query — cosine distance is defined for every
+        # vector pair, so even nonsense queries match something. Zero rows
+        # while embeddings exist therefore means the index is broken, not that
+        # nothing was similar. That makes this signal safe to act on.
+        #
+        # The connection-time check alone is not enough: a server can run for
+        # days, and an index that goes stale mid-session would otherwise serve
+        # keyword-only results until restart.
+        if not vector_hits and _index_repair_allowed():
+            _note_index_repair_attempt()
+            state = _ensure_vector_index(conn)
+            if state.get("rebuilt"):
+                global _vector_index_state
+                _vector_index_state = state
+                if _run_vector_channel():
+                    logger.info("Search recovered after automatic index rebuild")
 
     # --- Channel 2: Full-text search (BM25 via FTS index) ---
     if _count_memories(conn) > 0:
@@ -2213,7 +2262,10 @@ def memory_stats() -> str:
                 "healthy": missing_embeddings == 0 and vector_index_live is not False,
                 "queryable": vector_index_live,
             },
-            "vector_index": _vector_index_state or {"status": "unknown"},
+            "vector_index": {
+                **(_vector_index_state or {"status": "unknown"}),
+                "repair_attempts": _index_repair_attempts,
+            },
             "fusion_mode": FUSION_MODE,
             "workspace_source": _workspace_source,
             "client": _client_info,

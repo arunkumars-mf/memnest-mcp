@@ -173,7 +173,10 @@ def test_probe_detects_missing_vector_index():
     assert not (server._probe_vector_index(conn) or 0) > 0
 
 
-def test_search_reports_degraded_when_index_is_stale():
+def test_search_reports_degraded_when_repair_is_unavailable(monkeypatch):
+    """With auto-repair disabled, a stale index must still be reported rather
+    than silently tolerated."""
+    monkeypatch.setattr(server, "INDEX_REPAIR_MAX_ATTEMPTS", 0)
     _seed()
     conn = server.get_conn()
     _drop_vector_index(conn)
@@ -186,7 +189,8 @@ def test_memory_reindex_repairs_a_stale_index():
     _seed()
     conn = server.get_conn()
     _drop_vector_index(conn)
-    assert "degraded" in _search("classifier retraining schedule")
+    # Probe directly rather than via search, which would auto-repair first
+    assert not (server._probe_vector_index(conn) or 0) > 0
 
     out = server.memory_reindex.__wrapped__()
     assert out["status"] == "rebuilt", out
@@ -231,7 +235,7 @@ def test_connection_self_heals_stale_index(tmp_path, monkeypatch):
     conn = server.get_conn()
     assert str(db) == server.DB_PATH, server.DB_PATH
     _drop_vector_index(conn)
-    assert "degraded" in _search("classifier retraining schedule")
+    assert not (server._probe_vector_index(conn) or 0) > 0, "index should be gone"
 
     # Force a reconnect (as a server restart would)
     close_conn()
@@ -274,3 +278,81 @@ def test_reindex_reports_when_nothing_has_embeddings(monkeypatch):
     assert out["status"] == "no_embeddings"
     assert out["memories"] == 1
     assert "re-store" in out["message"]
+
+
+# --- Repair on use ----------------------------------------------------------
+#
+# The connection-time check cannot help an index that goes stale mid-session,
+# and a server may run for days. Search itself therefore repairs on first
+# affected query. This is safe because a healthy HNSW index always returns the
+# k nearest neighbours for ANY query (cosine is defined for every vector pair),
+# so zero rows while embeddings exist is an unambiguous broken-index signal.
+
+@pytest.fixture(autouse=True)
+def reset_repair_budget():
+    server._index_repair_attempts = 0
+    server._index_repair_last = 0.0
+    yield
+    server._index_repair_attempts = 0
+    server._index_repair_last = 0.0
+
+
+def test_search_repairs_stale_index_on_first_query():
+    _seed()
+    conn = server.get_conn()
+    _drop_vector_index(conn)
+
+    res = _search("classifier retraining schedule")
+
+    assert server._index_repair_attempts == 1, "should have attempted one repair"
+    assert "degraded" not in res, "search should self-repair and return semantic hits"
+    assert res["results"]
+    # And the index is genuinely live afterwards
+    assert (server._probe_vector_index(conn) or 0) > 0
+
+
+def test_repair_budget_prevents_rebuild_storm(monkeypatch):
+    """If rebuilding cannot fix the index, stop trying on every query."""
+    _seed()
+    conn = server.get_conn()
+    _drop_vector_index(conn)
+
+    # Simulate a rebuild that never succeeds
+    monkeypatch.setattr(server, "_ensure_vector_index",
+                        lambda c: {"status": "rebuild_failed", "rebuilt": False})
+    monkeypatch.setattr(server, "INDEX_REPAIR_COOLDOWN_S", 0.0)
+
+    for _ in range(6):
+        res = _search("classifier retraining schedule")
+        assert "degraded" in res, "should keep reporting degradation"
+
+    assert server._index_repair_attempts <= server.INDEX_REPAIR_MAX_ATTEMPTS, \
+        f"exceeded repair budget: {server._index_repair_attempts}"
+
+
+def test_repair_disabled_by_config(monkeypatch):
+    monkeypatch.setattr(server, "INDEX_REPAIR_MAX_ATTEMPTS", 0)
+    _seed()
+    conn = server.get_conn()
+    _drop_vector_index(conn)
+
+    res = _search("classifier retraining schedule")
+    assert "degraded" in res
+    assert server._index_repair_attempts == 0, "repair must not run when disabled"
+
+
+def test_healthy_search_never_triggers_repair():
+    _seed()
+    res = _search("classifier retraining schedule")
+    assert "degraded" not in res
+    assert server._index_repair_attempts == 0, "healthy index must not be rebuilt"
+
+
+def test_stats_exposes_repair_attempts():
+    _seed()
+    conn = server.get_conn()
+    _drop_vector_index(conn)
+    _search("classifier retraining schedule")
+
+    vi = server.memory_stats.__wrapped__()["runtime"]["vector_index"]
+    assert vi["repair_attempts"] >= 1
