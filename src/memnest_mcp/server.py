@@ -183,6 +183,10 @@ LATENCY_WARN_MS = int(os.environ.get("MEMORY_LATENCY_WARN_MS", "200"))
 # Vector-channel scaling in search fusion: 'legacy' (raw cosine) or
 # 'normalized' (min-max, matching the FTS channel). Default 'legacy' because
 # the published benchmark score was measured with it.
+# Score multiplier for memories that a newer memory SUPERSEDES. 1.0 disables
+# the demotion; 0.0 sinks them to the bottom of the ranking.
+SUPERSEDED_PENALTY = float(os.environ.get("MEMORY_SUPERSEDED_PENALTY", "0.5"))
+
 FUSION_MODE = os.environ.get("MEMORY_FUSION", "legacy").strip().lower()
 if FUSION_MODE not in ("legacy", "normalized"):
     raise RuntimeError(
@@ -1389,12 +1393,17 @@ def memory_search(
     top_k: int = 5,
     global_search: bool = False,
     preview_chars: int = 200,
+    include_superseded: bool = True,
 ) -> str:
     """Hybrid semantic + keyword + graph search. Filters by current workspace unless global_search=True.
     top_k max 10. preview_chars caps content length per result (default 200).
     TIP: Pass tags=[...] to disambiguate overloaded query words (e.g. "workspace"
     could mean Brazil, Kiro, or ATX — tags narrow it instantly). See memory_stats
     for the list of known topics.
+
+    Memories that a newer memory SUPERSEDES are demoted and marked
+    "superseded": true, so the current answer ranks above the version it
+    replaced. Pass include_superseded=False to drop them entirely.
     """
     conn = get_conn()
     top_k = min(top_k, MAX_SEARCH_RESULTS)
@@ -1634,6 +1643,30 @@ def memory_search(
         )
         final_scores[mid] = final
 
+    # --- Supersession awareness ---
+    # A memory that something SUPERSEDES is stale by definition. Pure
+    # similarity cannot know that, and the query's wording usually matches the
+    # stale fact better than its own correction ("rounds using HALF_UP" beats
+    # "Correction: now uses HALF_EVEN" for the query "how does it round?"), so
+    # the outdated answer wins on relevance. Demote superseded memories so the
+    # current answer surfaces without the caller writing a graph query.
+    superseded: set[int] = set()
+    if final_scores:
+        try:
+            r = conn.execute(
+                """MATCH (x:Memory)-[:SUPERSEDES]->(m:Memory)
+                   WHERE m.id IN $ids RETURN DISTINCT m.id;""",
+                {"ids": list(final_scores)},
+            )
+            superseded = {row[0] for row in _collect_results(r)}
+        except Exception as e:
+            logger.debug(f"Supersession lookup failed: {e}")
+
+    if superseded:
+        for mid in superseded:
+            if mid in final_scores:
+                final_scores[mid] *= SUPERSEDED_PENALTY
+
     # Build results
     results = []
     for mid, score in sorted(final_scores.items(), key=lambda x: -x[1]):
@@ -1661,12 +1694,19 @@ def memory_search(
         if not global_search and mem.get("workspace", "") not in ("", WORKSPACE):
             continue
 
-        results.append({
+        if mid in superseded and not include_superseded:
+            continue
+
+        entry = {
             "id": mid,
             "content": _truncate(mem["content"], preview_chars),
             "tags": mem["tags"],
             "score": round(score, 4),
-        })
+        }
+        if mid in superseded:
+            # Flag it so the agent does not present stale info as current
+            entry["superseded"] = True
+        results.append(entry)
         if len(results) >= top_k:
             break
 
