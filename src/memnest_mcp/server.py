@@ -180,6 +180,15 @@ EMBEDDING_DIM = int(os.environ.get("MEMORY_EMBEDDING_DIM", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92"))
 LATENCY_WARN_MS = int(os.environ.get("MEMORY_LATENCY_WARN_MS", "200"))
 
+# Vector-channel scaling in search fusion: 'legacy' (raw cosine) or
+# 'normalized' (min-max, matching the FTS channel). Default 'legacy' because
+# the published benchmark score was measured with it.
+FUSION_MODE = os.environ.get("MEMORY_FUSION", "legacy").strip().lower()
+if FUSION_MODE not in ("legacy", "normalized"):
+    raise RuntimeError(
+        f"Invalid MEMORY_FUSION={FUSION_MODE!r}: expected 'legacy' or 'normalized'."
+    )
+
 # Response format: 'json' (default) or 'toon' (compact for LLM context)
 RESPONSE_FORMAT = os.environ.get("MEMORY_RESPONSE_FORMAT", "toon" if _TOON_AVAILABLE else "json").lower()
 
@@ -761,7 +770,10 @@ def _embed(text: str) -> Optional[list[float]]:
     try:
         return list(get_embed_model().embed([text]))[0].tolist()
     except Exception as e:
-        logger.warning(f"Embedding failed for text (len={len(text)}): {e}")
+        # ERROR, not WARNING: without embeddings the semantic channel is dead
+        # and retrieval silently degrades to keyword-only. Hosts commonly set
+        # FASTMCP_LOG_LEVEL=ERROR, which would hide a warning entirely.
+        logger.error(f"Embedding failed for text (len={len(text)}): {e}")
         return None
 
 
@@ -1286,6 +1298,10 @@ def memory_search(
     raw_scores: dict[int, dict[str, float]] = {}
     memory_data: dict[int, dict] = {}
 
+    # Ids that actually got a hit from the vector index. Needed because
+    # _record() pre-seeds every channel to 0.0, so key presence cannot
+    # distinguish "no semantic hit" from "semantic score of zero".
+    vector_hits: set[int] = set()
     def _record(mid: int, channel: str, score: float):
         if mid not in raw_scores:
             raw_scores[mid] = {"vector": 0.0, "fts": 0.0, "graph": 0.0}
@@ -1312,8 +1328,11 @@ def memory_search(
             )
             for row in _collect_results(result):
                 mid = row[0]
-                similarity = 1.0 - row[8]
+                # Cosine distance is 0..2, so raw 1-distance can go negative.
+                # Clamp so a dissimilar hit can never subtract from relevance.
+                similarity = max(0.0, min(1.0, 1.0 - row[8]))
                 _record(mid, "vector", similarity)
+                vector_hits.add(mid)
                 memory_data[mid] = {
                     "id": mid, "content": row[1], "category": row[2],
                     "tags": _parse_tags(row[3]),
@@ -1321,7 +1340,8 @@ def memory_search(
                     "workspace": row[6] or "", "updated_at": row[7] or 0.0,
                 }
         except Exception as e:
-            logger.warning(f"Vector search failed: {e}")
+            # ERROR, not WARNING: this silently degrades search to keyword-only.
+            logger.error(f"Vector search failed (semantic channel disabled): {e}")
 
     # --- Channel 2: Full-text search (BM25 via FTS index) ---
     if _count_memories(conn) > 0:
@@ -1437,6 +1457,26 @@ def memory_search(
 
     # --- Score fusion ---
     # Weighted combination: vector 0.4 + fts 0.3 + graph 0.15 + recency 0.1 + importance 0.05
+    #
+    # FUSION_MODE controls how the vector channel is scaled before weighting:
+    #   'legacy'     — raw cosine similarity (this is what the published LOCOMO
+    #                  score was measured with, so it stays the default)
+    #   'normalized' — min-max across candidates, matching how the FTS channel
+    #                  is already scaled. BGE similarities sit in a narrow high
+    #                  band (~0.4-0.85 even for unrelated text), so raw values
+    #                  give the semantic channel a large constant offset and
+    #                  weak discrimination, while normalized FTS always spans
+    #                  its full weight. Normalizing makes the effective
+    #                  influence match the documented weights.
+    # Re-run the LOCOMO benchmark before changing the default.
+    if FUSION_MODE == "normalized" and len(vector_hits) > 1:
+        vec_vals = [raw_scores[m]["vector"] for m in vector_hits]
+        v_lo, v_hi = min(vec_vals), max(vec_vals)
+        v_span = v_hi - v_lo
+        if v_span > 1e-9:
+            for m in vector_hits:
+                raw_scores[m]["vector"] = (raw_scores[m]["vector"] - v_lo) / v_span
+
     now = time.time()
     final_scores: dict[int, float] = {}
     for mid, channels in raw_scores.items():
@@ -1507,8 +1547,20 @@ def memory_search(
             "SET m.access_count = m.access_count + 1;",
             {"ids": ids})
 
+    # Report a dead semantic channel. Without this, a failed embedding model
+    # silently turns hybrid search into keyword-only search that still returns
+    # plausible-looking scores — the caller has no way to know retrieval is
+    # degraded. See _embed()/vector-search error logging above.
+    out: dict = {"results": results}
+    if not vector_hits and _count_memories(conn) > 0:
+        out["degraded"] = (
+            "Semantic (vector) search returned nothing — results are keyword-only. "
+            "The embedding model may have failed to load, or these memories were "
+            "stored without embeddings. Check memory_stats().runtime for details."
+        )
+
     # Wrap in a key so TOON can recognize the uniform array
-    return {"results": results}
+    return out
 
 
 @mcp.tool()
@@ -2016,6 +2068,19 @@ def memory_stats() -> str:
     except Exception as e:
         logger.warning(f"Top memories query failed: {e}")
 
+    # Embedding health: memories stored while the model was unavailable have a
+    # NULL embedding and are invisible to semantic search. Surfacing the count
+    # makes that recoverable instead of a silent quality loss.
+    missing_embeddings = 0
+    try:
+        r = conn.execute(
+            "MATCH (m:Memory) WHERE m.embedding IS NULL RETURN COUNT(m);"
+        )
+        if r.has_next():
+            missing_embeddings = r.get_next()[0] or 0
+    except Exception as e:
+        logger.debug(f"Embedding health check failed: {e}")
+
     # Dream state — useful for hooks deciding whether to trigger consolidation
     now = time.time()
     hours_since_dream = (now - _dream_last_time) / 3600 if _dream_last_time > 0 else None
@@ -2042,6 +2107,12 @@ def memory_stats() -> str:
         "runtime": {
             "version": SERVER_VERSION,
             "db_path": DB_PATH,
+            "embeddings": {
+                "model": EMBEDDING_MODEL,
+                "missing": missing_embeddings,
+                "healthy": missing_embeddings == 0,
+            },
+            "fusion_mode": FUSION_MODE,
             "workspace_source": _workspace_source,
             "client": _client_info,
             "client_supports_roots": _client_supports_roots,

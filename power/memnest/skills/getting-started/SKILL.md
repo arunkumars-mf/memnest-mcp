@@ -68,6 +68,11 @@ Tips:
 - Use `memory_get(memory_id=42)` for full untruncated content after search returns previews
 - Use `memory_topics(limit=20, min_count=2)` to discover existing tag filters
 
+**If the response contains a `degraded` field**, semantic search is dead and
+results are keyword-only (usually the embedding model failed to load). Tell
+the user rather than silently accepting worse recall — check
+`memory_stats().runtime.embeddings` for the cause.
+
 ### Step 3: Store new information
 
 Single mode:
@@ -100,12 +105,32 @@ Categories:
 
 Importance: 1=trivial, 2=low, 3=neutral (default), 4=important, 5=critical
 
-### Step 4: Link related memories
+### Step 4: Link related memories (this is the highest-value step)
+
+**Write edges, or you are using a graph database as a flat list.** Similarity
+search alone cannot tell that fact B replaces fact A, so without a
+`SUPERSEDES` edge an outdated decision keeps resurfacing next to its own
+correction and the agent cannot tell which one is current. Edges are what
+memnest offers over plain vector search.
+
+Create an edge whenever one of these is true:
+- You corrected or updated something already stored → `SUPERSEDES`
+- A bug, incident, or gotcha stems from a stored decision → `RELATED_TO`
+- One memory is the rationale for another → `EXPLAINS`
 
 ```
 memory_relate(from_id=10, to_id=5, relationship="RELATED_TO", confidence=0.9)
 memory_relate(from_id=10, to_id=3, relationship="SUPERSEDES")  # 10 replaces 3
 memory_relate(from_id=10, to_id=7, relationship="EXPLAINS")    # 10 explains 7
+```
+
+Then retrieval can be deterministic instead of similarity guesswork — this
+returns only the current version of a policy, ignoring superseded ones:
+
+```
+memory_query(cypher_query="MATCH (m:Memory) WHERE m.content CONTAINS 'retry policy' "
+                          "AND NOT EXISTS { MATCH (x:Memory)-[:SUPERSEDES]->(m) } "
+                          "RETURN m.id, m.content", read_only=True)
 ```
 
 Relationship types:
@@ -188,6 +213,7 @@ Three layers — you don't need to check manually:
 | `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic similarity threshold for dedup |
 | `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max search results |
+| `MEMORY_FUSION` | `legacy` | Vector-channel scaling: `legacy` (raw cosine) or `normalized` (min-max, matching the FTS channel). `normalized` is more robust on very small memory sets |
 
 ## Troubleshooting
 
@@ -198,6 +224,15 @@ LadybugDB allows a single read-write process per database file. Another memnest 
 ### Search returns results from other projects, or workspace is ''
 
 Auto-detection failed (client launched the server from `/` without roots support). Check `memory_stats().runtime.workspace_source`, then pin with `memory_set_workspace(path=...)`.
+
+### Search results include a `degraded` field
+
+Semantic search is unavailable, so results are keyword-only and recall is
+noticeably worse. Call `memory_stats()` and check `runtime.embeddings`: a
+non-zero `missing` count means some memories were stored while the embedding
+model was down (they are invisible to vector search — re-store them), and
+`healthy: false` with `missing: 0` means the model is failing at query time.
+Server logs record the cause at ERROR level.
 
 ### First call is slow
 
