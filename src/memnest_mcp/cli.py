@@ -23,6 +23,7 @@ AUTO_APPROVE = [
     "memory_relate", "memory_dream", "memory_query", "memory_schema",
     "memory_topics", "memory_stats", "memory_graph_html", "memory_get",
     "memory_list", "memory_traverse", "memory_set_workspace",
+    "memory_reindex",
 ]
 
 # --- Kiro agent hooks (direct MCP tool usage — no power required) ---

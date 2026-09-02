@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "memnest",
   "version": "1.0.0",
-  "description": "Memnest Memory — persistent graph memory for AI agents with hybrid vector + full-text + graph search powered by LadybugDB. Scores 82.9% on the LOCOMO benchmark. Zero LLM calls in the server.",
+  "description": "Memnest Memory \u2014 persistent graph memory for AI agents with hybrid vector + full-text + graph search powered by LadybugDB. Scores 82.9% on the LOCOMO benchmark. Zero LLM calls in the server.",
   "author": {
     "name": "arunkse",
     "url": "https://github.com/arunkumars-mf"
@@ -36,7 +36,8 @@
         "memory_get",
         "memory_list",
         "memory_traverse",
-        "memory_set_workspace"
+        "memory_set_workspace",
+        "memory_reindex"
       ]
     }
   }

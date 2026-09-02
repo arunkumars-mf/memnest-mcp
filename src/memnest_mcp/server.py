@@ -249,6 +249,9 @@ _roots_lock = anyio.Lock()
 _client_info: Optional[dict] = None
 _client_supports_roots: Optional[bool] = None
 
+# Result of the vector-index health check performed at connection time.
+_vector_index_state: dict = {}
+
 
 def _file_uri_to_path(uri) -> Optional[str]:
     """Convert a file:// URI to a local filesystem path, or None if not file://."""
@@ -569,6 +572,10 @@ def get_conn() -> lb.Connection:
         pass
 
     _init_schema(_conn)
+    # Repair a stale HNSW index before serving any query, otherwise semantic
+    # search silently degrades to keyword-only for the whole session.
+    global _vector_index_state
+    _vector_index_state = _ensure_vector_index(_conn)
     _load_dream_state()
     return _conn
 
@@ -649,6 +656,81 @@ def _init_schema(conn: lb.Connection):
     _apply_migrations(conn)
 
     logger.info("Schema initialized")
+
+
+def _probe_vector_index(conn: lb.Connection, k: int = 1) -> Optional[int]:
+    """Return how many rows the HNSW index returns for a synthetic probe.
+
+    None means the query itself failed. Uses a constant vector so this costs
+    no embedding-model work — we only care whether the index yields anything,
+    not what it matches.
+    """
+    try:
+        result = conn.execute(
+            """CALL QUERY_VECTOR_INDEX('Memory', 'memory_vec_idx', $q, $k)
+               WITH node AS m, distance RETURN m.id;""",
+            {"q": [0.1] * EMBEDDING_DIM, "k": k},
+        )
+        return len(_collect_results(result))
+    except Exception as e:
+        logger.debug(f"Vector index probe failed: {e}")
+        return None
+
+
+def _ensure_vector_index(conn: lb.Connection) -> dict:
+    """Detect and repair an HNSW index that does not cover existing rows.
+
+    Observed in the field: a database carried across versions and delete
+    cycles ended up with memory_vec_idx present but returning zero rows for
+    every query, while all 127 memories held valid 384-dim embeddings. The
+    effect is severe and silent — hybrid search degrades to keyword-only and
+    still returns plausible scores. Dropping and recreating the index
+    restores semantic search immediately.
+
+    Runs at connection time: one cheap probe, and a rebuild only when broken.
+    """
+    total = _count_memories(conn)
+    if total == 0:
+        return {"status": "empty", "rebuilt": False}
+
+    embedded = 0
+    try:
+        r = conn.execute("MATCH (m:Memory) WHERE m.embedding IS NOT NULL RETURN COUNT(m);")
+        if r.has_next():
+            embedded = r.get_next()[0] or 0
+    except Exception as e:
+        logger.debug(f"Embedded-row count failed: {e}")
+        return {"status": "unknown", "rebuilt": False}
+
+    if embedded == 0:
+        # Nothing to index; rebuilding cannot help. Callers see this via stats.
+        return {"status": "no_embeddings", "rebuilt": False, "memories": total}
+
+    if (_probe_vector_index(conn) or 0) > 0:
+        return {"status": "ok", "rebuilt": False}
+
+    logger.error(
+        f"Vector index is stale: {embedded} of {total} memories have embeddings "
+        f"but the HNSW index returns nothing. Semantic search would silently "
+        f"degrade to keyword-only. Rebuilding memory_vec_idx..."
+    )
+    try:
+        _safe_execute(conn, "CALL DROP_VECTOR_INDEX('Memory', 'memory_vec_idx');",
+                      expected_errors=("does not exist", "not found"))
+        conn.execute(
+            "CALL CREATE_VECTOR_INDEX('Memory', 'memory_vec_idx', 'embedding', "
+            "metric := 'cosine');"
+        )
+    except Exception as e:
+        logger.error(f"Vector index rebuild FAILED: {e}")
+        return {"status": "rebuild_failed", "rebuilt": False, "error": str(e)[:200]}
+
+    after = _probe_vector_index(conn) or 0
+    if after > 0:
+        logger.info(f"Vector index rebuilt successfully ({embedded} embeddings indexed)")
+        return {"status": "rebuilt", "rebuilt": True, "indexed": embedded}
+    logger.error("Vector index still returns nothing after rebuild")
+    return {"status": "broken", "rebuilt": True}
 
 
 def _verify_embedding_dim(conn: lb.Connection):
@@ -1555,8 +1637,10 @@ def memory_search(
     if not vector_hits and _count_memories(conn) > 0:
         out["degraded"] = (
             "Semantic (vector) search returned nothing — results are keyword-only. "
-            "The embedding model may have failed to load, or these memories were "
-            "stored without embeddings. Check memory_stats().runtime for details."
+            "Causes: the embedding model failed to load, these memories were stored "
+            "without embeddings, or the HNSW index is stale. Call memory_stats() and "
+            "check runtime.embeddings / runtime.vector_index, then run "
+            "memory_reindex() to rebuild the index."
         )
 
     # Wrap in a key so TOON can recognize the uniform array
@@ -2081,6 +2165,17 @@ def memory_stats() -> str:
     except Exception as e:
         logger.debug(f"Embedding health check failed: {e}")
 
+    # Probe the actual query path. Counting non-null embedding columns is not
+    # sufficient: a stale HNSW index reports full storage while returning
+    # nothing to searches.
+    # None means "not applicable" (empty DB). Otherwise False covers both a
+    # probe that errored and one that returned no rows — from search's point of
+    # view those are the same failure.
+    vector_index_live: Optional[bool] = None
+    if total > 0:
+        probe = _probe_vector_index(conn)
+        vector_index_live = probe is not None and probe > 0
+
     # Dream state — useful for hooks deciding whether to trigger consolidation
     now = time.time()
     hours_since_dream = (now - _dream_last_time) / 3600 if _dream_last_time > 0 else None
@@ -2110,14 +2205,80 @@ def memory_stats() -> str:
             "embeddings": {
                 "model": EMBEDDING_MODEL,
                 "missing": missing_embeddings,
-                "healthy": missing_embeddings == 0,
+                # Honest health: 'missing == 0' only proves vectors are STORED.
+                # It says nothing about whether the index returns them, which
+                # is what search actually depends on — so probe the query path.
+                "stored_ok": missing_embeddings == 0,
+                "index_returns_rows": vector_index_live,
+                "healthy": missing_embeddings == 0 and vector_index_live is not False,
+                "queryable": vector_index_live,
             },
+            "vector_index": _vector_index_state or {"status": "unknown"},
             "fusion_mode": FUSION_MODE,
             "workspace_source": _workspace_source,
             "client": _client_info,
             "client_supports_roots": _client_supports_roots,
             "roots_adoption": {"done": _roots_done, "attempts": _roots_attempts},
         },
+    }
+
+
+@mcp.tool()
+@_timed("memory_reindex")
+def memory_reindex() -> str:
+    """Rebuild the vector (HNSW) index, restoring semantic search.
+
+    Use when search results include a `degraded` field, or when
+    memory_stats().runtime.embeddings shows stored_ok true but
+    index_returns_rows false — meaning embeddings exist but the index does not
+    return them, so search has silently fallen back to keyword-only.
+
+    Safe to run any time: it only rebuilds the index, never touches memories.
+    Cost scales with memory count (the index is rebuilt from stored vectors).
+    """
+    conn = get_conn()
+    total = _count_memories(conn)
+    before = _probe_vector_index(conn)
+
+    embedded = 0
+    try:
+        r = conn.execute("MATCH (m:Memory) WHERE m.embedding IS NOT NULL RETURN COUNT(m);")
+        if r.has_next():
+            embedded = r.get_next()[0] or 0
+    except Exception:
+        pass
+
+    if total == 0:
+        return {"status": "empty", "message": "No memories to index."}
+    if embedded == 0:
+        return {
+            "status": "no_embeddings",
+            "memories": total,
+            "message": "No memory has an embedding, so there is nothing to index. "
+                       "The embedding model was unavailable when these were stored; "
+                       "re-store them once memory_stats() reports the model healthy.",
+        }
+
+    try:
+        _safe_execute(conn, "CALL DROP_VECTOR_INDEX('Memory', 'memory_vec_idx');",
+                      expected_errors=("does not exist", "not found"))
+        conn.execute(
+            "CALL CREATE_VECTOR_INDEX('Memory', 'memory_vec_idx', 'embedding', "
+            "metric := 'cosine');"
+        )
+    except Exception as e:
+        return {"status": "error", "error": str(e)[:300]}
+
+    after = _probe_vector_index(conn) or 0
+    global _vector_index_state
+    _vector_index_state = {"status": "rebuilt" if after > 0 else "broken",
+                           "rebuilt": True, "indexed": embedded}
+    return {
+        "status": "rebuilt" if after > 0 else "still_broken",
+        "memories": total,
+        "embeddings_indexed": embedded,
+        "index_rows_before": before,
+        "index_rows_after": after,
     }
 
 

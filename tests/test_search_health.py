@@ -141,3 +141,136 @@ def test_invalid_fusion_mode_is_rejected():
     )
     assert r.returncode != 0
     assert "MEMORY_FUSION" in (r.stdout + r.stderr)
+
+
+# --- Stale vector index: detection, self-heal, and manual repair -------------
+#
+# Observed in the field: a database carried across versions and delete cycles
+# had memory_vec_idx present and all 127 embeddings stored, yet
+# QUERY_VECTOR_INDEX returned zero rows for every query. Semantic search
+# silently degraded to keyword-only while reporting healthy storage.
+# These tests simulate that state by removing the index from under the data.
+
+def _drop_vector_index(conn):
+    conn.execute("CALL DROP_VECTOR_INDEX('Memory', 'memory_vec_idx');")
+
+
+def _seed(n=12):
+    server.memory_store.__wrapped__(items=[
+        {"content": f"The {s} service retrains its classifier on schedule {i}."}
+        for i, s in enumerate(["billing", "fraud", "search", "checkout", "ledger",
+                               "pricing", "identity", "cart", "shipping",
+                               "inventory", "auth", "notification"][:n])
+    ])
+
+
+def test_probe_detects_missing_vector_index():
+    _seed()
+    conn = server.get_conn()
+    assert (server._probe_vector_index(conn) or 0) > 0, "healthy index should return rows"
+    _drop_vector_index(conn)
+    # A dropped index makes the probe fail rather than return rows
+    assert not (server._probe_vector_index(conn) or 0) > 0
+
+
+def test_search_reports_degraded_when_index_is_stale():
+    _seed()
+    conn = server.get_conn()
+    _drop_vector_index(conn)
+    res = _search("how often is the anti-abuse classifier refreshed")
+    assert "degraded" in res, "a stale index must be reported, not silently tolerated"
+    assert "memory_reindex" in res["degraded"], "message should name the remedy"
+
+
+def test_memory_reindex_repairs_a_stale_index():
+    _seed()
+    conn = server.get_conn()
+    _drop_vector_index(conn)
+    assert "degraded" in _search("classifier retraining schedule")
+
+    out = server.memory_reindex.__wrapped__()
+    assert out["status"] == "rebuilt", out
+    assert out["embeddings_indexed"] == 12
+    assert out["index_rows_after"] > 0
+
+    res = _search("classifier retraining schedule")
+    assert "degraded" not in res, "search should be healthy after reindex"
+    assert res["results"]
+
+
+def test_connection_self_heals_stale_index(tmp_path, monkeypatch):
+    """Reopening a persistent database must restore working semantic search
+    with no user action.
+
+    Uses a file-backed DB because the data has to survive the reconnect (the
+    default ':memory:' would start empty). Note that a *dropped* index is
+    recreated by _init_schema, whose CREATE is only a no-op when the index
+    already exists. The field failure was subtler — the index existed but
+    returned nothing, so _init_schema skipped it and only the
+    _ensure_vector_index probe catches it. Either way, what a caller needs is
+    that search works again after a reconnect.
+    """
+    def close_conn():
+        """Close before reopening. Nulling the globals alone leaves the old
+        handle holding the WAL, which corrupts the next open on a file DB."""
+        try:
+            if server._conn is not None:
+                server._conn.close()
+            if server._db is not None:
+                server._db.close()
+        except Exception:
+            pass
+        server._conn = None
+        server._db = None
+
+    db = tmp_path / "persist.lbug"
+    monkeypatch.setenv("MEMORY_DB_PATH", str(db))
+    close_conn()
+
+    _seed()
+    conn = server.get_conn()
+    assert str(db) == server.DB_PATH, server.DB_PATH
+    _drop_vector_index(conn)
+    assert "degraded" in _search("classifier retraining schedule")
+
+    # Force a reconnect (as a server restart would)
+    close_conn()
+    server.get_conn()
+
+    assert server._vector_index_state.get("status") in ("ok", "rebuilt"), \
+        server._vector_index_state
+    res = _search("classifier retraining schedule")
+    assert "degraded" not in res, "reconnect should leave search healthy"
+    assert res["results"]
+
+    close_conn()
+
+
+def test_stats_distinguishes_stored_from_queryable():
+    """The old health check said 'healthy' whenever vectors were stored. It must
+    now also report whether the index actually returns them."""
+    _seed()
+    conn = server.get_conn()
+    _drop_vector_index(conn)
+
+    emb = server.memory_stats.__wrapped__()["runtime"]["embeddings"]
+    assert emb["missing"] == 0
+    assert emb["stored_ok"] is True, "vectors are stored"
+    assert emb["index_returns_rows"] is False, "but the index returns nothing"
+    assert emb["healthy"] is False, "so overall health must be False"
+
+
+def test_reindex_on_empty_database():
+    out = server.memory_reindex.__wrapped__()
+    assert out["status"] == "empty"
+
+
+def test_reindex_reports_when_nothing_has_embeddings(monkeypatch):
+    monkeypatch.setattr(server, "_embed", lambda text: None)
+    monkeypatch.setattr(server, "_embed_batch", lambda texts: [None] * len(texts))
+    server.memory_store.__wrapped__(content="stored while the model was down")
+
+    out = server.memory_reindex.__wrapped__()
+    assert out["status"] == "no_embeddings"
+    assert out["memories"] == 1
+    assert "re-store" in out["message"]

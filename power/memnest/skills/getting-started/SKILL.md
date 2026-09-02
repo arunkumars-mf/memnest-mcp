@@ -228,11 +228,17 @@ Auto-detection failed (client launched the server from `/` without roots support
 ### Search results include a `degraded` field
 
 Semantic search is unavailable, so results are keyword-only and recall is
-noticeably worse. Call `memory_stats()` and check `runtime.embeddings`: a
-non-zero `missing` count means some memories were stored while the embedding
-model was down (they are invisible to vector search — re-store them), and
-`healthy: false` with `missing: 0` means the model is failing at query time.
-Server logs record the cause at ERROR level.
+noticeably worse. Call `memory_stats()` and read `runtime.embeddings`:
+
+| Reading | Meaning | Fix |
+|---------|---------|-----|
+| `missing` > 0 | Those memories were stored while the model was down and are invisible to semantic search | Re-store them |
+| `stored_ok: true`, `index_returns_rows: false` | Vectors exist but the HNSW index does not return them (stale index) | `memory_reindex()` |
+| `missing: 0`, `index_returns_rows: true` | Storage and index are fine; the model is failing at query time | Check server logs (ERROR level) |
+
+A stale index is repaired automatically when the server reconnects, and
+`memory_reindex()` forces it at any time. It only rebuilds the index — it
+never modifies memories.
 
 ### First call is slow
 
