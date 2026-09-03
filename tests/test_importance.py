@@ -180,3 +180,61 @@ def test_access_count_is_not_part_of_the_ranking_formula():
     conn = server.get_conn()
     conn.execute("MATCH (m:Memory {id: $i}) SET m.access_count = 9999;", {"i": a["id"]})
     assert scores() == before, "access_count must not influence the score"
+
+
+# ---------------------------------------------------------------------------
+# An omitted importance must not be read as the caller asserting 3.
+#
+# Follow-up to the fix above. Taking max(existing, incoming) is right, but the
+# tool substituted its default of 3 before reaching the merge, so a memory
+# deliberately stored at importance 2 was silently raised to 3 by any
+# restatement that simply left the argument out. Bounded at the default rather
+# than ratcheting to the ceiling, so not the original bug — but "importance is
+# caller-owned" only holds if an unstated value stays unstated.
+# ---------------------------------------------------------------------------
+
+
+def test_restatement_omitting_importance_leaves_it_untouched():
+    a = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=2)
+    assert _state(a["id"])["importance"] == 2
+
+    server.memory_store.__wrapped__(content=LATENCY_PARA, tags=TAGS)
+    assert _state(a["id"])["importance"] == 2, \
+        "omitting importance must not apply the default to an existing memory"
+
+    server.memory_store.__wrapped__(content=LATENCY, tags=TAGS)
+    assert _state(a["id"])["importance"] == 2
+
+
+def test_new_memory_without_importance_still_defaults_to_three():
+    a = server.memory_store.__wrapped__(content="Atlas stores its event log in Kinesis.",
+                                        tags=["atlas", "eventlog"])
+    assert _state(a["id"])["importance"] == server.DEFAULT_IMPORTANCE == 3
+
+
+def test_explicit_importance_on_a_restatement_still_applies():
+    a = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=2)
+    server.memory_store.__wrapped__(content=LATENCY_PARA, tags=TAGS, importance=5)
+    assert _state(a["id"])["importance"] == 5, \
+        "a caller that states a value must still be able to raise importance"
+
+
+def test_batch_item_without_importance_does_not_promote():
+    a = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=2)
+    out = server.memory_store.__wrapped__(items=[
+        {"content": LATENCY_PARA, "tags": TAGS},
+        {"content": "Rigel caches lookups in Memcached.", "tags": ["rigel", "cache"]},
+    ])
+    assert _state(a["id"])["importance"] == 2
+    new_id = out["results"][1]["id"]
+    assert _state(new_id)["importance"] == 3, "a new batch item still gets the default"
+
+
+@pytest.mark.parametrize("given,expected", [(99, 5), (6, 5), (5, 5), (1, 1), (0, 1), (-4, 1)])
+def test_importance_is_clamped_to_the_documented_range(given, expected):
+    """The ranking term is (importance - 1) / 4, so an unclamped 9 would carry
+    double the weight the 1-5 scale allows."""
+    a = server.memory_store.__wrapped__(
+        content=f"Sirius exposes health endpoint number {given}.",
+        tags=["sirius", "health"], importance=given)
+    assert _state(a["id"])["importance"] == expected

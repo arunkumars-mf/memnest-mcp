@@ -1376,10 +1376,34 @@ def _store_without_embedding(conn, content: str, content_hash: str, category: st
             "message": "Stored, but embedding generation failed. Vector search will skip this memory."}
 
 
-def _store_one(conn, content: str, category: str, tags: list[str], importance: int,
+DEFAULT_IMPORTANCE = 3
+
+
+def _clamp_importance(value: int) -> int:
+    """Hold importance inside the documented 1-5 range.
+
+    Out-of-range values are not merely cosmetic: the ranking term is
+    (importance - 1) / 4, so an unclamped 9 would contribute double the weight
+    the scale allows. memory_update already clamped; store did not.
+    """
+    try:
+        return min(5, max(1, int(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_IMPORTANCE
+
+
+def _store_one(conn, content: str, category: str, tags: list[str],
+               importance: Optional[int] = None,
                embedding: Optional[list[float]] = None,
                supersedes: Optional[int] = None) -> dict:
     """Core single-memory store logic. Returns a status dict.
+
+    `importance` of None means the caller did not state one. That is kept
+    distinct from an explicit 3, because substituting the default early let it
+    leak into merges: a memory deliberately stored at importance 2 was raised to
+    3 by any restatement that simply omitted the argument. A new memory still
+    defaults to DEFAULT_IMPORTANCE; a merge with no stated importance leaves the
+    existing value alone.
 
     If `embedding` is pre-computed (for batch mode), uses it instead of computing again.
 
@@ -1392,6 +1416,11 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
     """
     c_hash = _content_hash(content)
     now = time.time()
+    # Value written when this turns out to be a NEW memory. Merges consult
+    # `importance` itself so they can tell "unstated" from an explicit 3.
+    new_memory_importance = (
+        DEFAULT_IMPORTANCE if importance is None else _clamp_importance(importance)
+    )
 
     # Layer 1: Exact hash dedup
     result = conn.execute(
@@ -1416,7 +1445,8 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
     if embedding is None:
         # Embedding failed — skip semantic dedup and store with NULL embedding
         # (vector search will skip these; FTS / Cypher still work)
-        return _store_without_embedding(conn, content, c_hash, category, tags, importance, now)
+        return _store_without_embedding(conn, content, c_hash, category, tags,
+                                        new_memory_importance, now)
 
     # Set when a near-duplicate was refused a merge because its values disagree.
     # Reported on the stored_new result so the caller learns about the competing
@@ -1480,7 +1510,14 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
                     # Importance is caller-owned metadata; the server should not
                     # editorialise it. This now matches dream's merge, which has
                     # always taken a plain max.
-                    new_imp = min(5, max(match_importance, importance))
+                    #
+                    # An unstated importance leaves the existing value untouched.
+                    # Applying the default here would mean a restatement that
+                    # omits the argument silently raises a deliberate 2 to 3.
+                    if importance is None:
+                        new_imp = match_importance
+                    else:
+                        new_imp = min(5, max(match_importance, _clamp_importance(importance)))
                     content_changed = (keep != match_content)
 
                     if content_changed:
@@ -1552,7 +1589,8 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
                embedding: $emb
            });""",
         {"id": mem_id, "content": content, "hash": c_hash,
-         "cat": category, "tags": _format_tags(tags), "ws": WORKSPACE, "imp": importance,
+         "cat": category, "tags": _format_tags(tags), "ws": WORKSPACE,
+         "imp": new_memory_importance,
          "now": now, "emb": embedding},
     )
     _ensure_topics(conn, mem_id, tags)
@@ -1590,7 +1628,7 @@ def memory_store(
     content: Optional[str] = None,
     category: Literal["learning", "preference", "decision", "pattern", "general"] = "general",
     tags: Optional[list[str]] = None,
-    importance: int = 3,
+    importance: Optional[int] = None,
     items: Optional[list[dict]] = None,
     supersedes: Optional[int] = None,
 ) -> str:
@@ -1603,7 +1641,11 @@ def memory_store(
     that store — essential, because a correction is textually near-identical to
     what it corrects, so dedup would otherwise merge the two and erase the
     history. Search then ranks the new version above the old one automatically.
-    Importance 1-5; default 3 (neutral).
+
+    Importance 1-5, default 3 (neutral) for a NEW memory. Omitting it when the
+    store turns out to be a duplicate leaves the existing memory's importance
+    untouched, so restating a fact can never change how it ranks. Pass it
+    explicitly to set a value.
     """
     conn = get_conn()
     tags = tags or []
@@ -1625,7 +1667,7 @@ def memory_store(
                     content=item.get("content", ""),
                     category=item.get("category", "general"),
                     tags=item.get("tags", []),
-                    importance=item.get("importance", 3),
+                    importance=item.get("importance"),
                     embedding=emb,
                     supersedes=item.get("supersedes"),
                 )
