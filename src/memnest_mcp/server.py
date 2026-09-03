@@ -1213,10 +1213,18 @@ def _store_without_embedding(conn, content: str, content_hash: str, category: st
 
 
 def _store_one(conn, content: str, category: str, tags: list[str], importance: int,
-               embedding: Optional[list[float]] = None) -> dict:
+               embedding: Optional[list[float]] = None,
+               supersedes: Optional[int] = None) -> dict:
     """Core single-memory store logic. Returns a status dict.
 
     If `embedding` is pre-computed (for batch mode), uses it instead of computing again.
+
+    `supersedes` marks this memory as replacing an existing one: it disables
+    semantic dedup for this store and creates the SUPERSEDES edge. Both must
+    happen together, because a correction is textually near-identical to what it
+    corrects — two consecutive retry-policy versions measured 0.9284 similarity,
+    above the 0.92 dedup threshold — so dedup would merge them and destroy the
+    very history the edge exists to record.
     """
     c_hash = _content_hash(content)
     now = time.time()
@@ -1257,7 +1265,9 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
             )
             for row in _collect_results(result):
                 similarity = round(1.0 - row[6], 4)
-                if similarity >= DEDUP_THRESHOLD:
+                # An explicit supersedes target means the caller is recording a
+                # new version, not a duplicate. Never merge those.
+                if similarity >= DEDUP_THRESHOLD and supersedes is None:
                     match_id = row[0]
                     match_content = row[1]
                     match_category = row[2]
@@ -1337,7 +1347,17 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
     )
     _ensure_topics(conn, mem_id, tags)
 
-    return {"status": "stored_new", "id": mem_id}
+    out = {"status": "stored_new", "id": mem_id}
+
+    # Wire the correction chain in the same call, so a new version can never be
+    # stored without the edge that marks what it replaces.
+    if supersedes is not None:
+        rel = _relate_one(conn, mem_id, supersedes, relationship="SUPERSEDES")
+        out["supersedes"] = supersedes
+        if rel.get("status") != "created":
+            out["supersedes_error"] = rel.get("error") or rel.get("status")
+
+    return out
 
 
 @mcp.tool()
@@ -1348,10 +1368,17 @@ def memory_store(
     tags: Optional[list[str]] = None,
     importance: int = 3,
     items: Optional[list[dict]] = None,
+    supersedes: Optional[int] = None,
 ) -> str:
     """Store one or more memories with auto-dedup and topic linking.
     Single: pass content/category/tags/importance.
-    Batch: pass items=[{content, category?, tags?, importance?}, ...] (faster — single embed call).
+    Batch: pass items=[{content, category?, tags?, importance?, supersedes?}, ...] (faster — single embed call).
+
+    RECORDING A CORRECTION: pass supersedes=<old_id> (works per-item in batch
+    mode too). That creates the SUPERSEDES edge AND disables semantic dedup for
+    that store — essential, because a correction is textually near-identical to
+    what it corrects, so dedup would otherwise merge the two and erase the
+    history. Search then ranks the new version above the old one automatically.
     Importance 1-5; default 3 (neutral).
     """
     conn = get_conn()
@@ -1376,6 +1403,7 @@ def memory_store(
                     tags=item.get("tags", []),
                     importance=item.get("importance", 3),
                     embedding=emb,
+                    supersedes=item.get("supersedes"),
                 )
                 results.append(res)
             except Exception as e:
@@ -1388,7 +1416,8 @@ def memory_store(
     if content is None:
         return {"status": "error", "message": "content is required (or pass items=[...])."}
 
-    res = _store_one(conn, content, category, tags, importance)
+    res = _store_one(conn, content, category, tags, importance,
+                     supersedes=supersedes)
     _bump_dream_ops()
     return res
 

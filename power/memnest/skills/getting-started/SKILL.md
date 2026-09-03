@@ -129,6 +129,14 @@ Create an edge whenever one of these is true:
 - A bug, incident, or gotcha stems from a stored decision → `RELATED_TO`
 - One memory is the rationale for another → `EXPLAINS`
 
+**Recording a correction: always use `memory_store(..., supersedes=<old_id>)`**
+rather than storing then relating. A correction is textually near-identical to
+what it corrects, so a plain store can be silently absorbed by semantic dedup
+(measured: two consecutive retry-policy versions at 0.9284 similarity, above
+the 0.92 threshold — the intermediate version vanished). Passing `supersedes`
+disables dedup for that store and wires the edge in one call, so the chain
+cannot be lost. Works per-item in batch mode too.
+
 ```
 memory_relate(from_id=10, to_id=5, relationship="RELATED_TO", confidence=0.9)
 memory_relate(from_id=10, to_id=3, relationship="SUPERSEDES")  # 10 replaces 3
