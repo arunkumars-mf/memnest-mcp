@@ -73,6 +73,17 @@ results are keyword-only (usually the embedding model failed to load). Tell
 the user rather than silently accepting worse recall — check
 `memory_stats().runtime.embeddings` for the cause.
 
+**If the response contains a `related` list**, those are memories connected by
+graph edges to your top hits (each names its anchor via `linked_to`). They are
+reported separately because similarity ranking would not surface them — the
+incident caused by a decision, the rationale behind a convention, the version
+a correction replaced. Read them: they are often the context that actually
+answers the question, and they only exist because edges were written.
+
+**Superseded results** carry `"superseded": true`. Never present those as
+current — the memory that supersedes them ranks above them, or pass
+`include_superseded=False` to drop them.
+
 ### Step 3: Store new information
 
 Single mode:

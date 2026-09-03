@@ -187,6 +187,12 @@ LATENCY_WARN_MS = int(os.environ.get("MEMORY_LATENCY_WARN_MS", "200"))
 # the demotion; 0.0 sinks them to the bottom of the ranking.
 SUPERSEDED_PENALTY = float(os.environ.get("MEMORY_SUPERSEDED_PENALTY", "0.5"))
 
+# Graph neighbours reported alongside search results: how many top hits to
+# expand from, and how many connected memories to return. Set
+# MEMORY_GRAPH_EXPAND_SEEDS=0 to disable.
+GRAPH_EXPAND_SEEDS = int(os.environ.get("MEMORY_GRAPH_EXPAND_SEEDS", "3"))
+GRAPH_EXPAND_LIMIT = int(os.environ.get("MEMORY_GRAPH_EXPAND_LIMIT", "5"))
+
 FUSION_MODE = os.environ.get("MEMORY_FUSION", "legacy").strip().lower()
 if FUSION_MODE not in ("legacy", "normalized"):
     raise RuntimeError(
@@ -1404,6 +1410,13 @@ def memory_search(
     Memories that a newer memory SUPERSEDES are demoted and marked
     "superseded": true, so the current answer ranks above the version it
     replaced. Pass include_superseded=False to drop them entirely.
+
+    When the top hits have RELATED_TO / SUPERSEDES / EXPLAINS edges, connected
+    memories are returned in a separate "related" list (with "linked_to"
+    naming the result they hang off). These are memories similarity alone
+    would not surface — the incident caused by a decision, the rationale
+    behind a convention — and they are kept out of "results" so graph
+    proximity never displaces a direct answer.
     """
     conn = get_conn()
     top_k = min(top_k, MAX_SEARCH_RESULTS)
@@ -1567,8 +1580,11 @@ def memory_search(
                         top_communities.add(community)
 
                 # Community expansion: find other memories in the same communities
-                # as our top results — they're likely relevant too
-                if top_communities and len(results) < top_k:
+                # as our top results — they're likely relevant too.
+                # (Previously guarded by `len(results)`, a variable not bound
+                # until ~100 lines later, so this raised UnboundLocalError into
+                # the enclosing handler and never actually ran.)
+                if top_communities:
                     community_list = list(top_communities)[:3]  # cap at 3 communities
                     try:
                         result = conn.execute(
@@ -1718,11 +1734,51 @@ def memory_search(
             "SET m.access_count = m.access_count + 1;",
             {"ids": ids})
 
+    # --- Graph neighbours (query-dependent traversal, reported separately) ---
+    # PageRank, K-Core and community membership are query-INDEPENDENT: they say
+    # a memory is globally central, not that it answers THIS query. They also
+    # need memory_dream to have run and stay uniform until the graph has edges.
+    #
+    # The useful graph move is to expand one hop from what the query actually
+    # matched — the incident caused by a decision, the rationale behind a
+    # convention, the correction to a stale fact. Those are deliberately NOT
+    # mixed into `results`: raw cosine similarity has a high floor (~0.5 even
+    # for unrelated text), so every similarity candidate carries a large
+    # constant while a graph-only hit caps at the 0.15 graph weight. Boosting
+    # graph enough to compete would let loosely-linked memories crowd out
+    # direct answers. Reporting them separately preserves ranking precision
+    # and still gives the agent the connection explicitly.
+    related: list[dict] = []
+    if results and GRAPH_EXPAND_SEEDS > 0:
+        try:
+            seeds = [r["id"] for r in results[:GRAPH_EXPAND_SEEDS]]
+            returned = {r["id"] for r in results}
+            r = conn.execute(
+                """MATCH (s:Memory)-[e:RELATED_TO|SUPERSEDES|EXPLAINS]-(n:Memory)
+                   WHERE s.id IN $seeds
+                   RETURN DISTINCT n.id, n.content, n.importance, s.id;""",
+                {"seeds": seeds},
+            )
+            for row in _collect_results(r):
+                if row[0] in returned:
+                    continue  # already ranked on its own merits
+                related.append({
+                    "id": row[0],
+                    "content": _truncate(row[1], preview_chars),
+                    "linked_to": row[3],
+                })
+                if len(related) >= GRAPH_EXPAND_LIMIT:
+                    break
+        except Exception as e:
+            logger.debug(f"Neighbour expansion failed (non-fatal): {e}")
+
     # Report a dead semantic channel. Without this, a failed embedding model
     # silently turns hybrid search into keyword-only search that still returns
     # plausible-looking scores — the caller has no way to know retrieval is
     # degraded. See _embed()/vector-search error logging above.
     out: dict = {"results": results}
+    if related:
+        out["related"] = related
     if not vector_hits and _count_memories(conn) > 0:
         out["degraded"] = (
             "Semantic (vector) search returned nothing — results are keyword-only. "
