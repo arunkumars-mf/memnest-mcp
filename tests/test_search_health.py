@@ -195,7 +195,7 @@ def test_memory_reindex_repairs_a_stale_index():
     out = server.memory_reindex.__wrapped__()
     assert out["status"] == "rebuilt", out
     assert out["embeddings_indexed"] == 12
-    assert out["index_rows_after"] > 0
+    assert out["index_answering_after"] is True
 
     res = _search("classifier retraining schedule")
     assert "degraded" not in res, "search should be healthy after reindex"

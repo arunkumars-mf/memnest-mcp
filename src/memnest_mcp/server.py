@@ -1797,12 +1797,19 @@ def memory_search(
     global_search: bool = False,
     preview_chars: int = 200,
     include_superseded: bool = True,
+    explain: bool = False,
 ) -> str:
     """Hybrid semantic + keyword + graph search. Filters by current workspace unless global_search=True.
     top_k max 10. preview_chars caps content length per result (default 200).
     TIP: Pass tags=[...] to disambiguate overloaded query words (e.g. "workspace"
     could mean Brazil, Kiro, or ATX — tags narrow it instantly). See memory_stats
     for the list of known topics.
+
+    explain=True attaches a per-result "explain" block (raw channel values,
+    weighted contributions, and whether the memory came back from the vector
+    index for THIS query) plus a top-level "explain_meta". Use it to diagnose
+    ranking: e.g. a memory scoring ~0.3 below expectation with
+    in_vector_window=false has lost its semantic contribution for that query.
 
     Memories that a newer memory SUPERSEDES are demoted and marked
     "superseded": true, so the current answer ranks above the version it
@@ -2033,6 +2040,13 @@ def memory_search(
 
     now = time.time()
     final_scores: dict[int, float] = {}
+    # Per-memory fusion inputs, kept when explain=True so a caller can see WHY
+    # a memory scored what it did — added because a real ranking anomaly (a
+    # memory losing exactly its vector contribution on one query, on one
+    # database) was undiagnosable from outside: every enumerated input favoured
+    # the losing memory, and the per-channel values were the only place the
+    # difference could live.
+    explain_data: dict[int, dict] = {}
     for mid, channels in raw_scores.items():
         mem = memory_data.get(mid, {})
         vec_score = channels.get("vector", 0.0)
@@ -2056,6 +2070,23 @@ def memory_search(
             + importance_score * 0.05
         )
         final_scores[mid] = final
+
+        if explain:
+            explain_data[mid] = {
+                "vector": round(vec_score, 4),
+                "fts": round(fts_score, 4),
+                "graph": round(graph_score, 4),
+                "recency": round(recency_score, 4),
+                "importance_norm": round(importance_score, 4),
+                "in_vector_window": mid in vector_hits,
+                "weighted": {
+                    "vector": round(vec_score * 0.4, 4),
+                    "fts": round(fts_score * 0.3, 4),
+                    "graph": round(graph_score * 0.15, 4),
+                    "recency": round(recency_score * 0.1, 4),
+                    "importance": round(importance_score * 0.05, 4),
+                },
+            }
 
     # --- Supersession awareness ---
     # A memory that something SUPERSEDES is stale by definition. Pure
@@ -2120,6 +2151,11 @@ def memory_search(
         if mid in superseded:
             # Flag it so the agent does not present stale info as current
             entry["superseded"] = True
+        if explain and mid in explain_data:
+            ex = dict(explain_data[mid])
+            if mid in superseded:
+                ex["superseded_penalty"] = SUPERSEDED_PENALTY
+            entry["explain"] = ex
         results.append(entry)
         if len(results) >= top_k:
             break
@@ -2254,6 +2290,22 @@ def memory_search(
         out["related"] = related
     if conflicts:
         out["potential_conflicts"] = conflicts
+    if explain:
+        out["explain_meta"] = {
+            "fusion_mode": FUSION_MODE,
+            "weights": {"vector": 0.4, "fts": 0.3, "graph": 0.15,
+                        "recency": 0.1, "importance": 0.05},
+            "embedding_model": EMBEDDING_MODEL,
+            "query_embedded": embedding is not None,
+            # The vector channel asks the HNSW index for the k nearest
+            # neighbours GLOBALLY (k = top_k*3) and workspace-filters after,
+            # so these two numbers say how much of the window this query used
+            # and how many candidates survived the filter.
+            "vector_k": top_k * 3,
+            "vector_hits": len(vector_hits),
+            "candidates_scored": len(raw_scores),
+            "superseded_penalty": SUPERSEDED_PENALTY,
+        }
     if not vector_hits and _count_memories(conn) > 0:
         out["degraded"] = (
             "Semantic (vector) search returned nothing — results are keyword-only. "
@@ -2900,8 +2952,12 @@ def memory_reindex() -> str:
         "status": "rebuilt" if after > 0 else "still_broken",
         "memories": total,
         "embeddings_indexed": embedded,
-        "index_rows_before": before,
-        "index_rows_after": after,
+        # The probe is a k=1 synthetic query — it answers "does the index
+        # respond at all", not "how many rows are indexed". The old field names
+        # (index_rows_before/after) read as row counts and made a healthy
+        # rebuild of 38 embeddings look like it had indexed one row.
+        "index_answering_before": bool(before),
+        "index_answering_after": bool(after),
     }
 
 
