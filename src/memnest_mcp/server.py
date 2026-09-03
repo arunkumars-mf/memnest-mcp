@@ -180,6 +180,14 @@ EMBEDDING_DIM = int(os.environ.get("MEMORY_EMBEDDING_DIM", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("MEMORY_DEDUP_THRESHOLD", "0.92"))
 LATENCY_WARN_MS = int(os.environ.get("MEMORY_LATENCY_WARN_MS", "200"))
 
+# Refuse to merge two near-identical memories whose value-bearing tokens
+# disagree (500ms vs 900ms, Kafka vs Kinesis, prod-checkout vs prod-inventory).
+# Set MEMORY_MERGE_VALUE_GATE=0 to restore pure-similarity merging. Unsafe:
+# without it, storing a corrected value can silently keep the stale one.
+MERGE_VALUE_GATE = os.environ.get("MEMORY_MERGE_VALUE_GATE", "1").lower() not in (
+    "0", "false", "no", "off",
+)
+
 # Vector-channel scaling in search fusion: 'legacy' (raw cosine) or
 # 'normalized' (min-max, matching the FTS channel). Default 'legacy' because
 # the published benchmark score was measured with it.
@@ -704,6 +712,84 @@ def _init_schema(conn: lb.Connection):
     _apply_migrations(conn)
 
     logger.info("Schema initialized")
+
+
+_NUMERIC_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_CAPPED_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*\b")
+# Lowercase identifiers: service/host/env names such as prod-checkout,
+# payments-core, ledger-db, api.internal, feature/flag. Requires an internal
+# separator so prose words don't qualify, and must not start with a digit so
+# quantities like "30-minute" stay with the numeric class instead.
+_IDENT_RE = re.compile(r"\b[a-z][a-z0-9]*(?:[-_./:][a-z0-9]+)+\b")
+
+
+_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _discriminating_tokens(text: str, name_vocab: Optional[set] = None) -> set:
+    """Extract the tokens that carry a fact's VALUE rather than its phrasing.
+
+    Three classes distinguish two statements about the same subject:
+      numbers        500ms vs 900ms, Q2 2026 vs Q3 2026, Java 17 vs Java 21
+      names          Kafka vs Kinesis, HALF_UP vs HALF_EVEN, PostgreSQL vs DynamoDB
+      identifiers    prod-checkout vs prod-inventory, ledger-db vs inventory-cache
+
+    Ordinary wording differences ("caches sessions" vs "caches user sessions")
+    leave all three identical. Thousands separators are stripped so
+    "12,000"/"12000" match, and everything is lowercased.
+
+    `name_vocab` supplies the set of words to treat as names. It matters because
+    capitalisation is evidence, not identity: deriving names from this text alone
+    makes the class asymmetric, so "Uses Redis" would yield {uses, redis} while
+    "uses redis" yields {} and a pure case difference would read as two missing
+    values. Callers comparing two texts pass the union of both vocabularies.
+    """
+    norm = text.replace(",", "")
+    nums = {n.rstrip(".") for n in _NUMERIC_RE.findall(norm)}
+    idents = set(_IDENT_RE.findall(text.lower()))
+    if name_vocab is None:
+        name_vocab = {w.lower() for w in _CAPPED_RE.findall(text)}
+    names = {w for w in _WORD_RE.findall(text.lower()) if w in name_vocab}
+    return nums | names | idents
+
+
+def _name_vocab(*texts: str) -> set:
+    """Words capitalised in ANY of the given texts, lowercased."""
+    vocab = set()
+    for t in texts:
+        vocab |= {w.lower() for w in _CAPPED_RE.findall(t)}
+    return vocab
+
+
+def _values_conflict(a: str, b: str) -> bool:
+    """True when two texts disagree on a value-bearing token.
+
+    Used to refuse a DESTRUCTIVE merge. Two memories about the same subject
+    whose numbers or named values differ are not duplicates — they are
+    competing facts, and merging them silently discards one. Observed: storing
+    "Vega request timeout is 900 milliseconds" over "...is 500 milliseconds"
+    merged at 0.929 and kept the STALE 500ms value while reporting success.
+
+    A superset is not a conflict: "5 attempts" vs "5 attempts with jitter and a
+    10s cap" adds tokens rather than contradicting them, so only genuine
+    disagreement on shared token *kinds* blocks the merge.
+    """
+    if not MERGE_VALUE_GATE:
+        return False
+    vocab = _name_vocab(a, b)
+    ta = _discriminating_tokens(a, vocab)
+    tb = _discriminating_tokens(b, vocab)
+    if ta == tb:
+        return False
+    # One side strictly richer = elaboration rather than disagreement, but that
+    # is only SAFE if the richer text is the one the merge keeps. Both merge
+    # paths keep the longer string, so a shorter-but-value-richer text would
+    # have its extra values thrown away — treat that as a conflict instead.
+    if ta < tb:
+        return not len(b) > len(a)
+    if tb < ta:
+        return not len(a) > len(b)
+    return True
 
 
 def _same_subject(tags_a, tags_b) -> bool:
@@ -1330,6 +1416,12 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
         # (vector search will skip these; FTS / Cypher still work)
         return _store_without_embedding(conn, content, c_hash, category, tags, importance, now)
 
+    # Set when a near-duplicate was refused a merge because its values disagree.
+    # Reported on the stored_new result so the caller learns about the competing
+    # fact at write time, without waiting for a search to flag it.
+    conflict_with = None
+    conflict_sim = None
+
     if _count_memories(conn) > 0:
         try:
             # Filter by workspace inside the WITH clause to avoid wasted candidates
@@ -1357,6 +1449,23 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
                         logger.debug(
                             f"Not merging into {match_id} (sim {similarity}): "
                             f"different subject ({tags} vs {match_tags})"
+                        )
+                        continue
+
+                    # Same subject, disagreeing values = competing facts, not
+                    # duplicates. Merging would silently discard one side (and
+                    # on equal-length texts the `keep` tie below favours the
+                    # OLDER value, so the stale fact would win). Keep both and
+                    # let potential_conflicts surface it at read time.
+                    if _values_conflict(content, match_content):
+                        if conflict_with is None:
+                            conflict_with = match_id
+                            conflict_sim = similarity
+                        _v = _name_vocab(content, match_content)
+                        logger.info(
+                            f"Not merging into {match_id} (sim {similarity}): "
+                            f"conflicting values "
+                            f"{sorted(_discriminating_tokens(content, _v) ^ _discriminating_tokens(match_content, _v))}"
                         )
                         continue
 
@@ -1434,6 +1543,20 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
     _ensure_topics(conn, mem_id, tags)
 
     out = {"status": "stored_new", "id": mem_id}
+
+    # A near-duplicate was kept instead of merged because the values disagree.
+    # Tell the caller now: if this is a correction, one memory_relate call
+    # resolves it; if both are true, they need distinguishing context.
+    if conflict_with is not None:
+        out["potential_conflict_with"] = conflict_with
+        out["conflict_similarity"] = conflict_sim
+        out["hint"] = (
+            f"Kept as a separate memory: near-identical to id {conflict_with} "
+            f"(similarity {conflict_sim}) but the values differ, so merging would "
+            f"have discarded one. If this supersedes it, call "
+            f"memory_relate(from_id={mem_id}, to_id={conflict_with}, "
+            f"relationship='SUPERSEDES')."
+        )
 
     # Wire the correction chain in the same call, so a new version can never be
     # stored without the edge that marks what it replaces.
@@ -2884,6 +3007,9 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
         protected_pairs = 0
         # Pairs left alone because their tags indicate different subjects.
         distinct_subject_skips = 0
+        # Pairs left alone because they are the same subject but disagree on a
+        # value — contradictions, which the subject gate cannot detect.
+        value_conflict_skips = 0
 
         # Phase 1: Auto-prune stale low-importance memories
         prune_cutoff = now - (DREAM_AUTO_PRUNE_DAYS * 86400)
@@ -2980,6 +3106,19 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                                 f"different subject"
                             )
                             distinct_subject_skips += 1
+                            continue
+                        # Same subject but disagreeing values: a contradiction,
+                        # not a duplicate. This is the case the subject gate
+                        # cannot catch, because a contradiction is same-subject
+                        # by construction.
+                        if _values_conflict(content, other_content):
+                            _v = _name_vocab(content, other_content)
+                            logger.info(
+                                f"Skipping merge of {mid}/{other_id} (sim {sim:.4f}): "
+                                f"conflicting values "
+                                f"{sorted(_discriminating_tokens(content, _v) ^ _discriminating_tokens(other_content, _v))}"
+                            )
+                            value_conflict_skips += 1
                             continue
 
                         # Keep the longer content, absorb tags, take max importance
@@ -3217,6 +3356,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "auto_merged": merged_count,
             "protected_by_edges": protected_pairs,
             "protected_by_subject": distinct_subject_skips,
+            "protected_by_value_conflict": value_conflict_skips,
             "memories_after": memories_after,
             "clusters_for_review": clusters,
             "contradictions": contradictions,

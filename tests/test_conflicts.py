@@ -240,8 +240,212 @@ def test_dream_reports_subject_protected_pairs():
 
 
 def test_merge_gate_can_be_disabled(monkeypatch):
-    """Setting the overlap to 0 restores pure-similarity merging."""
+    """Disabling both merge gates restores pure-similarity merging.
+
+    RUNBOOK_A/B are blocked twice over: different subjects (tags) and different
+    named values (Zephyr vs Titan), so bypassing the pair requires switching off
+    both gates.
+    """
+    monkeypatch.setattr(server, "MERGE_TAG_OVERLAP", 0.0)
+    monkeypatch.setattr(server, "MERGE_VALUE_GATE", False)
+    server.memory_store.__wrapped__(content=RUNBOOK_A, tags=["zephyr", "runbook"])
+    b = server.memory_store.__wrapped__(content=RUNBOOK_B, tags=["titan", "runbook"])
+    assert b["status"] == "updated_existing", "gates should be bypassable"
+
+
+def test_value_gate_blocks_independently_of_subject_gate(monkeypatch):
+    """The value gate alone is enough to stop a destructive merge.
+
+    With the subject gate wide open, differing named values must still keep
+    both memories — the two gates are independent protections.
+    """
     monkeypatch.setattr(server, "MERGE_TAG_OVERLAP", 0.0)
     server.memory_store.__wrapped__(content=RUNBOOK_A, tags=["zephyr", "runbook"])
     b = server.memory_store.__wrapped__(content=RUNBOOK_B, tags=["titan", "runbook"])
-    assert b["status"] == "updated_existing", "gate should be bypassable"
+    assert b["status"] == "stored_new", "value gate must block on its own"
+
+
+# ---------------------------------------------------------------------------
+# Same-subject contradictions must not be merged.
+#
+# The subject gate above stops two DIFFERENT subjects merging. It cannot help
+# here, because a contradiction is same-subject by construction: identical tags,
+# near-identical wording, one differing value. Observed on 0.13.1:
+#
+#   store "Vega request timeout is 500 milliseconds."  -> stored_new id=372
+#   store "Vega request timeout is 900 milliseconds."  -> updated_existing 0.929
+#   memory_get(372) -> "...500 milliseconds."   <- STALE value kept
+#
+# Three compounding faults: the older value wins (the two strings are the same
+# length, so the `keep = longer` tie-break falls through to the existing text),
+# the call reports success, and potential_conflicts can never fire afterwards
+# because one of the two facts no longer exists.
+# ---------------------------------------------------------------------------
+
+TIMEOUT_500 = "Vega request timeout is 500 milliseconds."
+TIMEOUT_900 = "Vega request timeout is 900 milliseconds."
+VEGA_TAGS = ["vega", "config"]
+
+# Genuine restatement of one fact: differing wording, identical values.
+TTL_A = "The Vega service caches sessions in Redis with a 30 minute TTL."
+TTL_B = "The Vega service caches user sessions in Redis using a 30-minute TTL."
+TTL_TAGS = ["vega", "redis"]
+
+
+@pytest.mark.parametrize(
+    "a,b,conflict",
+    [
+        # Numeric drift: the highest-risk shape, since only a digit changes and
+        # similarity is therefore maximal.
+        (TIMEOUT_500, TIMEOUT_900, True),
+        ("Ledger-db is decommissioned in Q2 2026.",
+         "Ledger-db is decommissioned in Q3 2026.", True),
+        ("Checkout runs Java 17.", "Checkout runs Java 21.", True),
+        # Enum-ish and named values, no numbers involved.
+        ("Atlas stores its event log in Kafka.",
+         "Atlas stores its event log in Kinesis.", True),
+        ("Zephyr rounds currency with HALF_UP.",
+         "Zephyr rounds currency with HALF_EVEN.", True),
+        # Lowercase service identifiers have neither a capital nor a digit, so
+        # they need their own token class.
+        ("Deployed via Apollo to prod-checkout.",
+         "Deployed via Apollo to prod-inventory.", True),
+        ("Checkout depends on payments-core.",
+         "Checkout depends on inventory-cache.", True),
+        # Formatting-only differences must NOT read as conflicts.
+        ("Vega timeout is 500ms.", "Vega timeout is 500 ms.", False),
+        ("Throughput is 12,000 msg/sec.", "Throughput is 12000 msg/sec.", False),
+        ("Uses Redis for cache.", "uses redis for cache.", False),
+        (TTL_A, TTL_B, False),
+        # A superset elaborates rather than contradicts; the merge keeps the
+        # longer text, so no value is lost.
+        ("Retry policy is 5 attempts.",
+         "Retry policy is 5 attempts with exponential backoff.", False),
+        ("Retry policy is 5 attempts.",
+         "Retry policy is 5 attempts, backoff with jitter and a 10s cap.", False),
+    ],
+)
+def test_values_conflict_boundaries(a, b, conflict):
+    assert server._values_conflict(a, b) is conflict
+
+
+def test_values_conflict_is_symmetric():
+    assert server._values_conflict(TIMEOUT_500, TIMEOUT_900) is True
+    assert server._values_conflict(TIMEOUT_900, TIMEOUT_500) is True
+
+
+def test_contradicting_value_is_not_merged_at_store_time():
+    """The reported bug: both facts must survive the second store."""
+    a = server.memory_store.__wrapped__(content=TIMEOUT_500, tags=VEGA_TAGS)
+    b = server.memory_store.__wrapped__(content=TIMEOUT_900, tags=VEGA_TAGS)
+
+    assert a["status"] == "stored_new"
+    assert b["status"] == "stored_new", \
+        "a differing value must never be absorbed into an existing memory"
+    assert a["id"] != b["id"]
+
+    kept = server.memory_get.__wrapped__(memory_id=a["id"])
+    assert "500" in kept["content"], "original fact must be untouched"
+    fresh = server.memory_get.__wrapped__(memory_id=b["id"])
+    assert "900" in fresh["content"], "new fact must be stored verbatim"
+
+
+def test_store_reports_the_competing_memory():
+    """The caller learns about the conflict at write time, not only at search."""
+    a = server.memory_store.__wrapped__(content=TIMEOUT_500, tags=VEGA_TAGS)
+    b = server.memory_store.__wrapped__(content=TIMEOUT_900, tags=VEGA_TAGS)
+
+    assert b["potential_conflict_with"] == a["id"]
+    assert b["conflict_similarity"] >= server.DEDUP_THRESHOLD
+    assert "supersedes" in b["hint"].lower(), \
+        "the hint should name the remedy, not just the problem"
+
+
+def test_both_facts_survive_so_search_can_flag_them():
+    """Detection and destruction were in direct conflict; destruction ran first.
+
+    With the merge refused, the pair stays intact and potential_conflicts —
+    which needs both sides to exist — can finally fire on it.
+    """
+    a = server.memory_store.__wrapped__(content=TIMEOUT_500, tags=VEGA_TAGS)
+    b = server.memory_store.__wrapped__(content=TIMEOUT_900, tags=VEGA_TAGS)
+
+    out = server.memory_search.__wrapped__(
+        query="what is the Vega request timeout", top_k=4
+    )
+    ids = {r["id"] for r in out["results"]}
+    assert {a["id"], b["id"]} <= ids, "both values should be retrievable"
+
+    pairs = [set(c["ids"]) for c in out.get("potential_conflicts", [])]
+    assert {a["id"], b["id"]} in pairs
+
+
+def test_paraphrase_of_one_fact_still_merges():
+    """Regression guard: the gate must not break ordinary dedup."""
+    server.memory_store.__wrapped__(content=TTL_A, tags=TTL_TAGS)
+    b = server.memory_store.__wrapped__(content=TTL_B, tags=TTL_TAGS)
+    assert b["status"] == "updated_existing", \
+        "same values, different wording is a duplicate and should merge"
+
+
+def test_elaboration_merges_and_keeps_the_richer_text():
+    short = "Retry policy is 5 attempts."
+    long = "Retry policy is 5 attempts with exponential backoff."
+    server.memory_store.__wrapped__(content=short, tags=["retry", "policy"])
+    b = server.memory_store.__wrapped__(content=long, tags=["retry", "policy"])
+
+    assert b["status"] == "updated_existing"
+    assert "backoff" in server.memory_get.__wrapped__(memory_id=b["id"])["content"]
+
+
+def test_supersedes_still_bypasses_dedup_for_a_known_correction():
+    a = server.memory_store.__wrapped__(content=TIMEOUT_500, tags=VEGA_TAGS)
+    b = server.memory_store.__wrapped__(
+        content=TIMEOUT_900, tags=VEGA_TAGS, supersedes=a["id"]
+    )
+    assert b["status"] == "stored_new"
+    assert b["supersedes"] == a["id"]
+    # An explicit correction is already resolved, so there is nothing to flag.
+    assert "potential_conflict_with" not in b
+
+
+def test_dream_does_not_auto_merge_contradicting_values():
+    """Auto-merge at >=0.95 is unreviewed, so it needs the same gate."""
+    a = server.memory_store.__wrapped__(content=TIMEOUT_500, tags=VEGA_TAGS)
+    b = server.memory_store.__wrapped__(content=TIMEOUT_900, tags=VEGA_TAGS)
+
+    out = server.memory_dream.__wrapped__(force=True)
+    assert out.get("protected_by_value_conflict", 0) >= 1, \
+        "dream should report pairs it declined to merge on value grounds"
+
+    for mid, expect in ((a["id"], "500"), (b["id"], "900")):
+        got = server.memory_get.__wrapped__(memory_id=mid)
+        assert "error" not in got, f"memory {mid} was consumed by auto-merge"
+        assert expect in got["content"]
+
+
+def test_elaboration_carve_out_requires_the_richer_text_to_survive():
+    """A shorter-but-value-richer text must not be absorbed into a longer one.
+
+    Both merge paths keep the LONGER string. So "extra values are harmless" only
+    holds while the value-richer side is also the longer side; otherwise those
+    extra values would be silently dropped.
+    """
+    terse_rich = "Retry: 5 attempts, 10s cap, 3 hosts."
+    verbose_poor = (
+        "The retry policy for the ingestion pipeline is configured with a "
+        "total of 5 attempts before the request is finally abandoned."
+    )
+    assert len(verbose_poor) > len(terse_rich)
+
+    # The terse text carries values (10, 3) the verbose one lacks, and it is the
+    # shorter of the two, so merging would discard them.
+    assert server._values_conflict(terse_rich, verbose_poor) is True
+    assert server._values_conflict(verbose_poor, terse_rich) is True
+
+
+def test_elaboration_merges_when_the_longer_text_is_the_richer_one():
+    short_poor = "Retry policy is 5 attempts."
+    long_rich = "Retry policy is 5 attempts, backoff with jitter and a 10s cap."
+    assert server._values_conflict(long_rich, short_poor) is False
+    assert server._values_conflict(short_poor, long_rich) is False

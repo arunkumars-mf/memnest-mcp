@@ -73,12 +73,26 @@ results are keyword-only (usually the embedding model failed to load). Tell
 the user rather than silently accepting worse recall — check
 `memory_stats().runtime.embeddings` for the cause.
 
-**If the response contains a `related` list**, those are memories connected by
-graph edges to your top hits (each names its anchor via `linked_to`). They are
-reported separately because similarity ranking would not surface them — the
-incident caused by a decision, the rationale behind a convention, the version
-a correction replaced. Read them: they are often the context that actually
-answers the question, and they only exist because edges were written.
+**You MUST read the `related` list before answering.** This is a requirement,
+not an optimisation. Those are memories connected by graph edges to your top
+hits (each names its anchor via `linked_to`), reported separately because
+similarity ranking cannot surface them — the incident caused by a decision, the
+rationale behind a convention, the version a correction replaced.
+
+Treat `results` and `related` as one answer set. In benchmark runs on a
+38-fact graph, the correct answer was frequently NOT the #1 result: it sat at
+rank 2–3, or existed only in `related`. Examples that failed when `related` was
+ignored, and succeeded when it was read:
+- "what deprecated infrastructure does checkout transitively depend on?" — the
+  deprecated component is two hops away and never ranks; it is only in `related`
+- "which of these dependencies is still maintained?" — the lifecycle fact is a
+  separate memory from the dependency fact, reachable only by edge
+- "what breaks if this service shuts down?" — the mitigation project is linked,
+  not similar
+
+An agent that reads only `results` loses those questions outright. The ranking
+answers "what matches?"; `related` answers "what else do you need to know?".
+Both are required to answer well.
 
 **Superseded results** carry `"superseded": true`. Never present those as
 current — the memory that supersedes them ranks above them, or pass
@@ -128,6 +142,24 @@ Categories:
 - `general` — Everything else (default)
 
 Importance: 1=trivial, 2=low, 3=neutral (default), 4=important, 5=critical
+
+**Recording a corrected value?** Pass `supersedes=<old_id>` when you know the
+new fact replaces an older one. That writes the `SUPERSEDES` edge and skips
+dedup in a single call.
+
+**If the result contains `potential_conflict_with`**, the store found a
+near-identical memory whose *values* disagree (`500 milliseconds` vs
+`900 milliseconds`, `Kafka` vs `Kinesis`, `prod-checkout` vs `prod-inventory`)
+and deliberately kept both rather than merging one away. The status is
+`stored_new`, not an error — nothing was lost. Resolve it now, while you have
+the context:
+- If the new fact replaces the old one → `memory_relate(from_id=<new>,
+  to_id=<conflict_id>, relationship="SUPERSEDES")`
+- If both are true in different scopes → say so in the content, then link them
+- If you cannot tell → surface it to the user
+
+Ignoring it is safe but leaves an unresolved pair that `potential_conflicts`
+will keep reporting on every future search that touches it.
 
 ### Step 4: Link related memories (this is the highest-value step)
 
@@ -251,6 +283,8 @@ Three layers — you don't need to check manually:
 | `MEMORY_DB_PATH` | `<workspace>/.memnest/memory.lbug` | Database file path. Workspace is auto-detected from the MCP client (roots/list), falling back to cwd, then `~/.memnest/`. Use `:memory:` for testing |
 | `MEMORY_WORKSPACE` | Auto-detected | Scope memories per project. Auto-detected from the MCP client's workspace root; set explicitly to override |
 | `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic similarity threshold for dedup |
+| `MEMORY_MERGE_TAG_OVERLAP` | `0.5` | Min tag Jaccard before two similar memories may merge. Blocks same-shape/different-subject merges |
+| `MEMORY_MERGE_VALUE_GATE` | `1` | Refuse to merge near-identical memories whose values disagree. Set `0` to restore pure-similarity merging (unsafe: a corrected value can silently keep the stale one) |
 | `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max search results |
 | `MEMORY_FUSION` | `legacy` | Vector-channel scaling: `legacy` (raw cosine) or `normalized` (min-max, matching the FTS channel). `normalized` is more robust on very small memory sets |
