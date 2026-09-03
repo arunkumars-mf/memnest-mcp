@@ -174,3 +174,74 @@ def test_review_clusters_state_the_available_resolutions():
     if clusters:
         assert "resolution" in clusters[0]
         assert "supersedes" in clusters[0]["resolution"]
+
+
+# --- Subject gate on destructive merges --------------------------------------
+#
+# Store-time dedup (>=0.92) and dream auto-merge (>=0.95) are the two paths that
+# destroy a memory without review. Neither checked whether the pair was even
+# about the same thing. Measured on a 127-fact corpus of per-service templated
+# facts: 30 memories were silently absorbed on ingest — runbooks and logging
+# decisions for DIFFERENT services merged at 0.94-0.95, losing which service
+# each described. With the gate, all 127 survive.
+#
+# Asymmetry is deliberate: a missed merge leaves a recoverable duplicate that
+# the review band surfaces again; a wrong merge destroys a fact irreversibly.
+
+RUNBOOK_A = "Runbook: to roll back the Zephyr service, redeploy the previous Apollo version."
+RUNBOOK_B = "Runbook: to roll back the Titan service, redeploy the previous Apollo version."
+DUP_A = "The Vega service caches sessions in Redis with a 30 minute TTL."
+DUP_B = "The Vega service caches user sessions in Redis using a 30-minute TTL."
+
+
+def test_same_subject_helper():
+    assert server._same_subject(["zephyr", "cache"], ["zephyr", "cache"])
+    assert server._same_subject(["zephyr", "cache"], ["zephyr"])          # 0.5
+    assert not server._same_subject(["zephyr", "runbook"], ["titan", "runbook"])  # 0.33
+    assert not server._same_subject(["a"], ["b"])
+    # No tags on either side means no signal, so prior behaviour is preserved
+    assert server._same_subject([], ["zephyr"])
+    assert server._same_subject(["zephyr"], [])
+
+
+def test_distinct_subjects_are_not_merged_on_store():
+    a = server.memory_store.__wrapped__(content=RUNBOOK_A, tags=["zephyr", "runbook"])
+    b = server.memory_store.__wrapped__(content=RUNBOOK_B, tags=["titan", "runbook"])
+    assert b["status"] == "stored_new", \
+        "near-identical runbooks for different services must both survive"
+    assert a["id"] != b["id"]
+
+
+def test_genuine_duplicates_still_merge():
+    """The gate must not disable dedup for real duplicates."""
+    server.memory_store.__wrapped__(content=DUP_A, tags=["vega", "cache"])
+    b = server.memory_store.__wrapped__(content=DUP_B, tags=["vega", "cache"])
+    assert b["status"] == "updated_existing", "same-subject duplicates should merge"
+
+
+def test_untagged_memories_keep_prior_dedup_behaviour():
+    """With no tags there is no subject signal, so similarity alone decides."""
+    server.memory_store.__wrapped__(content=DUP_A)
+    b = server.memory_store.__wrapped__(content=DUP_B)
+    assert b["status"] == "updated_existing"
+
+
+def test_dream_reports_subject_protected_pairs():
+    server.memory_store.__wrapped__(items=[
+        {"content": f"Runbook: to roll back the svc{i} service, redeploy the "
+                    f"previous Apollo version.", "tags": [f"svc{i}", "runbook"]}
+        for i in range(6)
+    ] + [{"content": f"Filler note {i} about unrelated capacity planning {i}.",
+          "tags": [f"filler{i}"]} for i in range(20)])
+
+    res = server.memory_dream.__wrapped__(force=True, dry_run=True)
+    assert res.get("protected_by_subject", 0) >= 1, \
+        "dream should report pairs it declined to merge on subject grounds"
+
+
+def test_merge_gate_can_be_disabled(monkeypatch):
+    """Setting the overlap to 0 restores pure-similarity merging."""
+    monkeypatch.setattr(server, "MERGE_TAG_OVERLAP", 0.0)
+    server.memory_store.__wrapped__(content=RUNBOOK_A, tags=["zephyr", "runbook"])
+    b = server.memory_store.__wrapped__(content=RUNBOOK_B, tags=["titan", "runbook"])
+    assert b["status"] == "updated_existing", "gate should be bypassable"

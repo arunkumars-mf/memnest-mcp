@@ -204,6 +204,11 @@ CONFLICT_THRESHOLD = float(os.environ.get("MEMORY_CONFLICT_THRESHOLD", "0.85"))
 # same subject. Guards against flagging parallel facts about different services.
 CONFLICT_TAG_OVERLAP = float(os.environ.get("MEMORY_CONFLICT_TAG_OVERLAP", "0.5"))
 
+# Minimum Jaccard tag overlap before two similar memories may be MERGED
+# (store-time dedup and dream auto-merge). Both paths are destructive, so they
+# get the strictest guard. Set to 0 to restore pure-similarity merging.
+MERGE_TAG_OVERLAP = float(os.environ.get("MEMORY_MERGE_TAG_OVERLAP", "0.5"))
+
 FUSION_MODE = os.environ.get("MEMORY_FUSION", "legacy").strip().lower()
 if FUSION_MODE not in ("legacy", "normalized"):
     raise RuntimeError(
@@ -699,6 +704,32 @@ def _init_schema(conn: lb.Connection):
     _apply_migrations(conn)
 
     logger.info("Schema initialized")
+
+
+def _same_subject(tags_a, tags_b) -> bool:
+    """Cheap subject check gating DESTRUCTIVE merges.
+
+    Templated facts about different subjects read almost identically — runbooks
+    and logging decisions for different services measured 0.94-0.95 similarity,
+    above both merge thresholds, and merging them silently discards which
+    service each described. Measured on a 127-fact corpus: 30 memories were
+    absorbed on ingest before this gate existed.
+
+    Tag overlap is the subject proxy. When either side is untagged there is no
+    signal, so prior behaviour is preserved (similarity alone decides) — which
+    is why the guidance tells agents to tag.
+
+    Asymmetry is deliberate: a missed merge leaves a recoverable duplicate that
+    the review band will surface again, while a wrong merge destroys a fact
+    irreversibly. Prefer keeping both.
+    """
+    sa, sb = set(tags_a or []), set(tags_b or [])
+    if not sa or not sb:
+        return True
+    union = sa | sb
+    if not union:
+        return True
+    return (len(sa & sb) / len(union)) >= MERGE_TAG_OVERLAP
 
 
 def _semantically_linked(conn: lb.Connection, a: int, b: int) -> Optional[str]:
@@ -1320,6 +1351,14 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
                     match_category = row[2]
                     match_tags = _parse_tags(row[3])
                     match_importance = row[4]
+
+                    # Distinct subjects that merely read alike must not merge.
+                    if not _same_subject(tags, match_tags):
+                        logger.debug(
+                            f"Not merging into {match_id} (sim {similarity}): "
+                            f"different subject ({tags} vs {match_tags})"
+                        )
+                        continue
 
                     keep = content if len(content) > len(match_content) else match_content
                     merged_tags = list(set(match_tags + tags))
@@ -2843,6 +2882,8 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
         # Pairs left alone because a SUPERSEDES/EXPLAINS edge marks them as
         # distinct versions rather than duplicates.
         protected_pairs = 0
+        # Pairs left alone because their tags indicate different subjects.
+        distinct_subject_skips = 0
 
         # Phase 1: Auto-prune stale low-importance memories
         prune_cutoff = now - (DREAM_AUTO_PRUNE_DAYS * 86400)
@@ -2930,6 +2971,15 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                                 f"linked by {link}"
                             )
                             protected_pairs += 1
+                            continue
+                        # Auto-merge is the only unreviewed destructive path, so
+                        # it gets the same subject gate as everything else.
+                        if not _same_subject(_parse_tags(tags), _parse_tags(other_tags)):
+                            logger.info(
+                                f"Skipping merge of {mid}/{other_id} (sim {sim:.4f}): "
+                                f"different subject"
+                            )
+                            distinct_subject_skips += 1
                             continue
 
                         # Keep the longer content, absorb tags, take max importance
@@ -3166,6 +3216,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "pruned": pruned_count,
             "auto_merged": merged_count,
             "protected_by_edges": protected_pairs,
+            "protected_by_subject": distinct_subject_skips,
             "memories_after": memories_after,
             "clusters_for_review": clusters,
             "contradictions": contradictions,
