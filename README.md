@@ -191,6 +191,8 @@ All settings are optional — defaults work out of the box.
 | `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic similarity threshold for auto-dedup |
 | `MEMORY_MERGE_TAG_OVERLAP` | `0.5` | Minimum tag Jaccard overlap before two similar memories may merge |
 | `MEMORY_MERGE_VALUE_GATE` | `1` | Refuse to merge near-identical memories whose values disagree (`500ms` vs `900ms`). Set `0` to restore pure-similarity merging (unsafe) |
+| `MEMORY_CONFLICT_THRESHOLD` | `0.85` | Similarity at which two results are flagged `near_duplicate` |
+| `MEMORY_CONFLICT_VALUE_FLOOR` | `0.5` | Similarity floor for `value_disagreement` flagging — same subject, different value, however differently worded |
 | `MEMORY_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed model for embeddings |
 | `MEMORY_EMBEDDING_DIM` | `384` | Embedding dimension (must match model) |
 | `MEMORY_WORKSPACE` | `cwd` | Workspace identifier for memory namespacing |

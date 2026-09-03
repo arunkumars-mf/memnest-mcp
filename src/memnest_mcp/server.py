@@ -211,6 +211,12 @@ CONFLICT_THRESHOLD = float(os.environ.get("MEMORY_CONFLICT_THRESHOLD", "0.85"))
 # Minimum Jaccard tag overlap for a similar pair to count as being about the
 # same subject. Guards against flagging parallel facts about different services.
 CONFLICT_TAG_OVERLAP = float(os.environ.get("MEMORY_CONFLICT_TAG_OVERLAP", "0.5"))
+# Cosine floor for the value-disagreement path, which flags same-subject pairs
+# whose VALUES differ regardless of how differently they are worded. Much lower
+# than CONFLICT_THRESHOLD on purpose: a correction rewritten from scratch scores
+# too low to look like a duplicate, which is exactly why cosine-only detection
+# missed it. The floor only excludes pairs that merely share tags by accident.
+CONFLICT_VALUE_FLOOR = float(os.environ.get("MEMORY_CONFLICT_VALUE_FLOOR", "0.5"))
 
 # Minimum Jaccard tag overlap before two similar memories may be MERGED
 # (store-time dedup and dream auto-merge). Both paths are destructive, so they
@@ -1566,6 +1572,25 @@ def _store_one(conn, content: str, category: str, tags: list[str],
 
             for row in (candidates or []):
                 similarity = round(1.0 - row[6], 4)
+
+                # Warn about a competing fact even when it is too far apart to
+                # be a merge candidate. Write-time warning used to be a side
+                # effect of the dedup branch below, so it only fired at >=0.92
+                # while read-time potential_conflicts reaches down to 0.85 —
+                # meaning a contradiction in the 0.85-0.92 band returned a clean
+                # stored_new and the agent only discovered it if it later
+                # happened to search that topic. Write time is when the fix is
+                # cheap (one supersedes= away) and the context is still loaded.
+                if (
+                    supersedes is None
+                    and conflict_with is None
+                    and CONFLICT_VALUE_FLOOR <= similarity < DEDUP_THRESHOLD
+                    and _same_subject(tags, _parse_tags(row[3]))
+                    and _values_conflict(content, row[1])
+                ):
+                    conflict_with = row[0]
+                    conflict_sim = similarity
+
                 # An explicit supersedes target means the caller is recording a
                 # new version, not a duplicate. Never merge those.
                 if similarity >= DEDUP_THRESHOLD and supersedes is None:
@@ -1702,13 +1727,27 @@ def _store_one(conn, content: str, category: str, tags: list[str],
     if conflict_with is not None:
         out["potential_conflict_with"] = conflict_with
         out["conflict_similarity"] = conflict_sim
-        out["hint"] = (
-            f"Kept as a separate memory: near-identical to id {conflict_with} "
-            f"(similarity {conflict_sim}) but the values differ, so merging would "
-            f"have discarded one. If this supersedes it, call "
-            f"memory_relate(from_id={mem_id}, to_id={conflict_with}, "
-            f"relationship='SUPERSEDES')."
-        )
+        if conflict_sim is not None and conflict_sim >= DEDUP_THRESHOLD:
+            out["hint"] = (
+                f"Kept as a separate memory: near-identical to id {conflict_with} "
+                f"(similarity {conflict_sim}) but the values differ, so merging would "
+                f"have discarded one. If this supersedes it, call "
+                f"memory_relate(from_id={mem_id}, to_id={conflict_with}, "
+                f"relationship='SUPERSEDES')."
+            )
+        else:
+            # Below the dedup threshold nothing was at risk of being merged —
+            # the point is that the two facts disagree and only one can be
+            # current, which nothing else would have told the caller.
+            out["hint"] = (
+                f"Stored, but id {conflict_with} is about the same subject with a "
+                f"different value (similarity {conflict_sim}). These are worded too "
+                f"differently to look like duplicates, so resolve it now while you "
+                f"have the context: if this replaces it, call "
+                f"memory_relate(from_id={mem_id}, to_id={conflict_with}, "
+                f"relationship='SUPERSEDES'); if both hold in different scopes, make "
+                f"that explicit in the content."
+            )
 
     # Wire the correction chain in the same call, so a new version can never be
     # stored without the edge that marks what it replaces.
@@ -2199,11 +2238,16 @@ def memory_search(
         try:
             ids = [r["id"] for r in results]
             tags_by_id = {r["id"]: set(r.get("tags") or []) for r in results}
+            # FULL content, not the truncated preview: the value-disagreement
+            # check compares numbers and named values, and a 200-char preview
+            # can cut off the very token that differs.
             r = conn.execute(
-                "MATCH (m:Memory) WHERE m.id IN $ids RETURN m.id, m.embedding;",
+                "MATCH (m:Memory) WHERE m.id IN $ids RETURN m.id, m.embedding, m.content;",
                 {"ids": ids},
             )
-            vecs = {row[0]: row[1] for row in _collect_results(r) if row[1]}
+            rows = _collect_results(r)
+            vecs = {row[0]: row[1] for row in rows if row[1]}
+            contents_by_id = {row[0]: (row[2] or "") for row in rows}
             for i, a in enumerate(ids):
                 for b in ids[i + 1:]:
                     va, vb = vecs.get(a), vecs.get(b)
@@ -2215,30 +2259,75 @@ def memory_search(
                     if not na or not nb:
                         continue
                     sim = dot / (na * nb)
-                    if sim < CONFLICT_THRESHOLD:
-                        continue
 
-                    # Similarity alone over-reports: templated facts about
+                    # Same-subject check first, since BOTH detection paths need
+                    # it. Similarity alone over-reports: templated facts about
                     # DIFFERENT subjects read almost identically ("Checkout is
                     # written in Java 17" vs "Billing is written in Java 17")
-                    # without conflicting at all. Require the pair to be about
-                    # the same thing, using tag overlap as a cheap subject
-                    # proxy. Skipped when either side is untagged.
+                    # without conflicting at all. Tag overlap is the cheap
+                    # subject proxy. Skipped when either side is untagged.
                     ta, tb = tags_by_id.get(a) or set(), tags_by_id.get(b) or set()
+                    same_subject = True
                     if ta and tb:
                         union = ta | tb
-                        if union and (len(ta & tb) / len(union)) < CONFLICT_TAG_OVERLAP:
-                            continue
+                        same_subject = bool(union) and (len(ta & tb) / len(union)) >= CONFLICT_TAG_OVERLAP
+                    if not same_subject:
+                        continue
+
+                    # Two independent reasons to flag a pair:
+                    #
+                    #  near_duplicate — high cosine. Catches competing versions
+                    #    phrased alike.
+                    #
+                    #  value_disagreement — same subject and a disagreeing
+                    #    value token, at ANY cosine above a low floor. This
+                    #    closes the "middle gap": a correction rewritten from
+                    #    scratch rather than edited scores too LOW to look like
+                    #    a duplicate, so cosine-only detection missed it
+                    #    entirely and the stale version outranked the current
+                    #    one with no flag. Measured: "Izar retains audit logs
+                    #    for 30 days" (0.7677, ranked #1) vs "retention on Izar
+                    #    was extended to a full year" (0.6208) — same subject,
+                    #    plainly contradictory, silent. Perversely, the more
+                    #    thoroughly an agent rewords a correction, the less
+                    #    likely cosine was to notice.
+                    near_duplicate = sim >= CONFLICT_THRESHOLD
+                    value_disagreement = (
+                        sim >= CONFLICT_VALUE_FLOOR
+                        and _values_conflict(contents_by_id.get(a, ""),
+                                             contents_by_id.get(b, ""))
+                    )
+                    if not (near_duplicate or value_disagreement):
+                        continue
 
                     if _semantically_linked(conn, a, b):
                         continue  # already resolved by an edge
+
+                    if near_duplicate:
+                        reason = "near_duplicate"
+                        hint = ("Near-identical memories with no SUPERSEDES edge. If one "
+                                "replaces the other, re-store the current version with "
+                                "memory_store(..., supersedes=<old_id>); if both are true, "
+                                "link them with memory_relate.")
+                    else:
+                        _v = _name_vocab(contents_by_id.get(a, ""), contents_by_id.get(b, ""))
+                        differing = sorted(
+                            _discriminating_tokens(contents_by_id.get(a, ""), _v)
+                            ^ _discriminating_tokens(contents_by_id.get(b, ""), _v)
+                        )[:6]
+                        reason = "value_disagreement"
+                        hint = (f"Same subject but disagreeing values {differing} — these are "
+                                f"not phrased alike, so nothing else would flag them. Do NOT "
+                                f"present one as current without checking: if one replaces the "
+                                f"other, re-store it with memory_store(..., supersedes=<old_id>); "
+                                f"if both hold in different scopes, say so in the content and "
+                                f"link them with memory_relate.")
+
                     conflicts.append({
                         "ids": [a, b],
                         "similarity": round(sim, 4),
-                        "hint": "Near-identical memories with no SUPERSEDES edge. If one "
-                                "replaces the other, re-store the current version with "
-                                "memory_store(..., supersedes=<old_id>); if both are true, "
-                                "link them with memory_relate.",
+                        "reason": reason,
+                        "hint": hint,
                     })
                     if len(conflicts) >= 3:
                         break

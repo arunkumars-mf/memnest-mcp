@@ -98,10 +98,18 @@ Both are required to answer well.
 current — the memory that supersedes them ranks above them, or pass
 `include_superseded=False` to drop them.
 
-**If the response contains `potential_conflicts`**, two returned memories are
-near-identical with no edge marking which is current — typically a fact learned
-in one session and a conflicting one learned later. Resolve it rather than
-picking one silently:
+**If the response contains `potential_conflicts`**, two returned memories
+disagree with no edge marking which is current — typically a fact learned in one
+session and a conflicting one learned later. Each entry carries a `reason`:
+
+- `near_duplicate` — they read almost identically (high similarity)
+- `value_disagreement` — same subject, different value (`30 days` vs `a full
+  year`, `Kafka` vs `Kinesis`). These are worded *differently*, so similarity
+  alone would never surface them, and the stale one often ranks higher because
+  the query's wording matches it better. Do not present the top hit as current
+  without checking this list.
+
+Resolve it rather than picking one silently:
 - If one replaces the other → re-store the current version with
   `memory_store(..., supersedes=<old_id>)`
 - If both are true (different scopes, environments, time periods) → make that
@@ -293,11 +301,30 @@ Three layers — you don't need to check manually:
 | `MEMORY_DEDUP_THRESHOLD` | `0.92` | Semantic similarity threshold for dedup |
 | `MEMORY_MERGE_TAG_OVERLAP` | `0.5` | Min tag Jaccard before two similar memories may merge. Blocks same-shape/different-subject merges |
 | `MEMORY_MERGE_VALUE_GATE` | `1` | Refuse to merge near-identical memories whose values disagree. Set `0` to restore pure-similarity merging (unsafe: a corrected value can silently keep the stale one) |
+| `MEMORY_CONFLICT_THRESHOLD` | `0.85` | Similarity at which two results are flagged as `near_duplicate` |
+| `MEMORY_CONFLICT_VALUE_FLOOR` | `0.5` | Similarity floor for `value_disagreement` flagging (same subject, different value, however differently worded) |
 | `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max search results |
 | `MEMORY_FUSION` | `legacy` | Vector-channel scaling: `legacy` (raw cosine) or `normalized` (min-max, matching the FTS channel). `normalized` is more robust on very small memory sets |
 
 ## Troubleshooting
+
+### A memory ranks far lower than it should
+
+Use `memory_search(query="...", explain=True)`. Each result gains an `explain`
+block with the raw channel values (`vector`, `fts`, `graph`, `recency`,
+`importance_norm`), their weighted contributions, and `in_vector_window`. The
+weighted values sum to the score, so the shortfall names the broken channel:
+
+| Reading | Meaning | Fix |
+|---------|---------|-----|
+| `fts: 0.0` on a query whose words appear in the content | The keyword channel is not matching this memory — costs up to 0.30 of score | `memory_reindex()` (rebuilds FTS too) |
+| `in_vector_window: false` | The memory is not among the k nearest for this query; it is scoring on keywords alone | `memory_reindex()`, then compare again |
+| `vector` far below expectation but `in_vector_window: true` | Semantic similarity really is low — a phrasing mismatch, not a fault | Rely on `related`, or store an alias phrasing |
+
+A single degraded channel is invisible in aggregate health fields: they report
+per-index liveness, not per-memory scoring. `explain=True` is the only view that
+attributes a score.
 
 ### Memory database is locked
 

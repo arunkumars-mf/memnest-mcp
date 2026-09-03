@@ -449,3 +449,128 @@ def test_elaboration_merges_when_the_longer_text_is_the_richer_one():
     long_rich = "Retry policy is 5 attempts, backoff with jitter and a 10s cap."
     assert server._values_conflict(long_rich, short_poor) is False
     assert server._values_conflict(short_poor, long_rich) is False
+
+
+# ---------------------------------------------------------------------------
+# The middle gap: contradictions too differently worded to look like duplicates.
+#
+# Cosine-only detection has a floor problem. A correction REWRITTEN rather than
+# edited scores low, so nothing flagged it — and the stale version outranked the
+# current one because the query's wording matched it better. Measured:
+#
+#   "Izar retains audit logs for 30 days."                     -> 0.7748  #1
+#   "Correction: retention on Izar was extended to a full year." -> 0.4533  #2
+#   potential_conflicts: none
+#
+# Perversely, the more thoroughly an agent rewords a correction, the less likely
+# cosine was to notice it. The fix uses signals already computed: same subject
+# (tag Jaccard) plus a disagreeing value token, at any cosine above a low floor.
+#
+# Separately, write-time warning used to be a side effect of the dedup branch,
+# so it only fired at >=0.92 while read-time detection reached 0.85. A pair at
+# 0.8925 returned a clean stored_new and the agent found out only if it later
+# searched that topic — after the cheap moment to fix it had passed.
+# ---------------------------------------------------------------------------
+
+IZAR_OLD = "Izar retains audit logs for 30 days."
+IZAR_NEW = "Correction: retention on Izar was extended to a full year."
+IZAR_TAGS = ["izar", "retention"]
+IZAR_QUERY = "how long does Izar retain audit logs"
+
+
+def test_reworded_contradiction_is_flagged_despite_low_similarity():
+    a = server.memory_store.__wrapped__(content=IZAR_OLD, tags=IZAR_TAGS)
+    b = server.memory_store.__wrapped__(content=IZAR_NEW, tags=IZAR_TAGS)
+
+    out = server.memory_search.__wrapped__(query=IZAR_QUERY, top_k=3)
+    pairs = {frozenset(c["ids"]): c for c in out.get("potential_conflicts", [])}
+    key = frozenset({a["id"], b["id"]})
+    assert key in pairs, "a same-subject value contradiction must be flagged at any similarity"
+    entry = pairs[key]
+    assert entry["reason"] == "value_disagreement"
+    assert entry["similarity"] < server.CONFLICT_THRESHOLD, \
+        "this pair is below the near-duplicate threshold — that is the point"
+
+
+def test_value_disagreement_hint_names_the_differing_tokens():
+    server.memory_store.__wrapped__(content=IZAR_OLD, tags=IZAR_TAGS)
+    server.memory_store.__wrapped__(content=IZAR_NEW, tags=IZAR_TAGS)
+    out = server.memory_search.__wrapped__(query=IZAR_QUERY, top_k=3)
+    hint = out["potential_conflicts"][0]["hint"]
+    assert "30" in hint, "the hint should show what actually differs"
+    assert "supersedes" in hint.lower()
+
+
+def test_parallel_facts_do_not_trigger_value_disagreement():
+    """False-positive guard: same shape, DIFFERENT subjects, no conflict."""
+    for text, tg in (
+        ("The Checkout service is written in Java 17.", ["checkout", "lang"]),
+        ("The Billing service is written in Java 17.", ["billing", "lang"]),
+        ("The Inventory service is written in Java 17.", ["inventory", "lang"]),
+        ("The Search service is written in Java 17.", ["search", "lang"]),
+    ):
+        server.memory_store.__wrapped__(content=text, tags=tg)
+
+    out = server.memory_search.__wrapped__(
+        query="what language are the services written in", top_k=4)
+    assert not out.get("potential_conflicts"), \
+        "distinct subjects must not be flagged, however alike they read"
+
+
+def test_resolving_a_reworded_contradiction_silences_it():
+    a = server.memory_store.__wrapped__(content=IZAR_OLD, tags=IZAR_TAGS)
+    b = server.memory_store.__wrapped__(content=IZAR_NEW, tags=IZAR_TAGS)
+    server.memory_relate.__wrapped__(from_id=b["id"], to_id=a["id"],
+                                     relationship="SUPERSEDES")
+
+    out = server.memory_search.__wrapped__(query=IZAR_QUERY, top_k=3)
+    assert not out.get("potential_conflicts"), "the edge resolves the conflict"
+
+    by_id = {r["id"]: r for r in out["results"]}
+    assert by_id[a["id"]].get("superseded") is True, \
+        "the replaced version must be marked so it is not presented as current"
+
+    # Whether the demotion actually FLIPS the order depends on the score margin
+    # and the fusion mode (normalized min-max widens gaps, so a 0.5 penalty
+    # cannot always overtake a large lead). Dropping superseded results is the
+    # mode-independent guarantee.
+    strict = server.memory_search.__wrapped__(
+        query=IZAR_QUERY, top_k=3, include_superseded=False)
+    assert strict["results"][0]["id"] == b["id"], \
+        "with superseded results excluded, the current version must lead"
+
+
+def test_write_time_warning_covers_the_sub_dedup_band():
+    """A contradiction between the value floor and the dedup threshold must warn
+    at write time, when one memory_relate call still fixes it cheaply."""
+    a = server.memory_store.__wrapped__(
+        content="The Alkaid queue depth limit is 500 messages.", tags=["alkaidq", "config"])
+    b = server.memory_store.__wrapped__(
+        content="The Alkaid queue depth limit is 800 messages.", tags=["alkaidq", "config"])
+
+    assert b["status"] == "stored_new"
+    assert b["potential_conflict_with"] == a["id"]
+    assert server.CONFLICT_VALUE_FLOOR <= b["conflict_similarity"] < server.DEDUP_THRESHOLD
+    assert "supersedes" in b["hint"].lower()
+
+
+def test_write_time_warning_wording_matches_the_band():
+    """Below the dedup threshold nothing was at risk of being merged, so the
+    hint must not claim the memories were near-identical."""
+    server.memory_store.__wrapped__(content=IZAR_OLD, tags=IZAR_TAGS)
+    b = server.memory_store.__wrapped__(content=IZAR_NEW, tags=IZAR_TAGS)
+    assert b.get("potential_conflict_with") is not None
+    assert "near-identical" not in b["hint"]
+
+
+def test_unrelated_memories_sharing_tags_are_not_flagged():
+    """The cosine floor still excludes pairs that share tags by accident."""
+    server.memory_store.__wrapped__(
+        content="The Izar service was commissioned in 2019 by the platform team.",
+        tags=IZAR_TAGS)
+    server.memory_store.__wrapped__(
+        content="Quarterly capacity review meetings happen on the first Tuesday.",
+        tags=IZAR_TAGS)
+    out = server.memory_search.__wrapped__(query="Izar service history", top_k=3)
+    for c in out.get("potential_conflicts", []):
+        assert c["similarity"] >= server.CONFLICT_VALUE_FLOOR
