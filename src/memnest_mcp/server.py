@@ -309,6 +309,23 @@ def _note_index_repair_attempt() -> None:
     _index_repair_last = time.time()
 
 
+def _note_index_repair_success() -> None:
+    """A repair that worked must not consume the budget for later repairs.
+
+    The budget exists to stop an UNFIXABLE index from triggering a rebuild on
+    every call, so it should count CONSECUTIVE FAILURES. Counting successful
+    repairs too was actively harmful once dedup started using this path: a
+    merge's DETACH DELETE + CREATE leaves the index unable to answer, so
+    repairs are routine rather than pathological. With a 3-attempt budget and a
+    300s cooldown, the budget was exhausted almost immediately and dedup then
+    silently failed open — only the first near-duplicate after a merge was
+    recognised, and every one for the next five minutes was stored as new.
+    """
+    global _index_repair_attempts, _index_repair_last
+    _index_repair_attempts = 0
+    _index_repair_last = 0.0
+
+
 def _file_uri_to_path(uri) -> Optional[str]:
     """Convert a file:// URI to a local filesystem path, or None if not file://."""
     from urllib.parse import unquote, urlparse
@@ -876,7 +893,7 @@ def _probe_vector_index(conn: lb.Connection, k: int = 1) -> Optional[int]:
         return None
 
 
-def _ensure_vector_index(conn: lb.Connection) -> dict:
+def _ensure_vector_index(conn: lb.Connection, force_rebuild: bool = False) -> dict:
     """Detect and repair an HNSW index that does not cover existing rows.
 
     Observed in the field: a database carried across versions and delete
@@ -905,14 +922,19 @@ def _ensure_vector_index(conn: lb.Connection) -> dict:
         # Nothing to index; rebuilding cannot help. Callers see this via stats.
         return {"status": "no_embeddings", "rebuilt": False, "memories": total}
 
-    if (_probe_vector_index(conn) or 0) > 0:
-        return {"status": "ok", "rebuilt": False}
+    # force_rebuild skips the zero-rows probe: callers use it when they have
+    # independent evidence of PARTIAL degradation (the index returns rows but
+    # misses specific memories — e.g. dream's self-recall audit), which the
+    # probe cannot see.
+    if not force_rebuild:
+        if (_probe_vector_index(conn) or 0) > 0:
+            return {"status": "ok", "rebuilt": False}
 
-    logger.error(
-        f"Vector index is stale: {embedded} of {total} memories have embeddings "
-        f"but the HNSW index returns nothing. Semantic search would silently "
-        f"degrade to keyword-only. Rebuilding memory_vec_idx..."
-    )
+        logger.error(
+            f"Vector index is stale: {embedded} of {total} memories have embeddings "
+            f"but the HNSW index returns nothing. Semantic search would silently "
+            f"degrade to keyword-only. Rebuilding memory_vec_idx..."
+        )
     try:
         _safe_execute(conn, "CALL DROP_VECTOR_INDEX('Memory', 'memory_vec_idx');",
                       expected_errors=("does not exist", "not found",
@@ -1429,15 +1451,53 @@ def _store_one(conn, content: str, category: str, tags: list[str],
     )
     if result.has_next():
         existing_id = result.get_next()[0]
-        # Deliberately a no-op. This used to raise importance by 1 and reset
-        # updated_at, which made restating a fact a way to promote it: an agent
-        # re-learning the same thing across sessions is the NORMAL case, and it
-        # says how often something is mentioned, not how much it matters. The
-        # bump was monotonic with no decay, so the most-restated mundane facts
-        # drifted to the top of every query. Measured: a p99-latency note went
-        # 2 -> 4 -> 5 on two restatements and displaced every architecture fact
-        # from an unrelated architecture query.
-        return {"status": "already_exists", "id": existing_id}
+        out = {"status": "already_exists", "id": existing_id}
+
+        # Restating a fact must not promote it. This path used to raise
+        # importance by 1 and reset updated_at, which made restatement a way to
+        # climb the rankings: re-learning the same thing across sessions is the
+        # NORMAL case, and it says how often something is mentioned, not how
+        # much it matters. The bump was monotonic with no decay, so the
+        # most-restated mundane facts drifted to the top of every query.
+        # Measured: a p99-latency note went 2 -> 4 -> 5 on two restatements and
+        # displaced every architecture fact from an unrelated architecture query.
+        #
+        # But an EXPLICIT value is a caller instruction, not a side effect of
+        # restating, so it is still honoured — otherwise importance could be
+        # raised by restating a paraphrase yet not the identical text, which is
+        # both inconsistent and the case an agent hits when it re-encounters a
+        # fact verbatim. Never demotes; use memory_update to lower a value.
+        # updated_at is untouched throughout: the content did not change.
+        cur = conn.execute(
+            "MATCH (m:Memory {id: $id}) RETURN m.importance, m.tags;",
+            {"id": existing_id},
+        )
+        cur_row = cur.get_next() if cur.has_next() else (DEFAULT_IMPORTANCE, "")
+        cur_imp = cur_row[0] if cur_row[0] is not None else DEFAULT_IMPORTANCE
+        cur_tags = _parse_tags(cur_row[1])
+
+        if importance is not None:
+            new_imp = min(5, max(cur_imp, _clamp_importance(importance)))
+            if new_imp != cur_imp:
+                conn.execute(
+                    "MATCH (m:Memory {id: $id}) SET m.importance = $imp;",
+                    {"id": existing_id, "imp": new_imp},
+                )
+                out["importance"] = new_imp
+
+        # Tags are additive for the same reason: the merge path unions them, so
+        # dropping them here meant a restatement with a new tag silently lost it.
+        added = [t for t in _canonicalize_tags(tags or []) if t not in cur_tags]
+        if added:
+            merged = list(set(cur_tags + added))
+            conn.execute(
+                "MATCH (m:Memory {id: $id}) SET m.tags = $tags;",
+                {"id": existing_id, "tags": _format_tags(merged)},
+            )
+            _ensure_topics(conn, existing_id, merged)
+            out["tags_added"] = added
+
+        return out
 
     # Layer 2: Semantic dedup
     if embedding is None:
@@ -1456,16 +1516,55 @@ def _store_one(conn, content: str, category: str, tags: list[str],
 
     if _count_memories(conn) > 0:
         try:
-            # Filter by workspace inside the WITH clause to avoid wasted candidates
-            result = conn.execute(
-                """CALL QUERY_VECTOR_INDEX('Memory', 'memory_vec_idx', $query, $k)
-                   WITH node AS m, distance
-                   WHERE m.workspace IN ['', $ws]
-                   RETURN m.id, m.content, m.category, m.tags, m.importance, m.workspace, distance
-                   ORDER BY distance LIMIT 5;""",
-                {"query": embedding, "k": 20, "ws": WORKSPACE},
-            )
-            for row in _collect_results(result):
+            def _dedup_candidates():
+                """Nearest neighbours for the dedup decision.
+
+                Returns None if the probe itself failed (a missing index raises
+                rather than returning nothing) so the caller can treat that the
+                same as an empty result: both mean the index cannot answer.
+                """
+                try:
+                    # Filter by workspace inside the WITH clause to avoid wasted candidates
+                    result = conn.execute(
+                        """CALL QUERY_VECTOR_INDEX('Memory', 'memory_vec_idx', $query, $k)
+                           WITH node AS m, distance
+                           WHERE m.workspace IN ['', $ws]
+                           RETURN m.id, m.content, m.category, m.tags, m.importance, m.workspace, distance
+                           ORDER BY distance LIMIT 5;""",
+                        {"query": embedding, "k": 20, "ws": WORKSPACE},
+                    )
+                    return _collect_results(result)
+                except Exception as e:
+                    logger.debug(f"Dedup vector probe failed: {e}")
+                    return None
+
+            candidates = _dedup_candidates()
+
+            # Repair on use, exactly as the search path does. A healthy HNSW
+            # index always returns the k nearest neighbours, because cosine
+            # distance is defined for every vector pair — so zero rows while
+            # embeddings exist means the index is broken, not that nothing was
+            # similar.
+            #
+            # This matters more here than in search, and was missing: the merge
+            # branch below does DETACH DELETE + CREATE to re-embed, which can
+            # leave the index returning nothing. Dedup would then see no
+            # candidates and silently store every subsequent near-duplicate as
+            # new — failing open, with no error and no degraded flag, until some
+            # later memory_search happened to trigger a rebuild. Measured: after
+            # one merge, a 0.9488 paraphrase pair stopped merging entirely.
+            if not candidates and _index_repair_allowed():
+                _note_index_repair_attempt()
+                state = _ensure_vector_index(conn)
+                if state.get("rebuilt"):
+                    global _vector_index_state
+                    _vector_index_state = state
+                    candidates = _dedup_candidates()
+                    if candidates:
+                        _note_index_repair_success()
+                        logger.info("Dedup recovered after automatic index rebuild")
+
+            for row in (candidates or []):
                 similarity = round(1.0 - row[6], 4)
                 # An explicit supersedes target means the caller is recording a
                 # new version, not a duplicate. Never merge those.
@@ -1792,6 +1891,7 @@ def memory_search(
                 global _vector_index_state
                 _vector_index_state = state
                 if _run_vector_channel():
+                    _note_index_repair_success()
                     logger.info("Search recovered after automatic index rebuild")
 
     # --- Channel 2: Full-text search (BM25 via FTS index) ---
@@ -3067,6 +3167,11 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
         # Pairs left alone because they are the same subject but disagree on a
         # value — contradictions, which the subject gate cannot detect.
         value_conflict_skips = 0
+        # HNSW self-recall audit: memories the index failed to return for their
+        # own embedding (partial recall degradation — invisible to the
+        # zero-rows check), and whether that triggered a rebuild.
+        index_self_misses = 0
+        index_rebuilt_by_audit = False
 
         # Phase 1: Auto-prune stale low-importance memories
         prune_cutoff = now - (DREAM_AUTO_PRUNE_DAYS * 86400)
@@ -3119,14 +3224,51 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     if mid in visited or embedding is None:
                         continue
 
-                    result = conn.execute(
-                        """CALL QUERY_VECTOR_INDEX('Memory', 'memory_vec_idx', $query, $k)
-                           WITH node AS m, distance
-                           RETURN m.id, m.content, m.tags, m.importance, m.created_at,
-                                  m.category, m.workspace, distance;""",
-                        {"query": list(embedding), "k": 4},
-                    )
-                    for row in _collect_results(result):
+                    def _merge_probe(emb_):
+                        """Neighbours of one memory. None = the probe itself
+                        failed (a MISSING index raises rather than returning
+                        empty), which the audit treats the same as a miss."""
+                        try:
+                            r_ = conn.execute(
+                                """CALL QUERY_VECTOR_INDEX('Memory', 'memory_vec_idx', $query, $k)
+                                   WITH node AS m, distance
+                                   RETURN m.id, m.content, m.tags, m.importance, m.created_at,
+                                          m.category, m.workspace, distance;""",
+                                {"query": list(emb_), "k": 4},
+                            )
+                            return _collect_results(r_)
+                        except Exception as e_:
+                            logger.debug(f"Dream merge probe failed: {e_}")
+                            return None
+
+                    probe_rows = _merge_probe(embedding)
+
+                    # Self-recall audit. A healthy HNSW index queried with a
+                    # memory's OWN embedding must return that memory (distance
+                    # ~0 beats every other vector). A miss means the index has
+                    # PARTIAL recall degradation: it still returns rows, so the
+                    # zero-rows self-heal in search/dedup never fires, yet some
+                    # memories are unreachable from some query points. Observed
+                    # on a long-lived DB: a memory absent from results for a
+                    # query it answered at 0.74, while still reachable via its
+                    # own wording — and dedup/conflict-protection silently
+                    # blind to the missing partner. Dream probes every memory
+                    # anyway, so the audit is free; rebuild once and rescan.
+                    if not dry_run and (
+                        probe_rows is None or mid not in {r[0] for r in probe_rows}
+                    ):
+                        index_self_misses += 1
+                        if not index_rebuilt_by_audit:
+                            logger.warning(
+                                f"HNSW self-recall miss: memory {mid} not returned "
+                                f"for its own embedding. Rebuilding index..."
+                            )
+                            state = _ensure_vector_index(conn, force_rebuild=True)
+                            index_rebuilt_by_audit = bool(state.get("rebuilt"))
+                            if index_rebuilt_by_audit:
+                                probe_rows = _merge_probe(embedding)
+
+                    for row in (probe_rows or []):
                         other_id = row[0]
                         other_content = row[1]
                         other_tags = row[2]
@@ -3414,6 +3556,8 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "protected_by_edges": protected_pairs,
             "protected_by_subject": distinct_subject_skips,
             "protected_by_value_conflict": value_conflict_skips,
+            "index_self_misses": index_self_misses,
+            "index_rebuilt": index_rebuilt_by_audit,
             "memories_after": memories_after,
             "clusters_for_review": clusters,
             "contradictions": contradictions,

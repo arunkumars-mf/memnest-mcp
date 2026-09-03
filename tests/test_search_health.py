@@ -304,7 +304,12 @@ def test_search_repairs_stale_index_on_first_query():
 
     res = _search("classifier retraining schedule")
 
-    assert server._index_repair_attempts == 1, "should have attempted one repair"
+    # A SUCCESSFUL repair resets the budget: it exists to stop an unfixable
+    # index from triggering a rebuild on every call, so it counts consecutive
+    # failures. (Merges/updates delete+recreate nodes, so repairs are routine —
+    # counting successes exhausted the budget and made dedup fail open.)
+    assert server._index_repair_attempts == 0, \
+        "a successful repair should reset the budget counter"
     assert "degraded" not in res, "search should self-repair and return semantic hits"
     assert res["results"]
     # And the index is genuinely live afterwards
@@ -349,10 +354,19 @@ def test_healthy_search_never_triggers_repair():
 
 
 def test_stats_exposes_repair_attempts():
+    """After a successful repair the counter reads 0 (budget counts consecutive
+    failures); after a failed repair it stays non-zero. Exercise the failure
+    side so the stats field is verified to expose real attempts."""
     _seed()
     conn = server.get_conn()
     _drop_vector_index(conn)
-    _search("classifier retraining schedule")
 
-    vi = server.memory_stats.__wrapped__()["runtime"]["vector_index"]
-    assert vi["repair_attempts"] >= 1
+    # Make the rebuild itself fail so the attempt is not reset by success.
+    original = server._ensure_vector_index
+    server._ensure_vector_index = lambda c: {"status": "error", "rebuilt": False}
+    try:
+        _search("classifier retraining schedule")
+        vi = server.memory_stats.__wrapped__()["runtime"]["vector_index"]
+        assert vi["repair_attempts"] >= 1
+    finally:
+        server._ensure_vector_index = original

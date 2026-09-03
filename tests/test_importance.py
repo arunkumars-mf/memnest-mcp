@@ -238,3 +238,63 @@ def test_importance_is_clamped_to_the_documented_range(given, expected):
         content=f"Sirius exposes health endpoint number {given}.",
         tags=["sirius", "health"], importance=given)
     assert _state(a["id"])["importance"] == expected
+
+
+# ---------------------------------------------------------------------------
+# The exact-duplicate short-circuit dropped explicit caller intent.
+#
+# The hash match returned before importance or tags were considered, so a caller
+# could raise importance by restating a PARAPHRASE but not the identical text —
+# inconsistent with the merge path, and precisely the case an agent hits when it
+# re-encounters a fact verbatim and wants to promote it. The rule is now uniform
+# across every store path: an omitted value changes nothing, an explicit value
+# is honoured, and neither can demote.
+# ---------------------------------------------------------------------------
+
+
+def test_exact_restatement_honours_an_explicit_importance():
+    a = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=2)
+    r = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=4)
+    assert r["status"] == "already_exists"
+    assert _state(a["id"])["importance"] == 4, \
+        "an explicit importance must apply on the exact-duplicate path too"
+    assert r.get("importance") == 4, "the change should be reported, not silent"
+
+
+def test_exact_restatement_without_importance_is_still_a_total_no_op():
+    a = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=2)
+    before = _state(a["id"])
+    r = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS)
+    assert r["status"] == "already_exists"
+    assert "importance" not in r and "tags_added" not in r
+    assert _state(a["id"]) == before, "nothing may change when nothing was stated"
+
+
+def test_exact_restatement_cannot_demote():
+    a = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=5)
+    server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=1)
+    assert _state(a["id"])["importance"] == 5
+
+
+def test_exact_restatement_never_touches_recency():
+    """Content is identical, so updated_at must not move even when metadata does."""
+    a = server.memory_store.__wrapped__(content=LATENCY, tags=TAGS, importance=2)
+    before = _state(a["id"])["updated_at"]
+    server.memory_store.__wrapped__(content=LATENCY, tags=TAGS + ["perf"], importance=4)
+    assert _state(a["id"])["updated_at"] == before
+
+
+def test_exact_restatement_adds_new_tags():
+    a = server.memory_store.__wrapped__(content=LATENCY, tags=["helios"], importance=2)
+    r = server.memory_store.__wrapped__(content=LATENCY, tags=["helios", "perf", "sla"])
+    assert sorted(r.get("tags_added", [])) == ["perf", "sla"]
+
+    conn = server.get_conn()
+    tags = server._parse_tags(server._collect_results(conn.execute(
+        "MATCH (m:Memory {id: $i}) RETURN m.tags;", {"i": a["id"]}))[0][0])
+    assert {"helios", "perf", "sla"} <= set(tags)
+
+    # Topic nodes must be wired too, or the tag is invisible to tag-filtered search.
+    topics = {t[0] for t in server._collect_results(conn.execute(
+        "MATCH (m:Memory {id: $i})-[:ABOUT]->(t:Topic) RETURN t.name;", {"i": a["id"]}))}
+    assert {"perf", "sla"} <= topics
