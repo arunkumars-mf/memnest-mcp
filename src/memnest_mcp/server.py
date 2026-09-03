@@ -2889,6 +2889,12 @@ def memory_stats() -> str:
                 **(_vector_index_state or {"status": "unknown"}),
                 "repair_attempts": _index_repair_attempts,
             },
+            # answering=True means the index matches a term drawn from real
+            # content. CAVEAT: this cannot prove BM25 scoring is sound — the
+            # observed field failure passed every such probe and only misfired
+            # on full-question queries. False here is definitely broken; True
+            # is necessary, not sufficient. memory_reindex() rebuilds it.
+            "fts_index": {"answering": _probe_fts_index(conn)},
             "fusion_mode": FUSION_MODE,
             "workspace_source": _workspace_source,
             "client": _client_info,
@@ -2898,18 +2904,69 @@ def memory_stats() -> str:
     }
 
 
+def _rebuild_fts_index(conn: lb.Connection) -> dict:
+    """Drop and recreate the BM25 index from stored content.
+
+    FTS was the one channel with no rebuild path and no health signal:
+    memory_reindex() rebuilt only the HNSW index, so an FTS index carrying bad
+    state (e.g. built by an older library version and carried across upgrades)
+    was unrepairable — diagnosed in the field as a memory scoring fts 0.0 on a
+    full-question query while the same query returned fts 1.0 on a fresh
+    ingest of identical content, with the vector channel bit-identical.
+    """
+    try:
+        _safe_execute(conn, "CALL DROP_FTS_INDEX('Memory', 'memory_fts_idx');",
+                      expected_errors=("does not exist", "not found",
+                                       "doesn't have an index"))
+        conn.execute(
+            "CALL CREATE_FTS_INDEX('Memory', 'memory_fts_idx', ['content'], "
+            "stemmer := 'english');"
+        )
+    except Exception as e:
+        logger.error(f"FTS index rebuild FAILED: {e}")
+        return {"rebuilt": False, "error": str(e)[:200]}
+    return {"rebuilt": True}
+
+
+def _probe_fts_index(conn: lb.Connection) -> Optional[bool]:
+    """Whether the FTS index answers a term drawn from actual content.
+
+    Uses the first word (>3 chars) of the newest memory, so a healthy index
+    must match it. None = no content to probe with.
+    """
+    try:
+        r = conn.execute(
+            "MATCH (m:Memory) RETURN m.content ORDER BY m.updated_at DESC LIMIT 1;")
+        if not r.has_next():
+            return None
+        content = r.get_next()[0] or ""
+        term = next((w for w in re.findall(r"[A-Za-z]{4,}", content)), None)
+        if term is None:
+            return None
+        res = conn.execute(
+            """CALL QUERY_FTS_INDEX('Memory', 'memory_fts_idx', $q, top := 1)
+               WITH node AS m, score RETURN m.id;""",
+            {"q": term},
+        )
+        return len(_collect_results(res)) > 0
+    except Exception as e:
+        logger.debug(f"FTS index probe failed: {e}")
+        return False
+
+
 @mcp.tool()
 @_timed("memory_reindex")
 def memory_reindex() -> str:
-    """Rebuild the vector (HNSW) index, restoring semantic search.
+    """Rebuild the search indexes — vector (HNSW) AND full-text (BM25).
 
-    Use when search results include a `degraded` field, or when
+    Use when search results include a `degraded` field, when
     memory_stats().runtime.embeddings shows stored_ok true but
-    index_returns_rows false — meaning embeddings exist but the index does not
-    return them, so search has silently fallen back to keyword-only.
+    index_returns_rows false, or when a memory scores anomalously low on
+    queries it should win (a broken FTS term contributes 0 of the 0.3 keyword
+    weight; use memory_search(explain=True) to see per-channel values).
 
-    Safe to run any time: it only rebuilds the index, never touches memories.
-    Cost scales with memory count (the index is rebuilt from stored vectors).
+    Safe to run any time: it only rebuilds indexes, never touches memories.
+    Cost scales with memory count.
     """
     conn = get_conn()
     total = _count_memories(conn)
@@ -2925,13 +2982,20 @@ def memory_reindex() -> str:
 
     if total == 0:
         return {"status": "empty", "message": "No memories to index."}
+
+    # FTS rebuild is independent of embeddings — content is always present.
+    fts = _rebuild_fts_index(conn)
+    fts_ok = fts.get("rebuilt", False) and bool(_probe_fts_index(conn))
+
     if embedded == 0:
         return {
             "status": "no_embeddings",
             "memories": total,
-            "message": "No memory has an embedding, so there is nothing to index. "
-                       "The embedding model was unavailable when these were stored; "
-                       "re-store them once memory_stats() reports the model healthy.",
+            "fts_rebuilt": fts_ok,
+            "message": "FTS index rebuilt, but no memory has an embedding, so there "
+                       "is no vector index to build. The embedding model was "
+                       "unavailable when these were stored; re-store them once "
+                       "memory_stats() reports the model healthy.",
         }
 
     try:
@@ -2942,16 +3006,17 @@ def memory_reindex() -> str:
             "metric := 'cosine');"
         )
     except Exception as e:
-        return {"status": "error", "error": str(e)[:300]}
+        return {"status": "error", "error": str(e)[:300], "fts_rebuilt": fts_ok}
 
     after = _probe_vector_index(conn) or 0
     global _vector_index_state
     _vector_index_state = {"status": "rebuilt" if after > 0 else "broken",
                            "rebuilt": True, "indexed": embedded}
     return {
-        "status": "rebuilt" if after > 0 else "still_broken",
+        "status": "rebuilt" if (after > 0 and fts_ok) else "still_broken",
         "memories": total,
         "embeddings_indexed": embedded,
+        "fts_rebuilt": fts_ok,
         # The probe is a k=1 synthetic query — it answers "does the index
         # respond at all", not "how many rows are indexed". The old field names
         # (index_rows_before/after) read as row counts and made a healthy
@@ -3567,6 +3632,17 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
         if not dry_run and memories_after > 0:
             _compute_graph_scores(conn)
 
+        # Routine FTS rebuild. Unlike the HNSW audit above, bad FTS state has
+        # no cheap detector: the observed failure (a memory scoring fts 0.0 on
+        # a full-question query while rare-term and exact-text probes all
+        # return 1.0) only shows on query shapes the server cannot enumerate,
+        # so a self-recall audit would pass on a broken index. Rebuilding
+        # unconditionally is bounded (content-sized, dream runs at most daily)
+        # and turns a permanently wedged index into one fixed at next dream.
+        fts_rebuilt = False
+        if not dry_run and memories_after > 0:
+            fts_rebuilt = _rebuild_fts_index(conn).get("rebuilt", False)
+
         # --- Phase 4: SCC contradiction detection on SUPERSEDES subgraph ---
         contradictions = []
         if not dry_run:
@@ -3614,6 +3690,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "protected_by_value_conflict": value_conflict_skips,
             "index_self_misses": index_self_misses,
             "index_rebuilt": index_rebuilt_by_audit,
+            "fts_rebuilt": fts_rebuilt,
             "memories_after": memories_after,
             "clusters_for_review": clusters,
             "contradictions": contradictions,
