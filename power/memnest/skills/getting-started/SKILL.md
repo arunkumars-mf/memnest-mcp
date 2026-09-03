@@ -143,6 +143,13 @@ Categories:
 
 Importance: 1=trivial, 2=low, 3=neutral (default), 4=important, 5=critical
 
+Importance is yours to set — the server never raises it on its own. Re-storing a
+fact you already know is a no-op (`already_exists`) and changes nothing, so
+re-learning something across sessions cannot quietly promote it up the rankings.
+A merge takes the higher of the two importances but never adds to it, so pass
+the value you actually mean. `updated_at`, which feeds the recency term, tracks
+when a memory's *content* changed, not when it was last mentioned.
+
 **Recording a corrected value?** Pass `supersedes=<old_id>` when you know the
 new fact replaces an older one. That writes the `SUPERSEDES` edge and skips
 dedup in a single call.

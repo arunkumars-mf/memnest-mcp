@@ -1400,12 +1400,14 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
     )
     if result.has_next():
         existing_id = result.get_next()[0]
-        conn.execute(
-            """MATCH (m:Memory {id: $id})
-               SET m.importance = CASE WHEN m.importance < 5 THEN m.importance + 1 ELSE 5 END,
-                   m.updated_at = $now;""",
-            {"id": existing_id, "now": now},
-        )
+        # Deliberately a no-op. This used to raise importance by 1 and reset
+        # updated_at, which made restating a fact a way to promote it: an agent
+        # re-learning the same thing across sessions is the NORMAL case, and it
+        # says how often something is mentioned, not how much it matters. The
+        # bump was monotonic with no decay, so the most-restated mundane facts
+        # drifted to the top of every query. Measured: a p99-latency note went
+        # 2 -> 4 -> 5 on two restatements and displaced every architecture fact
+        # from an unrelated architecture query.
         return {"status": "already_exists", "id": existing_id}
 
     # Layer 2: Semantic dedup
@@ -1471,7 +1473,14 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
 
                     keep = content if len(content) > len(match_content) else match_content
                     merged_tags = list(set(match_tags + tags))
-                    new_imp = min(5, max(match_importance, importance) + 1)
+                    # Take the higher of the two, but do NOT add to it. The old
+                    # `+ 1` treated every merge as evidence of importance, so
+                    # re-storing a paraphrase twice ratcheted a memory to the
+                    # ceiling and distorted ranking for unrelated queries.
+                    # Importance is caller-owned metadata; the server should not
+                    # editorialise it. This now matches dream's merge, which has
+                    # always taken a plain max.
+                    new_imp = min(5, max(match_importance, importance))
                     content_changed = (keep != match_content)
 
                     if content_changed:
@@ -1509,13 +1518,19 @@ def _store_one(conn, content: str, category: str, tags: list[str], importance: i
                         _ensure_topics(conn, match_id, merged_tags)
                         _restore_memory_relationships(conn, match_id, saved_rels)
                     else:
-                        # Content unchanged — just update tags/importance/timestamp in place.
-                        # Keep the existing embedding (no index rebuild needed).
+                        # Content unchanged — absorb tags/importance in place and
+                        # keep the existing embedding (no index rebuild needed).
+                        #
+                        # updated_at is deliberately NOT touched. The ranking
+                        # recency term reads updated_at, so refreshing it here
+                        # let a restatement reset a memory's decay to ~1.0 and
+                        # jump it up the results for queries it does not answer.
+                        # updated_at means "when the content last changed".
                         conn.execute(
                             """MATCH (m:Memory {id: $id})
-                               SET m.tags = $tags, m.importance = $imp, m.updated_at = $now;""",
+                               SET m.tags = $tags, m.importance = $imp;""",
                             {"id": match_id, "tags": _format_tags(merged_tags),
-                             "imp": new_imp, "now": now},
+                             "imp": new_imp},
                         )
                         _ensure_topics(conn, match_id, merged_tags)
 
