@@ -84,6 +84,19 @@ answers the question, and they only exist because edges were written.
 current — the memory that supersedes them ranks above them, or pass
 `include_superseded=False` to drop them.
 
+**If the response contains `potential_conflicts`**, two returned memories are
+near-identical with no edge marking which is current — typically a fact learned
+in one session and a conflicting one learned later. Resolve it rather than
+picking one silently:
+- If one replaces the other → re-store the current version with
+  `memory_store(..., supersedes=<old_id>)`
+- If both are true (different scopes, environments, time periods) → make that
+  explicit in the content and link them with `memory_relate`
+- If you cannot tell → ask the user; do not guess which is current
+
+This is flagged as *potential* because the server does no LLM inference: it
+knows the two look alike and are unresolved, not which one is right.
+
 ### Step 3: Store new information
 
 Single mode:
@@ -188,7 +201,15 @@ What it does:
 2. Auto-prunes stale memories (>30 days old, importance ≤ 2)
 3. Auto-merges trivial duplicates (similarity ≥ 0.95)
 4. Surfaces clusters (similarity 0.88-0.95) for agent review
-5. Detects SCC contradictions (circular SUPERSEDES chains)
+5. Detects SCC contradictions (circular SUPERSEDES chains only — for
+   unresolved semantic conflicts see `potential_conflicts` in search results)
+
+Pairs joined by `SUPERSEDES` or `EXPLAINS` are never merged and never offered
+for review — they are distinct versions by assertion, and `protected_by_edges`
+in the response counts how many were left alone. Review clusters carry a
+`resolution` field: a cluster may be a true duplicate to merge, competing
+versions that need a `SUPERSEDES` edge, or distinct facts that merely read
+alike. Decide per cluster; do not merge reflexively.
 
 Auto-triggers: 10+ operations AND 24h since last run. Use `force=True` to override.
 

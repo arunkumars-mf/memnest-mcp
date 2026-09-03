@@ -196,6 +196,14 @@ GRAPH_EXPAND_LIMIT = int(os.environ.get("MEMORY_GRAPH_EXPAND_LIMIT", "5"))
 # Weak hits are coincidences and their neighbours are noise.
 GRAPH_EXPAND_MIN_RATIO = float(os.environ.get("MEMORY_GRAPH_EXPAND_MIN_RATIO", "0.6"))
 
+# Flag returned memories that are near-duplicates of each other with no
+# SUPERSEDES/EXPLAINS edge — likely competing versions nobody resolved.
+CONFLICT_DETECTION = os.environ.get("MEMORY_CONFLICT_DETECTION", "1") not in ("0", "false", "no")
+CONFLICT_THRESHOLD = float(os.environ.get("MEMORY_CONFLICT_THRESHOLD", "0.85"))
+# Minimum Jaccard tag overlap for a similar pair to count as being about the
+# same subject. Guards against flagging parallel facts about different services.
+CONFLICT_TAG_OVERLAP = float(os.environ.get("MEMORY_CONFLICT_TAG_OVERLAP", "0.5"))
+
 FUSION_MODE = os.environ.get("MEMORY_FUSION", "legacy").strip().lower()
 if FUSION_MODE not in ("legacy", "normalized"):
     raise RuntimeError(
@@ -691,6 +699,45 @@ def _init_schema(conn: lb.Connection):
     _apply_migrations(conn)
 
     logger.info("Schema initialized")
+
+
+def _semantically_linked(conn: lb.Connection, a: int, b: int) -> Optional[str]:
+    """Return the edge type if SUPERSEDES or EXPLAINS connects a and b.
+
+    These edges are asserted by an agent and mean "these memories are distinct
+    and ordered" — a correction and the thing it corrects, a rationale and the
+    decision it explains. Merging such a pair destroys the history the edge
+    exists to record, which matters because a correction is textually
+    near-identical to what it corrects (measured 0.9284 on consecutive
+    retry-policy versions) and therefore looks exactly like a duplicate.
+
+    RELATED_TO is deliberately NOT treated as protective: _compute_graph_scores
+    creates it automatically between memories sharing topics, so it carries no
+    assertion that the two are distinct.
+    """
+    try:
+        r = conn.execute(
+            """MATCH (x:Memory)-[e:SUPERSEDES|EXPLAINS]-(y:Memory)
+               WHERE x.id = $a AND y.id = $b RETURN label(e) LIMIT 1;""",
+            {"a": a, "b": b},
+        )
+        rows = _collect_results(r)
+        if rows:
+            return str(rows[0][0]) if rows[0] and rows[0][0] else "SUPERSEDES/EXPLAINS"
+    except Exception as e:
+        logger.debug(f"Link check failed for {a}/{b}: {e}")
+        # Fall back to a label-free existence check
+        try:
+            r = conn.execute(
+                """MATCH (x:Memory)-[e:SUPERSEDES|EXPLAINS]-(y:Memory)
+                   WHERE x.id = $a AND y.id = $b RETURN COUNT(e);""",
+                {"a": a, "b": b},
+            )
+            if r.has_next() and (r.get_next()[0] or 0) > 0:
+                return "SUPERSEDES/EXPLAINS"
+        except Exception:
+            pass
+    return None
 
 
 def _probe_vector_index(conn: lb.Connection, k: int = 1) -> Optional[int]:
@@ -1780,6 +1827,71 @@ def memory_search(
     # graph enough to compete would let loosely-linked memories crowd out
     # direct answers. Reporting them separately preserves ranking precision
     # and still gives the agent the connection explicitly.
+    # --- Unresolved conflict detection ---
+    # SUPERSEDES resolves conflicts an agent has already noticed. This catches
+    # the ones nobody wired: two returned memories that are near-duplicates of
+    # each other with NO edge between them are either competing versions or
+    # contradictory facts, and nothing marks which is current. That is the
+    # normal shape of accumulated agent memory — a fact learned in one session
+    # and a conflicting one learned later.
+    #
+    # Reported as "potential", not "contradiction": distinguishing a genuine
+    # contradiction from two complementary facts needs entailment, which would
+    # mean an LLM call in the server. Flagging the ambiguity is honest and free;
+    # deciding it is the agent's job.
+    conflicts: list[dict] = []
+    if CONFLICT_DETECTION and len(results) > 1:
+        try:
+            ids = [r["id"] for r in results]
+            tags_by_id = {r["id"]: set(r.get("tags") or []) for r in results}
+            r = conn.execute(
+                "MATCH (m:Memory) WHERE m.id IN $ids RETURN m.id, m.embedding;",
+                {"ids": ids},
+            )
+            vecs = {row[0]: row[1] for row in _collect_results(r) if row[1]}
+            for i, a in enumerate(ids):
+                for b in ids[i + 1:]:
+                    va, vb = vecs.get(a), vecs.get(b)
+                    if not va or not vb:
+                        continue
+                    dot = sum(x * y for x, y in zip(va, vb))
+                    na = sum(x * x for x in va) ** 0.5
+                    nb = sum(y * y for y in vb) ** 0.5
+                    if not na or not nb:
+                        continue
+                    sim = dot / (na * nb)
+                    if sim < CONFLICT_THRESHOLD:
+                        continue
+
+                    # Similarity alone over-reports: templated facts about
+                    # DIFFERENT subjects read almost identically ("Checkout is
+                    # written in Java 17" vs "Billing is written in Java 17")
+                    # without conflicting at all. Require the pair to be about
+                    # the same thing, using tag overlap as a cheap subject
+                    # proxy. Skipped when either side is untagged.
+                    ta, tb = tags_by_id.get(a) or set(), tags_by_id.get(b) or set()
+                    if ta and tb:
+                        union = ta | tb
+                        if union and (len(ta & tb) / len(union)) < CONFLICT_TAG_OVERLAP:
+                            continue
+
+                    if _semantically_linked(conn, a, b):
+                        continue  # already resolved by an edge
+                    conflicts.append({
+                        "ids": [a, b],
+                        "similarity": round(sim, 4),
+                        "hint": "Near-identical memories with no SUPERSEDES edge. If one "
+                                "replaces the other, re-store the current version with "
+                                "memory_store(..., supersedes=<old_id>); if both are true, "
+                                "link them with memory_relate.",
+                    })
+                    if len(conflicts) >= 3:
+                        break
+                if len(conflicts) >= 3:
+                    break
+        except Exception as e:
+            logger.debug(f"Conflict detection failed (non-fatal): {e}")
+
     related: list[dict] = []
     if results and GRAPH_EXPAND_SEEDS > 0:
         try:
@@ -1821,6 +1933,8 @@ def memory_search(
     out: dict = {"results": results}
     if related:
         out["related"] = related
+    if conflicts:
+        out["potential_conflicts"] = conflicts
     if not vector_hits and _count_memories(conn) > 0:
         out["degraded"] = (
             "Semantic (vector) search returned nothing — results are keyword-only. "
@@ -2726,6 +2840,9 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             }
 
         actions_taken = []
+        # Pairs left alone because a SUPERSEDES/EXPLAINS edge marks them as
+        # distinct versions rather than duplicates.
+        protected_pairs = 0
 
         # Phase 1: Auto-prune stale low-importance memories
         prune_cutoff = now - (DREAM_AUTO_PRUNE_DAYS * 86400)
@@ -2802,6 +2919,17 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                         if mem_ws != other_ws:
                             continue
                         if sim < DREAM_TRIVIAL_MERGE_THRESHOLD:
+                            continue
+                        # Never merge across a SUPERSEDES/EXPLAINS edge: those
+                        # assert the memories are distinct versions, and a
+                        # correction looks like a duplicate by construction.
+                        link = _semantically_linked(conn, mid, other_id)
+                        if link:
+                            logger.info(
+                                f"Skipping merge of {mid}/{other_id} (sim {sim:.4f}): "
+                                f"linked by {link}"
+                            )
+                            protected_pairs += 1
                             continue
 
                         # Keep the longer content, absorb tags, take max importance
@@ -2950,6 +3078,13 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                             and row[0] not in visited_clusters
                             and DREAM_CLUSTER_LOW_THRESHOLD <= sim < DREAM_TRIVIAL_MERGE_THRESHOLD
                         ):
+                            # Already-linked pairs are resolved history, not
+                            # candidates for review — surfacing them invites an
+                            # agent to merge a correction chain away.
+                            if _semantically_linked(conn, mid, row[0]):
+                                protected_pairs += 1
+                                visited_clusters.add(row[0])
+                                continue
                             cluster_members.append({"id": row[0], "preview": _truncate(row[1], 100), "similarity": sim})
                             visited_clusters.add(row[0])
 
@@ -2958,6 +3093,12 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                         clusters.append({
                             "anchor": {"id": mid, "preview": _truncate(content, 100), "importance": importance},
                             "similar": cluster_members,
+                            # None of these are edge-linked (linked pairs were
+                            # filtered above), so each is one of: a true
+                            # duplicate to merge, OR competing versions that
+                            # need a SUPERSEDES edge, OR distinct facts that
+                            # merely read alike. The agent must decide which.
+                            "resolution": "merge_duplicate | link_with_supersedes | leave_separate",
                         })
                         if len(clusters) >= MAX_CONSOLIDATE_CLUSTERS:
                             break
@@ -3024,6 +3165,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "status": "preview" if dry_run else "completed",
             "pruned": pruned_count,
             "auto_merged": merged_count,
+            "protected_by_edges": protected_pairs,
             "memories_after": memories_after,
             "clusters_for_review": clusters,
             "contradictions": contradictions,
