@@ -192,6 +192,9 @@ SUPERSEDED_PENALTY = float(os.environ.get("MEMORY_SUPERSEDED_PENALTY", "0.5"))
 # MEMORY_GRAPH_EXPAND_SEEDS=0 to disable.
 GRAPH_EXPAND_SEEDS = int(os.environ.get("MEMORY_GRAPH_EXPAND_SEEDS", "3"))
 GRAPH_EXPAND_LIMIT = int(os.environ.get("MEMORY_GRAPH_EXPAND_LIMIT", "5"))
+# A seed must score at least this fraction of the top result to expand from.
+# Weak hits are coincidences and their neighbours are noise.
+GRAPH_EXPAND_MIN_RATIO = float(os.environ.get("MEMORY_GRAPH_EXPAND_MIN_RATIO", "0.6"))
 
 FUSION_MODE = os.environ.get("MEMORY_FUSION", "legacy").strip().lower()
 if FUSION_MODE not in ("legacy", "normalized"):
@@ -1751,7 +1754,15 @@ def memory_search(
     related: list[dict] = []
     if results and GRAPH_EXPAND_SEEDS > 0:
         try:
-            seeds = [r["id"] for r in results[:GRAPH_EXPAND_SEEDS]]
+            # Only expand from STRONG matches. A weak hit is a coincidence, and
+            # its neighbours are noise: observed a pricing correction placing
+            # rank 3 at 53% of the top score on a billing query, dragging its
+            # superseded pair into `related` where it had no business being.
+            floor = results[0]["score"] * GRAPH_EXPAND_MIN_RATIO
+            seeds = [r["id"] for r in results[:GRAPH_EXPAND_SEEDS]
+                     if r["score"] >= floor]
+            if not seeds:
+                raise StopIteration  # nothing confident enough to expand from
             returned = {r["id"] for r in results}
             r = conn.execute(
                 """MATCH (s:Memory)-[e:RELATED_TO|SUPERSEDES|EXPLAINS]-(n:Memory)
@@ -1769,6 +1780,8 @@ def memory_search(
                 })
                 if len(related) >= GRAPH_EXPAND_LIMIT:
                     break
+        except StopIteration:
+            pass  # no seed cleared the relevance floor
         except Exception as e:
             logger.debug(f"Neighbour expansion failed (non-fatal): {e}")
 

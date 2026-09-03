@@ -140,3 +140,53 @@ def test_superseded_version_available_as_context(store):
     stale_visible = (store["decision"] in top_ids
                      or store["decision"] in {r["id"] for r in out.get("related", [])})
     assert stale_visible, "superseded memory should remain discoverable"
+
+
+def test_weak_matches_do_not_seed_expansion(store):
+    """A weak hit is a coincidence; its neighbours are noise.
+
+    Observed in a 127-memory corpus: a pricing correction placed rank 3 at
+    0.4185 on a billing-bug query (53% of the 0.7879 top score), which seeded
+    expansion and pulled its superseded pair into `related` where it was
+    irrelevant. Seeds must clear GRAPH_EXPAND_MIN_RATIO of the top score.
+    """
+    # Link something to a memory that will only ever be a weak match here
+    weak_neighbour = server.memory_store.__wrapped__(
+        content="Quarterly finance review scheduled for the fifteenth.")["id"]
+    weak_target = next(r["id"] for r in server.memory_search.__wrapped__(
+        query="cognito token validation", top_k=1)["results"])
+    server.memory_relate.__wrapped__(from_id=weak_neighbour, to_id=weak_target,
+                                     relationship="RELATED_TO")
+
+    out = _search()  # a checkout query; the auth memory is at best a weak hit
+    top = out["results"][0]["score"]
+    floor = top * server.GRAPH_EXPAND_MIN_RATIO
+    for r in out["results"]:
+        if r["score"] < floor:
+            assert r["id"] != weak_target or weak_neighbour not in {
+                x["id"] for x in out.get("related", [])
+            }, "expanded from a hit below the relevance floor"
+
+
+def test_strong_match_still_seeds_expansion(store):
+    """The floor must not block expansion from a confident top hit."""
+    server.memory_relate.__wrapped__(
+        from_id=store["consequence"], to_id=store["decision"],
+        relationship="RELATED_TO")
+
+    out = _search()
+    assert out["results"][0]["id"] == store["decision"]
+    assert out["results"][0]["score"] >= (
+        out["results"][0]["score"] * server.GRAPH_EXPAND_MIN_RATIO)
+    assert store["consequence"] in {r["id"] for r in out.get("related", [])}, \
+        "a strong top hit must still expand"
+
+
+def test_min_ratio_is_configurable(store, monkeypatch):
+    server.memory_relate.__wrapped__(
+        from_id=store["consequence"], to_id=store["decision"],
+        relationship="RELATED_TO")
+
+    # A ratio above 1.0 makes even the top result fail the floor
+    monkeypatch.setattr(server, "GRAPH_EXPAND_MIN_RATIO", 1.5)
+    assert "related" not in _search(), "no seed should clear an impossible floor"

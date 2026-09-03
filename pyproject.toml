@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memnest-mcp"
-version = "0.11.0"
+version = "0.11.1"
 description = "Persistent graph memory MCP server for AI agents using LadybugDB"
 readme = "README.md"
 license = "MIT"
