@@ -20,3 +20,10 @@ venv/
 benchmark/results/dbs/
 benchmark/results/*.json
 benchmark/results/*.txt
+
+# memory_export default output (timestamped, lands next to the database or cwd)
+memnest-export-*.json
+
+# memory_graph_html output and its rotated snapshots
+memory_graph.html
+memory_graph-*.html
