@@ -40,7 +40,7 @@ Evaluated with Claude Sonnet 4.5 as the answer agent and Haiku 4.5 as the judge,
 - **Local embeddings** — no API key needed (`bge-small-en-v1.5`, 384-dim)
 - **Single embedded database** — no Docker, no PostgreSQL, no separate vector DB
 - **Hybrid search** — Vector (HNSW) + Full-text (BM25) + Graph (PageRank + Louvain communities)
-- **3 agent tools** — `memory_search`, `memory_get`, `calculator`. Simple interface, powerful retrieval.
+- **Minimal retrieval surface** — the benchmark agent above scored 82.9% using only `memory_search`, `memory_get` and a `calculator` for date arithmetic. Retrieval quality comes from the server, not from agent-side orchestration.
 
 ## Quick Start
 
@@ -106,16 +106,21 @@ That's it — zero config required. All settings have sensible defaults.
 | `memory_search` | Hybrid semantic + keyword search, ranked by relevance |
 | `memory_update` | Update content, importance, or tags (single or batch) |
 | `memory_delete` | Delete one or more memories and their relationships |
-| `memory_relate` | Create RELATED_TO / SUPERSEDES / EXPLAINS relationships (single or batch) |
+| `memory_get` | Read one memory in full — untruncated content plus its edges |
+| `memory_list` | Enumerate memories by recency / category / topic / importance (no ranking, pages to any depth) |
+| `memory_relate` | Create RELATED_TO / SUPERSEDES / EXPLAINS relationships (single or batch, idempotent) |
+| `memory_unrelate` | Remove a relationship — one type or all types between a pair |
 | `memory_query` | Run any Cypher query — traversals, writes, extension calls (INSTALL/LOAD), table scans |
 | `memory_schema` | Inspect live DB schema: tables, columns, indexes, extensions |
 | `memory_topics` | List all topics (tags) with memory counts |
-| `memory_stats` | Database statistics: counts, categories, topics, top memories |
+| `memory_stats` | Database statistics: counts, categories, topics, top memories, runtime health |
 | `memory_dream` | Periodic consolidation — auto-prune stale, auto-merge trivial duplicates, surface clusters for review |
+| `memory_reindex` | Rebuild both search indexes (vector HNSW and full-text BM25) |
+| `memory_export` | Write all memories and edges to a portable JSON file |
+| `memory_import` | Restore an export — ids remapped, edges rewired, dedup applied |
+| `memory_set_workspace` | Pin the workspace scope and database location |
 | `memory_graph_html` | Generate an interactive HTML visualization of the graph |
-| `memory_get` | (compat) Get full content of a memory by ID |
-| `memory_list` | (compat) List memories filtered by recency, category, topic, or importance |
-| `memory_traverse` | (compat) Read-only Cypher — alias for `memory_query(read_only=True)` |
+| `memory_traverse` | *Deprecated* — use `memory_query(read_only=True)` |
 
 ## Graph Data Model
 
@@ -210,7 +215,10 @@ All settings are optional — defaults work out of the box.
 | `MEMORY_DREAM_CLUSTER_LOW` | `0.88` | Cluster-review window: `[low, trivial)` is surfaced for agent review |
 | `MEMORY_CONSOLIDATE_CLUSTERS` | `10` | Max clusters returned per `memory_dream` run |
 | `MEMORY_CONSOLIDATE_SCAN` | `1000` | Max memories scanned per dream phase |
-| `MEMORY_ALLOW_DESTRUCTIVE` | `false` | Allow DELETE/DROP/TRUNCATE through `memory_query`. **Off by default for safety**. Opt in with `true` |
+| `MEMORY_ALLOW_DESTRUCTIVE` | `false` | Allow DELETE/DROP/TRUNCATE/REMOVE/SET/COPY through `memory_query`. **Off by default for safety.** Prefer `memory_update`, `memory_delete`, `memory_unrelate` |
+| `MEMORY_SEARCH_CANDIDATES` | `100` | Rows each search channel retrieves before fusion. Independent of `top_k` |
+| `MEMORY_MAX_STORE_CHARS` | `20000` | Content longer than this is truncated on store |
+| `MEMORY_MAX_BATCH` | `500` | Max items per batch call |
 | `MEMORY_GRAPH_MAX_NODES` | `2000` | Max nodes `memory_graph_html` will render before refusing |
 | `MEMORY_EMBED_TIMEOUT_S` | `30` | Soft timeout for embedding model load (warm-up only) |
 
@@ -293,6 +301,20 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 
 ## Changelog
 
+### 0.19.0
+
+Surface hardening from a full tool-by-tool review.
+
+- **Security**: the `memory_query` destructive-query guard was bypassable. It matched the substring `"DELETE "` — with a literal trailing space — so `MATCH (m:Memory)\nDETACH\nDELETE\nm;` reported success and deleted every memory with `MEMORY_ALLOW_DESTRUCTIVE=false`. Queries are now classified after stripping comments and string literals, matching keywords on word boundaries.
+- **Breaking**: `read_only=True` now rejects *any* mutation. It previously permitted `CREATE`/`MERGE`/`SET`, so an overwrite succeeded under a flag named read-only. `MEMORY_ALLOW_DESTRUCTIVE` now also covers `SET`, `REMOVE` and `COPY` — an overwrite destroys the previous value as surely as a delete.
+- **New `memory_unrelate`**: edges could be created but never removed, and `memory_query`'s DELETE is blocked by default, so a mistaken `SUPERSEDES` was permanent. This is also the supported way to break a circular `SUPERSEDES` chain that `memory_dream` reports.
+- **`memory_get` now returns edges** (`include_edges=True` by default) plus `superseded` / `superseded_by`. Answering "what does this replace?" no longer requires Cypher.
+- **Ranking fix**: the search candidate pool was `top_k * 3`, so the page size decided which memories were scored at all — on a 25-memory corpus, `top_k=10` surfaced two memories that outranked every result `top_k=5` returned. The pool is now fixed (`MEMORY_SEARCH_CANDIDATES`, default 100) and independent of `top_k`. Scores are unchanged; only coverage improves.
+- **Pagination**: `memory_search(offset=...)` with `offset` / `has_more` in the response. Rank 11+ was previously unreachable.
+- **New `memory_export` / `memory_import`**: JSON backup and restore including edges, with id remapping so an import can merge into an existing database. `memory_relate` is now idempotent (`status: "exists"`), so re-importing no longer doubles every edge.
+- Input validation across every tool: two-sided clamping (`preview_chars=-5` used to slice content from the wrong end; `top_k=0` returned a `degraded` flag blaming the embedding model), content and batch size caps, and honest statuses (`memory_delete` reported `deleted` when every id was missing; `memory_list(min_importance='high')` raised a raw `ValueError`).
+- `memory_get` and `memory_list` are no longer labelled compatibility aliases — each does something no other tool does. `memory_traverse` is marked deprecated.
+
 ### 0.3.0
 
 - Default database is now per-workspace: `.memnest/memory.lbug` in the current directory. No more cross-workspace lock conflicts.
@@ -307,7 +329,7 @@ Compatibility-preserving redesign with improved safety defaults.
 - New tools: `memory_query` (general Cypher), `memory_schema`, `memory_topics`, `memory_dream`, `memory_graph_html`. Batch mode added to `memory_store`, `memory_update`, `memory_relate`, `memory_delete`.
 - **Breaking**: `MEMORY_ALLOW_DESTRUCTIVE` now defaults to `false`. Set it to `true` if you previously relied on `memory_query` deleting nodes.
 - **Breaking**: tag storage migrated from comma-joined strings to JSON arrays. Old rows are still readable; rewriting (e.g. via `memory_update`) upgrades them to JSON.
-- `memory_get`, `memory_list`, `memory_traverse` from 0.1.x are retained as compatibility aliases. They will be removed in 0.3.0.
+- `memory_get`, `memory_list`, `memory_traverse` from 0.1.x are retained as compatibility aliases. (As of 0.19.0 `memory_get` and `memory_list` are first-class again; only `memory_traverse` remains deprecated.)
 - TOON serialization is now the default response format when `toon-format` is installed; set `MEMORY_RESPONSE_FORMAT=json` to opt out.
 - `memory_relate` validates that both endpoints exist before returning `created` (used to silently no-op on typo'd IDs).
 - `memory_graph_html` is now XSS-safe (HTML-escaped tooltips, DOM `textContent` for the detail panel), refuses to render >`MEMORY_GRAPH_MAX_NODES`, and rotates snapshots.

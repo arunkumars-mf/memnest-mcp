@@ -218,6 +218,20 @@ Relationship types:
 - `SUPERSEDES` — Newer memory corrects/replaces older. Creates a correction chain.
 - `EXPLAINS` — One memory explains/elaborates another
 
+Creating an edge twice is a no-op (`status: "exists"`), so re-asserting a link
+you are unsure about is safe.
+
+**Wrote the wrong edge?** `memory_unrelate(from_id=..., to_id=...)` removes it.
+Omit `relationship` to drop every edge between the pair, or name one to drop
+just that type. The memories are untouched. This is also how you break a
+circular `SUPERSEDES` chain if `memory_dream` reports one under
+`contradictions`.
+
+**Inspecting what a memory is connected to:** `memory_get(memory_id=42)` returns
+an `edges` block with both directions, plus `superseded: true` and
+`superseded_by` when a newer version exists. Reach for that before writing
+Cypher.
+
 Batch mode:
 
 ```
@@ -303,9 +317,28 @@ Three layers — you don't need to check manually:
 | `MEMORY_MERGE_VALUE_GATE` | `1` | Refuse to merge near-identical memories whose values disagree. Set `0` to restore pure-similarity merging (unsafe: a corrected value can silently keep the stale one) |
 | `MEMORY_CONFLICT_THRESHOLD` | `0.85` | Similarity at which two results are flagged as `near_duplicate` |
 | `MEMORY_CONFLICT_VALUE_FLOOR` | `0.5` | Similarity floor for `value_disagreement` flagging (same subject, different value, however differently worded) |
+| `MEMORY_SEARCH_CANDIDATES` | `100` | Rows each channel retrieves before fusion. Independent of `top_k`, so page size never decides which memories get scored |
+| `MEMORY_ALLOW_DESTRUCTIVE` | `false` | Allow `memory_query` to run DELETE/DROP/TRUNCATE/REMOVE/SET/COPY. Leave off; use `memory_update`, `memory_delete`, `memory_unrelate` |
+| `MEMORY_MAX_STORE_CHARS` | `20000` | Content longer than this is truncated on store |
+| `MEMORY_MAX_BATCH` | `500` | Max items per batch call |
 | `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max search results |
 | `MEMORY_FUSION` | `legacy` | Vector-channel scaling: `legacy` (raw cosine) or `normalized` (min-max, matching the FTS channel). `normalized` is more robust on very small memory sets |
+
+## Backup and transfer
+
+`memory_export()` writes every memory and edge to a JSON file (defaults to a
+timestamped file next to the database). `memory_import(path=...)` restores it.
+
+Ids are remapped rather than preserved, so an import can be merged into a
+database that already has memories — edges are rewired onto the new ids, and
+imported content goes through normal dedup, so re-importing the same file is a
+no-op rather than a duplication. Use `dry_run=True` to see what a file would do.
+`include_embeddings=True` makes the file much larger but avoids re-embedding on
+restore; without it, content is re-embedded with the current model.
+
+Worth doing before an upgrade, before `memory_set_workspace` (which leaves the
+old database behind rather than moving it), and on any schedule you like.
 
 ## Troubleshooting
 

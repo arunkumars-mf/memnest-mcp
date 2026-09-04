@@ -22,10 +22,13 @@ Response format:
   - TOON typically reduces tokens by 30-60% vs JSON
 
 Tools (see individual docstrings for params):
-  memory_store, memory_search, memory_update, memory_delete, memory_relate,
-  memory_query, memory_schema, memory_topics, memory_stats, memory_dream,
-  memory_graph_html
-  Compatibility aliases: memory_get, memory_list, memory_traverse
+  Write      memory_store, memory_update, memory_delete
+  Read       memory_search, memory_get, memory_list, memory_topics
+  Graph      memory_relate, memory_unrelate, memory_query, memory_schema
+  Maintain   memory_dream, memory_reindex, memory_stats, memory_set_workspace
+  Transfer   memory_export, memory_import
+  Visualise  memory_graph_html
+  Deprecated memory_traverse (use memory_query with read_only=True)
 """
 
 import hashlib
@@ -233,7 +236,22 @@ if FUSION_MODE not in ("legacy", "normalized"):
 RESPONSE_FORMAT = os.environ.get("MEMORY_RESPONSE_FORMAT", "toon" if _TOON_AVAILABLE else "json").lower()
 
 MAX_CONTENT_LENGTH = int(os.environ.get("MEMORY_MAX_CONTENT", "500"))
+
+# Input caps. MAX_CONTENT_LENGTH above is an OUTPUT preview width, not an input
+# limit — a 120,000-character memory was accepted, embedded and stored, which
+# wastes the embedding budget (the model truncates to its context anyway) and
+# bloats every preview path.
+MAX_STORE_CHARS = int(os.environ.get("MEMORY_MAX_STORE_CHARS", "20000"))
+MAX_TAG_CHARS = int(os.environ.get("MEMORY_MAX_TAG_CHARS", "80"))
+MAX_TAGS_PER_MEMORY = int(os.environ.get("MEMORY_MAX_TAGS", "32"))
+MAX_BATCH_ITEMS = int(os.environ.get("MEMORY_MAX_BATCH", "500"))
+MAX_QUERY_CHARS = int(os.environ.get("MEMORY_MAX_QUERY_CHARS", "20000"))
+MAX_PREVIEW_CHARS = int(os.environ.get("MEMORY_MAX_PREVIEW_CHARS", "4000"))
 MAX_SEARCH_RESULTS = int(os.environ.get("MEMORY_SEARCH_LIMIT", "10"))
+# Rows each search channel retrieves before fusion. Independent of top_k so the
+# ranking does not depend on the page size — see the comment at the pool
+# computation in memory_search for why this cannot change scores.
+SEARCH_CANDIDATE_POOL = int(os.environ.get("MEMORY_SEARCH_CANDIDATES", "100"))
 MAX_LIST_RESULTS = int(os.environ.get("MEMORY_LIST_LIMIT", "20"))
 MAX_CONSOLIDATE_CLUSTERS = int(os.environ.get("MEMORY_CONSOLIDATE_CLUSTERS", "10"))
 MAX_CONSOLIDATE_SCAN = int(os.environ.get("MEMORY_CONSOLIDATE_SCAN", "1000"))
@@ -1407,6 +1425,44 @@ def _store_without_embedding(conn, content: str, content_hash: str, category: st
 DEFAULT_IMPORTANCE = 3
 
 
+def _clamp_int(value, lo: int, hi: int, default: int) -> int:
+    """Coerce a caller-supplied int into [lo, hi], falling back to `default`.
+
+    Two-sided on purpose. Several tools previously clamped only the upper
+    bound, so a negative slipped through: memory_search(top_k=-3) returned zero
+    results plus a `degraded` message blaming the embedding model, and
+    preview_chars=-5 turned _truncate into text[:-5], silently corrupting output
+    instead of erroring.
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, v))
+
+
+def _truncate_content(content: str) -> tuple:
+    """Cap stored content length. Returns (content, was_truncated)."""
+    if not isinstance(content, str):
+        return "", False
+    if len(content) <= MAX_STORE_CHARS:
+        return content, False
+    return content[:MAX_STORE_CHARS], True
+
+
+def _limit_tags(tags) -> list:
+    """Cap tag count and per-tag length before they become Topic primary keys."""
+    if not tags:
+        return []
+    if not isinstance(tags, list):
+        return []
+    out = []
+    for t in tags[:MAX_TAGS_PER_MEMORY]:
+        if isinstance(t, str) and t.strip():
+            out.append(t[:MAX_TAG_CHARS])
+    return out
+
+
 def _clamp_importance(value: int) -> int:
     """Hold importance inside the documented 1-5 range.
 
@@ -1786,25 +1842,32 @@ def memory_store(
     explicitly to set a value.
     """
     conn = get_conn()
-    tags = tags or []
+    tags = _limit_tags(tags or [])
 
     # Batch mode
     if items is not None:
-        if not items:
-            return {"status": "error", "message": "items list is empty."}
+        if not isinstance(items, list) or not items:
+            return {"status": "error", "message": "items must be a non-empty list."}
+        if len(items) > MAX_BATCH_ITEMS:
+            return {"status": "error",
+                    "message": f"Too many items ({len(items)}, limit {MAX_BATCH_ITEMS}). "
+                               f"Split the batch."}
 
         # Embed all in one call
-        contents = [item.get("content", "") for item in items]
+        contents = [_truncate_content(item.get("content", ""))[0] for item in items]
         embeddings = _embed_batch(contents)
 
         results = []
-        for item, emb in zip(items, embeddings):
+        for item, emb, text in zip(items, embeddings, contents):
             try:
+                if not text.strip():
+                    results.append({"status": "error", "message": "content is required."})
+                    continue
                 res = _store_one(
                     conn,
-                    content=item.get("content", ""),
+                    content=text,
                     category=item.get("category", "general"),
-                    tags=item.get("tags", []),
+                    tags=_limit_tags(item.get("tags", [])),
                     importance=item.get("importance"),
                     embedding=emb,
                     supersedes=item.get("supersedes"),
@@ -1814,14 +1877,24 @@ def memory_store(
                 results.append({"status": "error", "message": str(e)})
 
         _bump_dream_ops()
-        return {"results": results, "count": len(results)}
+        errors = sum(1 for r in results if r.get("status") == "error")
+        out = {"results": results, "count": len(results)}
+        # A batch where every item failed used to look like a success envelope,
+        # because only per-item statuses were reported.
+        if errors:
+            out["errors"] = errors
+            out["status"] = "error" if errors == len(results) else "partial"
+        return out
 
     # Single mode
-    if content is None:
+    if content is None or not str(content).strip():
         return {"status": "error", "message": "content is required (or pass items=[...])."}
 
+    content, truncated = _truncate_content(content)
     res = _store_one(conn, content, category, tags, importance,
                      supersedes=supersedes)
+    if truncated:
+        res["content_truncated_to"] = MAX_STORE_CHARS
     _bump_dream_ops()
     return res
 
@@ -1837,9 +1910,14 @@ def memory_search(
     preview_chars: int = 200,
     include_superseded: bool = True,
     explain: bool = False,
+    offset: int = 0,
 ) -> str:
     """Hybrid semantic + keyword + graph search. Filters by current workspace unless global_search=True.
-    top_k max 10. preview_chars caps content length per result (default 200).
+    top_k max 10 per page. preview_chars caps content length per result (default 200).
+
+    offset skips that many ranked results, so offset=10 with top_k=10 returns
+    ranks 11-20. Without it the 10th result was the last reachable one for any
+    query. The response carries `offset` and `has_more`.
     TIP: Pass tags=[...] to disambiguate overloaded query words (e.g. "workspace"
     could mean Brazil, Kiro, or ATX — tags narrow it instantly). See memory_stats
     for the list of known topics.
@@ -1862,7 +1940,12 @@ def memory_search(
     proximity never displaces a direct answer.
     """
     conn = get_conn()
-    top_k = min(top_k, MAX_SEARCH_RESULTS)
+    if not isinstance(query, str) or not query.strip():
+        return {"status": "error", "message": "query is required."}
+    top_k = _clamp_int(top_k, 1, MAX_SEARCH_RESULTS, 5)
+    offset = _clamp_int(offset, 0, 10_000, 0)
+    preview_chars = _clamp_int(preview_chars, 1, MAX_PREVIEW_CHARS, 200)
+    tags = _limit_tags(tags or []) or None
 
     # Score accumulators: {memory_id: {vector: float, fts: float, graph: float}}
     raw_scores: dict[int, dict[str, float]] = {}
@@ -1877,6 +1960,27 @@ def memory_search(
             raw_scores[mid] = {"vector": 0.0, "fts": 0.0, "graph": 0.0}
         raw_scores[mid][channel] = max(raw_scores[mid][channel], score)
 
+    # Candidate pool: how many rows each channel retrieves before fusion.
+    #
+    # This used to be top_k * 3, which made the pool a function of the page
+    # size and produced two defects. First, it TRUNCATED the ranking: with
+    # top_k=5 the true top-scoring memories could be absent entirely, because
+    # they never entered a 15-row window — measured on a 25-memory corpus where
+    # top_k=10 revealed two memories (0.7410, 0.7400) that outranked every
+    # result top_k=5 returned. Second, it made paging incoherent: a wider pool
+    # for page 2 re-ranked the candidates, so pages overlapped.
+    #
+    # A fixed pool fixes both, and it does NOT change any score: per-memory
+    # values are pool-independent (vector similarity is per-pair, FTS rows come
+    # back score-ordered so the normalising max is the first row regardless of
+    # limit, and recency/importance/graph are per-memory). A larger pool only
+    # scores MORE candidates, moving the result closer to the true global
+    # ranking. Paging deeper than the pool widens it, at which point pages are
+    # no longer guaranteed disjoint — use memory_list for exhaustive scans.
+    _pool = max(SEARCH_CANDIDATE_POOL, (top_k + offset) * 3)
+    _candidate_k = _pool
+    _fts_limit = _pool
+
     # --- Channel 1: Vector search (HNSW cosine similarity) ---
     embedding = _embed(query)
 
@@ -1885,12 +1989,16 @@ def memory_search(
         if embedding is None:
             return 0
         try:
+            # The candidate window must cover the requested PAGE, not just the
+            # page size, or paging past the first page would ask the index for
+            # fewer rows than the offset already consumed.
+            k = _candidate_k
             if global_search:
                 where_clause = ""
-                vec_params: dict = {"query": embedding, "k": top_k * 3}
+                vec_params: dict = {"query": embedding, "k": k}
             else:
                 where_clause = "WHERE m.workspace IN ['', $ws]"
-                vec_params = {"query": embedding, "k": top_k * 3, "ws": WORKSPACE}
+                vec_params = {"query": embedding, "k": k, "ws": WORKSPACE}
             result = conn.execute(
                 f"""CALL QUERY_VECTOR_INDEX('Memory', 'memory_vec_idx', $query, $k)
                    WITH node AS m, distance
@@ -1948,10 +2056,10 @@ def memory_search(
             if fts_query:
                 if global_search:
                     fts_where = ""
-                    fts_params: dict = {"query": fts_query, "limit": top_k * 2}
+                    fts_params: dict = {"query": fts_query, "limit": _fts_limit}
                 else:
                     fts_where = "AND m.workspace IN ['', $ws]"
-                    fts_params = {"query": fts_query, "limit": top_k * 2, "ws": WORKSPACE}
+                    fts_params = {"query": fts_query, "limit": _fts_limit, "ws": WORKSPACE}
                 result = conn.execute(
                     f"""CALL QUERY_FTS_INDEX('Memory', 'memory_fts_idx', $query, top := $limit)
                        WITH node AS m, score
@@ -2153,6 +2261,8 @@ def memory_search(
 
     # Build results
     results = []
+    skipped = 0
+    more_available = False
     for mid, score in sorted(final_scores.items(), key=lambda x: -x[1]):
         mem = memory_data.get(mid)
         if not mem:
@@ -2195,8 +2305,19 @@ def memory_search(
             if mid in superseded:
                 ex["superseded_penalty"] = SUPERSEDED_PENALTY
             entry["explain"] = ex
+
+        # Paging is applied AFTER the filters above, so offset counts results
+        # the caller would actually have seen rather than pre-filter candidates.
+        if skipped < offset:
+            skipped += 1
+            continue
+
         results.append(entry)
         if len(results) >= top_k:
+            # Look one past the page to answer has_more honestly, instead of the
+            # `len(results) >= limit` guess the other paginated tools use (which
+            # claims has_more on an exact-boundary final page).
+            more_available = True
             break
 
     # Bump access counts
@@ -2375,6 +2496,9 @@ def memory_search(
     # plausible-looking scores — the caller has no way to know retrieval is
     # degraded. See _embed()/vector-search error logging above.
     out: dict = {"results": results}
+    if offset or more_available:
+        out["offset"] = offset
+        out["has_more"] = more_available
     if related:
         out["related"] = related
     if conflicts:
@@ -2390,7 +2514,7 @@ def memory_search(
             # neighbours GLOBALLY (k = top_k*3) and workspace-filters after,
             # so these two numbers say how much of the window this query used
             # and how many candidates survived the filter.
-            "vector_k": top_k * 3,
+            "candidate_pool": _pool,
             "vector_hits": len(vector_hits),
             "candidates_scored": len(raw_scores),
             "superseded_penalty": SUPERSEDED_PENALTY,
@@ -2421,11 +2545,15 @@ def memory_update(memory_id: Optional[int] = None, content: Optional[str] = None
 
     # Batch mode
     if updates is not None:
-        if not updates:
-            return {"status": "error", "message": "updates list is empty."}
+        if not isinstance(updates, list) or not updates:
+            return {"status": "error", "message": "updates must be a non-empty list."}
+        if len(updates) > MAX_BATCH_ITEMS:
+            return {"status": "error",
+                    "message": f"Too many updates ({len(updates)}, limit {MAX_BATCH_ITEMS})."}
 
         # Pre-compute embeddings for all items that change content
-        contents_to_embed = [(i, u.get("content")) for i, u in enumerate(updates)
+        contents_to_embed = [(i, _truncate_content(u.get("content"))[0])
+                             for i, u in enumerate(updates)
                              if u.get("content") is not None]
         embeddings_by_idx = {}
         if contents_to_embed:
@@ -2439,9 +2567,10 @@ def memory_update(memory_id: Optional[int] = None, content: Optional[str] = None
                 res = _update_one(
                     conn,
                     memory_id=u.get("memory_id"),
-                    content=u.get("content"),
+                    content=(_truncate_content(u["content"])[0]
+                             if u.get("content") is not None else None),
                     importance=u.get("importance"),
-                    tags=u.get("tags"),
+                    tags=(_limit_tags(u["tags"]) if u.get("tags") is not None else None),
                     embedding=embeddings_by_idx.get(i),
                 )
                 results.append(res)
@@ -2456,8 +2585,20 @@ def memory_update(memory_id: Optional[int] = None, content: Optional[str] = None
     if memory_id is None:
         return {"status": "error",
                            "message": "memory_id is required (or pass updates=[...])."}
+    if content is None and importance is None and tags is None:
+        return {"status": "error",
+                "message": "Nothing to update: pass at least one of content, importance, tags."}
+
+    if content is not None:
+        content, truncated = _truncate_content(content)
+    else:
+        truncated = False
+    if tags is not None:
+        tags = _limit_tags(tags)
 
     res = _update_one(conn, memory_id, content, importance, tags)
+    if truncated:
+        res["content_truncated_to"] = MAX_STORE_CHARS
     _bump_dream_ops()
     return res
 
@@ -2526,13 +2667,26 @@ def _update_one(conn, memory_id: int, content: Optional[str] = None,
 @mcp.tool()
 @_timed("memory_delete")
 def memory_delete(memory_id: int | list[int]) -> str:
-    """Delete one or more memories (and their relationships). Pass int or list of ints."""
+    """Delete one or more memories (and their relationships). Pass int or list of ints.
+
+    To remove only an EDGE and keep both memories, use memory_unrelate.
+    """
     conn = get_conn()
     ids = memory_id if isinstance(memory_id, list) else [memory_id]
+    if not ids:
+        return {"status": "error", "message": "memory_id is required."}
+    if len(ids) > MAX_BATCH_ITEMS:
+        return {"status": "error",
+                "message": f"Too many ids ({len(ids)}, limit {MAX_BATCH_ITEMS})."}
+
     deleted = []
     not_found = []
+    invalid = []
 
     for mid in ids:
+        if not isinstance(mid, int) or isinstance(mid, bool):
+            invalid.append(mid)
+            continue
         result = conn.execute("MATCH (m:Memory {id: $id}) RETURN m.id;", {"id": mid})
         if not result.has_next():
             not_found.append(mid)
@@ -2540,23 +2694,35 @@ def memory_delete(memory_id: int | list[int]) -> str:
         conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;", {"id": mid})
         deleted.append(mid)
 
-    return {
-        "status": "deleted",
-        "deleted": deleted,
-        "not_found": not_found,
-    }
+    # The status used to be a hardcoded "deleted" even when nothing was deleted
+    # and every id landed in not_found, so a caller could not tell the
+    # difference from the status alone.
+    if deleted and not (not_found or invalid):
+        status = "deleted"
+    elif deleted:
+        status = "partial"
+    else:
+        status = "not_found" if not invalid else "error"
+
+    out = {"status": status, "deleted": deleted, "not_found": not_found}
+    if invalid:
+        out["invalid"] = invalid
+    return out
+
+
+# SECURITY: relationship labels are interpolated into Cypher (LadybugDB does
+# not support parameterized rel labels), so every path that names one validates
+# against this single allowlist. Never accept an arbitrary label.
+EDGE_TYPES = ("RELATED_TO", "SUPERSEDES", "EXPLAINS")
 
 
 def _relate_one(conn, from_id: int, to_id: int, relationship: str = "RELATED_TO",
                 confidence: float = 1.0, provenance: str = "EXTRACTED") -> dict:
     """Core single-relationship creation logic."""
-    rel = relationship.upper()
-    # SECURITY: rel is interpolated into Cypher (LadybugDB does not support
-    # parameterized rel labels). Validate against an allowlist; never accept
-    # arbitrary input here.
-    if rel not in ("RELATED_TO", "SUPERSEDES", "EXPLAINS"):
+    rel = str(relationship or "").upper()
+    if rel not in EDGE_TYPES:
         return {"status": "error", "from": from_id, "to": to_id,
-                "message": f"Unknown relationship: {rel}. Use RELATED_TO, SUPERSEDES, or EXPLAINS."}
+                "message": f"Unknown relationship: {rel}. Use {', '.join(EDGE_TYPES)}."}
 
     if from_id is None or to_id is None:
         return {"status": "error", "from": from_id, "to": to_id,
@@ -2573,6 +2739,20 @@ def _relate_one(conn, from_id: int, to_id: int, relationship: str = "RELATED_TO"
     if missing:
         return {"status": "not_found", "from": from_id, "to": to_id,
                 "missing": missing}
+
+    # Idempotent: re-asserting an edge must not create a parallel duplicate.
+    # dream already has to defend against those (_dedupe_related exists because
+    # duplicates "silently inflate the relationship count and confuse traversal
+    # queries"), and re-importing an export used to double every edge.
+    try:
+        existing = conn.execute(
+            f"MATCH (a:Memory {{id: $f}})-[r:{rel}]->(b:Memory {{id: $t}}) RETURN COUNT(r);",
+            {"f": from_id, "t": to_id},
+        )
+        if existing.has_next() and (existing.get_next()[0] or 0) > 0:
+            return {"status": "exists", "from": from_id, "to": to_id, "type": rel}
+    except Exception as e:
+        logger.debug(f"Duplicate-edge check failed for {rel} {from_id}->{to_id}: {e}")
 
     try:
         if rel == "RELATED_TO":
@@ -2610,8 +2790,11 @@ def memory_relate(from_id: Optional[int] = None, to_id: Optional[int] = None,
 
     # Batch mode
     if relations is not None:
-        if not relations:
-            return {"status": "error", "message": "relations list is empty."}
+        if not isinstance(relations, list) or not relations:
+            return {"status": "error", "message": "relations must be a non-empty list."}
+        if len(relations) > MAX_BATCH_ITEMS:
+            return {"status": "error",
+                    "message": f"Too many relations ({len(relations)}, limit {MAX_BATCH_ITEMS})."}
         results = []
         for r in relations:
             res = _relate_one(
@@ -2634,29 +2817,175 @@ def memory_relate(from_id: Optional[int] = None, to_id: Optional[int] = None,
     return res
 
 
+def _unrelate_one(conn, from_id: int, to_id: int,
+                  relationship: Optional[str] = None,
+                  both_directions: bool = False) -> dict:
+    """Core single-relationship removal logic.
+
+    relationship=None removes every edge type between the pair, which is what a
+    caller undoing a mistake usually wants (they know the two memories should
+    not be linked, not necessarily which label was written).
+    """
+    if from_id is None or to_id is None:
+        return {"status": "error", "from": from_id, "to": to_id,
+                "message": "from_id and to_id are required."}
+
+    if relationship is None:
+        types = list(EDGE_TYPES)
+    else:
+        rel = str(relationship).upper()
+        if rel not in EDGE_TYPES:
+            return {"status": "error", "from": from_id, "to": to_id,
+                    "message": f"Unknown relationship: {rel}. Use {', '.join(EDGE_TYPES)}."}
+        types = [rel]
+
+    removed: list[str] = []
+    for rel in types:
+        # Count first: LadybugDB's DELETE reports nothing, so without this the
+        # caller cannot tell "removed" from "there was no such edge".
+        pairs = [(from_id, to_id)] + ([(to_id, from_id)] if both_directions else [])
+        for f, t in pairs:
+            try:
+                r = conn.execute(
+                    f"MATCH (a:Memory {{id: $f}})-[r:{rel}]->(b:Memory {{id: $t}}) "
+                    f"RETURN COUNT(r);",
+                    {"f": f, "t": t},
+                )
+                count = r.get_next()[0] if r.has_next() else 0
+                if not count:
+                    continue
+                conn.execute(
+                    f"MATCH (a:Memory {{id: $f}})-[r:{rel}]->(b:Memory {{id: $t}}) DELETE r;",
+                    {"f": f, "t": t},
+                )
+                removed.extend([f"{f}-[{rel}]->{t}"] * count)
+            except Exception as e:
+                return {"status": "error", "from": from_id, "to": to_id,
+                        "message": f"{rel}: {e}"}
+
+    if not removed:
+        return {"status": "not_found", "from": from_id, "to": to_id,
+                "searched": types,
+                "message": "No such edge between these memories."}
+    return {"status": "deleted", "from": from_id, "to": to_id, "removed": removed}
+
+
+@mcp.tool()
+@_timed("memory_unrelate")
+def memory_unrelate(from_id: Optional[int] = None, to_id: Optional[int] = None,
+                    relationship: Optional[str] = None,
+                    both_directions: bool = False,
+                    relations: Optional[list[dict]] = None) -> str:
+    """Remove a relationship between two memories. The inverse of memory_relate.
+
+    Omit `relationship` to remove every edge type between the pair; pass
+    RELATED_TO, SUPERSEDES or EXPLAINS to remove just that one. Edges are
+    directed, so this removes from_id -> to_id; pass both_directions=True to
+    remove the reverse as well.
+    Batch: relations=[{from_id, to_id, relationship?}, ...].
+
+    Use this to undo a wrong edge — a SUPERSEDES pointing the wrong way, or a
+    correction chain wired to the wrong version. It is also the supported way to
+    break a circular SUPERSEDES chain, which memory_dream reports under
+    `contradictions`. The memories themselves are untouched; only the edge goes.
+    """
+    conn = get_conn()
+
+    if relations is not None:
+        if not relations:
+            return {"status": "error", "message": "relations list is empty."}
+        if len(relations) > MAX_BATCH_ITEMS:
+            return {"status": "error",
+                    "message": f"Too many relations ({len(relations)}, limit {MAX_BATCH_ITEMS})."}
+        results = [
+            _unrelate_one(
+                conn,
+                from_id=r.get("from_id"),
+                to_id=r.get("to_id"),
+                relationship=r.get("relationship"),
+                both_directions=bool(r.get("both_directions", False)),
+            )
+            for r in relations
+        ]
+        return {"results": results, "count": len(results)}
+
+    if from_id is None or to_id is None:
+        return {"status": "error",
+                "message": "from_id and to_id are required (or pass relations=[...])."}
+
+    return _unrelate_one(conn, from_id, to_id, relationship, both_directions)
+
+
 # Configurable: bool to allow destructive queries through memory_query.
 # Defaults to FALSE for safety — an MCP server is exposed to LLM agents which can
 # (and have) hallucinated DELETE queries. Operators must explicitly opt in.
 ALLOW_DESTRUCTIVE_QUERIES = os.environ.get("MEMORY_ALLOW_DESTRUCTIVE", "false").lower() == "true"
 
 
-_DESTRUCTIVE_PATTERNS = (
-    "DETACH DELETE",
-    "DELETE ",
-    "DROP ",
-    "TRUNCATE",
-)
+# Query classification for memory_query's safety gate.
+#
+# The previous implementation matched raw substrings against query.upper():
+# ("DETACH DELETE", "DELETE ", "DROP ", "TRUNCATE"). Two holes, both verified:
+#
+#   1. "DELETE " requires a literal trailing SPACE, so any other whitespace
+#      slipped through. With MEMORY_ALLOW_DESTRUCTIVE=false,
+#      "MATCH (m:Memory)\nDETACH\nDELETE\nm;" reported ordinary success and
+#      deleted every memory in the database.
+#   2. Only removal was considered. SET/REMOVE/COPY were never checked, so
+#      read_only=True permitted overwrites:
+#      "MATCH (m:Memory {id: 1}) SET m.content = 'OVERWRITTEN';" succeeded
+#      under read_only=True and replaced the content.
+#
+# Now: strip comments and string literals (so a keyword inside a quoted value
+# or a /* */ comment neither triggers nor hides a match), then match keywords on
+# word boundaries. Underscore-suffixed procedure names (DROP_VECTOR_INDEX) are
+# matched separately because "_" is a word character, so \bDROP\b misses them.
+_CYPHER_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
+_CYPHER_STRING_RE = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"")
+
+# Removes or overwrites data that already exists. Gated by
+# MEMORY_ALLOW_DESTRUCTIVE. SET and REMOVE are included deliberately: an
+# overwrite destroys the previous value just as surely as a DELETE, and an
+# agent hallucinating `SET m.content = ...` is the same class of accident.
+_DESTRUCTIVE_KEYWORDS = ("DELETE", "DETACH", "DROP", "TRUNCATE", "REMOVE", "SET", "COPY")
+# Adds data. Rejected by read_only=True but allowed by default, since a caller
+# reaching for memory_query to CREATE something is not destroying anything.
+_ADDITIVE_KEYWORDS = ("CREATE", "MERGE", "ALTER")
+
+
+def _strip_cypher_noise(query: str) -> str:
+    """Remove comments and string literals so keyword matching sees only code."""
+    q = _CYPHER_COMMENT_RE.sub(" ", query)
+    return _CYPHER_STRING_RE.sub("''", q)
+
+
+def _has_keyword(query: str, keywords: tuple) -> bool:
+    stripped = _strip_cypher_noise(query).upper()
+    for kw in keywords:
+        # \bKW\b for bare keywords, \bKW_ for procedure names like DROP_FTS_INDEX.
+        if re.search(rf"\b{kw}\b|\b{kw}_", stripped):
+            return True
+    return False
 
 
 def _is_destructive(query: str) -> bool:
-    upper = query.upper()
-    return any(p in upper for p in _DESTRUCTIVE_PATTERNS)
+    """True if the query can remove or overwrite existing data."""
+    return _has_keyword(query, _DESTRUCTIVE_KEYWORDS)
+
+
+def _is_write(query: str) -> bool:
+    """True if the query mutates the database at all, additively or otherwise."""
+    return _has_keyword(query, _DESTRUCTIVE_KEYWORDS + _ADDITIVE_KEYWORDS)
 
 
 def _is_unsafe_embedding_set(query: str) -> bool:
-    """Detect SET on m.embedding which fails silently due to HNSW index."""
-    upper = query.upper().replace(" ", "")
-    return "SETM.EMBEDDING" in upper or "SETEMBEDDING" in upper
+    """Detect SET on m.embedding, which fails silently due to the HNSW index.
+
+    Whitespace-insensitive: the old version only stripped spaces, so a tab or
+    newline between SET and the property evaded it.
+    """
+    collapsed = re.sub(r"\s+", "", _strip_cypher_noise(query).upper())
+    return "SETM.EMBEDDING" in collapsed or "SETEMBEDDING" in collapsed
 
 
 @mcp.tool()
@@ -2665,22 +2994,41 @@ def memory_query(cypher_query: str, read_only: bool = False) -> str:
     """Run a Cypher query. Supports traversals, writes, INSTALL/LOAD, CALL (algorithms, scans).
     Call memory_schema() first to get table/column names.
     WARNING: SET on m.embedding fails (vector index). Use memory_update for content changes.
-    read_only=True rejects DELETE/DROP/TRUNCATE.
+
+    read_only=True rejects ANY mutation (CREATE/MERGE/SET/DELETE/DROP/...), not
+    just removals. MEMORY_ALLOW_DESTRUCTIVE (default false) independently blocks
+    anything that removes or overwrites existing data — DELETE, DROP, TRUNCATE,
+    REMOVE, SET, COPY — so use memory_update to change a memory and
+    memory_unrelate to remove an edge.
     """
     conn = get_conn()
 
-    # Caller-requested read-only check (more specific — runs first so the error
-    # message reflects the caller's intent rather than the global flag).
-    if read_only and _is_destructive(cypher_query):
+    if not isinstance(cypher_query, str) or not cypher_query.strip():
+        return {"status": "error", "message": "cypher_query is required."}
+    if len(cypher_query) > MAX_QUERY_CHARS:
         return {
             "status": "error",
-            "message": "Destructive query blocked by read_only=True.",
+            "message": f"Query too long ({len(cypher_query)} chars, limit {MAX_QUERY_CHARS}).",
         }
-    # Server-level kill switch for destructive ops
+
+    # Caller-requested read-only check (more specific — runs first so the error
+    # message reflects the caller's intent rather than the global flag).
+    # This now covers additive writes too: read_only=True used to permit
+    # CREATE/MERGE/SET, which made the parameter's name untrue.
+    if read_only and _is_write(cypher_query):
+        return {
+            "status": "error",
+            "message": "Query blocked by read_only=True: it mutates the database.",
+        }
+    # Server-level kill switch for anything that removes or overwrites data.
     if not ALLOW_DESTRUCTIVE_QUERIES and _is_destructive(cypher_query):
         return {
             "status": "error",
-            "message": "Destructive query blocked by server config (MEMORY_ALLOW_DESTRUCTIVE=false).",
+            "message": "Destructive query blocked by server config "
+                       "(MEMORY_ALLOW_DESTRUCTIVE=false). This covers DELETE, DROP, "
+                       "TRUNCATE, REMOVE, SET and COPY. Use memory_update to change a "
+                       "memory, memory_delete to remove one, and memory_unrelate to "
+                       "remove an edge.",
         }
 
     # Block SET on m.embedding — silent failure due to HNSW vector index
@@ -2784,7 +3132,9 @@ def memory_topics(limit: int = 50, offset: int = 0, min_count: int = 1,
     Filters by current workspace unless global_search=True. min_count filters out rare topics.
     """
     conn = get_conn()
-    limit = max(1, min(limit, 500))
+    limit = _clamp_int(limit, 1, 500, 50)
+    offset = _clamp_int(offset, 0, 1_000_000, 0)
+    min_count = _clamp_int(min_count, 1, 1_000_000, 1)
 
     if global_search:
         result = conn.execute(
@@ -3113,6 +3463,254 @@ def memory_reindex() -> str:
         "index_answering_before": bool(before),
         "index_answering_after": bool(after),
     }
+
+
+EXPORT_FORMAT = "memnest-export"
+EXPORT_FORMAT_VERSION = 1
+
+
+@mcp.tool()
+@_timed("memory_export")
+def memory_export(path: Optional[str] = None, include_embeddings: bool = False,
+                  global_export: bool = False) -> str:
+    """Write all memories AND their edges to a portable JSON file.
+
+    There was no backup path at all, which is uncomfortable for a store that is
+    the single copy of an agent's long-term memory: the database allows one
+    writer, index state has been observed to degrade across library upgrades,
+    and memory_set_workspace strands the old file rather than moving it.
+
+    path defaults to <db directory>/memnest-export-<timestamp>.json.
+    include_embeddings=False keeps the file small; memory_import re-embeds from
+    content when they are absent (slower, but model-version independent).
+    global_export=True includes every workspace, not just the current one.
+    """
+    conn = get_conn()
+
+    if path is None:
+        base = os.path.dirname(DB_PATH) if DB_PATH != ":memory:" else os.getcwd()
+        path = os.path.join(base, f"memnest-export-{int(time.time())}.json")
+    path = os.path.abspath(os.path.expanduser(str(path)))
+
+    where = "" if global_export else "WHERE m.workspace IN ['', $ws]"
+    params = {} if global_export else {"ws": WORKSPACE}
+    cols = ("m.id, m.content, m.category, m.tags, m.importance, m.access_count, "
+            "m.created_at, m.updated_at, m.workspace")
+    if include_embeddings:
+        cols += ", m.embedding"
+
+    try:
+        rows = _collect_results(conn.execute(
+            f"MATCH (m:Memory) {where} RETURN {cols} ORDER BY m.id;", params))
+    except Exception as e:
+        return {"status": "error", "message": f"Export query failed: {e}"}
+
+    memories = []
+    ids = set()
+    for r in rows:
+        ids.add(r[0])
+        item = {
+            "id": r[0], "content": r[1], "category": r[2],
+            "tags": _parse_tags(r[3]), "importance": r[4],
+            "access_count": r[5] or 0, "created_at": r[6], "updated_at": r[7],
+            "workspace": r[8] or "",
+        }
+        if include_embeddings and len(r) > 9 and r[9] is not None:
+            item["embedding"] = list(r[9])
+        memories.append(item)
+
+    # Only edges whose BOTH endpoints are in the export, so an import never
+    # references a memory that was filtered out by the workspace scope.
+    def _edges(query, keys):
+        out = []
+        try:
+            for row in _collect_results(conn.execute(query)):
+                if row[0] in ids and row[1] in ids:
+                    out.append(dict(zip(keys, row)))
+        except Exception as e:
+            logger.debug(f"Edge export failed ({keys}): {e}")
+        return out
+
+    edges = {
+        "related_to": _edges(
+            "MATCH (a:Memory)-[r:RELATED_TO]->(b:Memory) "
+            "RETURN a.id, b.id, r.provenance, r.confidence;",
+            ("from", "to", "provenance", "confidence")),
+        "supersedes": _edges(
+            "MATCH (a:Memory)-[:SUPERSEDES]->(b:Memory) RETURN a.id, b.id;",
+            ("from", "to")),
+        "explains": _edges(
+            "MATCH (a:Memory)-[r:EXPLAINS]->(b:Memory) "
+            "RETURN a.id, b.id, r.rationale_type;",
+            ("from", "to", "rationale_type")),
+    }
+
+    payload = {
+        "format": EXPORT_FORMAT,
+        "format_version": EXPORT_FORMAT_VERSION,
+        "exported_at": time.time(),
+        "server_version": SERVER_VERSION,
+        "workspace": "*" if global_export else WORKSPACE,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_dim": EMBEDDING_DIM,
+        "includes_embeddings": include_embeddings,
+        "memories": memories,
+        "edges": edges,
+    }
+
+    try:
+        from pathlib import Path
+        Path(os.path.dirname(path) or ".").mkdir(parents=True, exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, path)  # atomic: never leaves a partial export
+    except Exception as e:
+        return {"status": "error", "message": f"Could not write {path}: {e}"}
+
+    return {
+        "status": "exported",
+        "path": path,
+        "memories": len(memories),
+        "edges": {k: len(v) for k, v in edges.items()},
+        "includes_embeddings": include_embeddings,
+        "bytes": os.path.getsize(path) if os.path.exists(path) else None,
+    }
+
+
+@mcp.tool()
+@_timed("memory_import")
+def memory_import(path: str, dry_run: bool = False) -> str:
+    """Restore memories and edges from a memory_export file.
+
+    Ids are REMAPPED, not preserved: the file's ids are matched to whatever ids
+    the import produces, so a file can be merged into a database that already
+    has memories without collisions. Edges are rewired to the new ids.
+
+    Imported memories go through normal dedup, so re-importing into the same
+    database recognises existing content instead of duplicating it — which also
+    means an import can be used to merge two memory sets. Embeddings in the file
+    are reused when present; otherwise content is re-embedded.
+
+    dry_run=True validates the file and reports what would happen.
+    """
+    conn = get_conn()
+    path = os.path.abspath(os.path.expanduser(str(path)))
+
+    if not os.path.isfile(path):
+        return {"status": "error", "message": f"No such file: {path}"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        return {"status": "error", "message": f"Could not read {path}: {e}"}
+
+    if not isinstance(payload, dict) or payload.get("format") != EXPORT_FORMAT:
+        return {"status": "error",
+                "message": f"Not a memnest export (expected format={EXPORT_FORMAT!r})."}
+    if payload.get("format_version", 0) > EXPORT_FORMAT_VERSION:
+        return {"status": "error",
+                "message": f"Export format v{payload.get('format_version')} is newer than "
+                           f"this server supports (v{EXPORT_FORMAT_VERSION}). Upgrade memnest."}
+
+    memories = payload.get("memories") or []
+    if not isinstance(memories, list):
+        return {"status": "error", "message": "Malformed export: 'memories' is not a list."}
+
+    file_dim = payload.get("embedding_dim")
+    reuse_embeddings = bool(payload.get("includes_embeddings")) and file_dim == EMBEDDING_DIM
+    dim_mismatch = (
+        payload.get("includes_embeddings") and file_dim not in (None, EMBEDDING_DIM)
+    )
+
+    if dry_run:
+        return {
+            "status": "preview",
+            "path": path,
+            "memories": len(memories),
+            "edges": {k: len(v or []) for k, v in (payload.get("edges") or {}).items()},
+            "would_reuse_embeddings": reuse_embeddings,
+            "embedding_dim_mismatch": dim_mismatch,
+            "note": ("Embeddings in the file have a different dimension and will be "
+                     "recomputed from content." if dim_mismatch else None),
+        }
+
+    id_map: dict = {}
+    imported = 0
+    merged = 0
+    failed = []
+
+    for item in memories:
+        if not isinstance(item, dict):
+            continue
+        content = _truncate_content(item.get("content") or "")[0]
+        if not content.strip():
+            continue
+        try:
+            emb = item.get("embedding") if reuse_embeddings else None
+            if emb is not None and len(emb) != EMBEDDING_DIM:
+                emb = None
+            res = _store_one(
+                conn,
+                content=content,
+                category=item.get("category") or "general",
+                tags=_limit_tags(item.get("tags") or []),
+                importance=item.get("importance"),
+                embedding=emb,
+            )
+            new_id = res.get("id")
+            if new_id is None:
+                failed.append({"id": item.get("id"), "reason": res.get("status")})
+                continue
+            if item.get("id") is not None:
+                id_map[item["id"]] = new_id
+            if res.get("status") == "stored_new":
+                imported += 1
+            else:
+                merged += 1
+        except Exception as e:
+            failed.append({"id": item.get("id"), "reason": str(e)[:120]})
+
+    # Rewire edges onto the new ids.
+    edge_payload = payload.get("edges") or {}
+    edge_counts = {"related_to": 0, "supersedes": 0, "explains": 0}
+    edge_skipped = 0
+    for kind, rel in (("related_to", "RELATED_TO"), ("supersedes", "SUPERSEDES"),
+                      ("explains", "EXPLAINS")):
+        for e in (edge_payload.get(kind) or []):
+            a, b = id_map.get(e.get("from")), id_map.get(e.get("to"))
+            if a is None or b is None or a == b:
+                # a == b happens when dedup merged both endpoints into one
+                # memory; a self-edge would be meaningless.
+                edge_skipped += 1
+                continue
+            res = _relate_one(conn, a, b, relationship=rel,
+                              confidence=e.get("confidence", 1.0),
+                              provenance=e.get("provenance", "EXTRACTED"))
+            if res.get("status") == "created":
+                edge_counts[kind] += 1
+            else:
+                # "exists" lands here too: re-importing the same file is a no-op
+                # for edges rather than doubling them.
+                edge_skipped += 1
+
+    _bump_dream_ops()
+    out = {
+        "status": "imported" if not failed else "partial",
+        "path": path,
+        "stored_new": imported,
+        "merged_into_existing": merged,
+        "edges_created": edge_counts,
+        "edges_skipped": edge_skipped,
+        "reused_embeddings": reuse_embeddings,
+    }
+    if failed:
+        out["failed"] = failed[:20]
+        out["failed_count"] = len(failed)
+    if dim_mismatch:
+        out["note"] = ("Export embeddings had a different dimension; content was "
+                       "re-embedded with the current model.")
+    return out
 
 
 @mcp.tool()
@@ -4155,22 +4753,41 @@ function resetView() {{
 
 
 # ----------------------------------------------------------------------------
-# Compatibility aliases for the pre-0.2.0 tool surface.
+# Single-memory read and non-ranked listing.
 #
-# These wrap the new tools but keep the old names so existing hooks/steering
-# files continue to work. They are thin shims and will be removed in 0.3.0.
+# These began as pre-0.2.0 compatibility aliases and carried a note saying they
+# would be removed in 0.3.0. That note was wrong by the time it mattered: two of
+# them do things no other tool does, and the project is well past 0.3.0.
+#
+#   memory_get   — the only way to read ONE memory in full. Search truncates to
+#                  a preview, and only memory_get returns the edge block.
+#   memory_list  — the only ordered, offset-paged, relevance-free enumeration.
+#                  memory_search ranks; sometimes you want "newest 20".
+#
+# memory_traverse is genuinely redundant: it is memory_query(read_only=True)
+# under another name. It stays only because published hooks and steering files
+# reference it, and it is now marked deprecated in its own docstring rather than
+# by a stale comment here.
 # ----------------------------------------------------------------------------
 
 @mcp.tool()
 @_timed("memory_get")
-def memory_get(memory_id: int) -> str:
-    """Get full untruncated content of a memory by ID, including metadata.
+def memory_get(memory_id: int, include_edges: bool = True) -> str:
+    """Get one memory in full — untruncated content, metadata, and its edges.
 
-    Compatibility alias retained from 0.1.x. Prefer `memory_query` for richer
-    Cypher access; this remains for hooks and steering files that referenced
-    the older name.
+    This is the right tool for "show me memory 42 completely". Search returns
+    truncated previews; this does not.
+
+    include_edges=True (the default) adds an `edges` block listing the memory's
+    RELATED_TO / SUPERSEDES / EXPLAINS links in both directions, plus a
+    `superseded_by` convenience field. Without it, answering "what does this
+    replace?" or "is this still current?" required hand-written Cypher, even
+    though edges are the whole point of storing memory as a graph.
     """
     conn = get_conn()
+    if not isinstance(memory_id, int) or isinstance(memory_id, bool):
+        return {"status": "error", "message": "memory_id must be an integer."}
+
     result = conn.execute(
         """MATCH (m:Memory {id: $id})
            RETURN m.id, m.content, m.category, m.tags, m.importance,
@@ -4188,7 +4805,7 @@ def memory_get(memory_id: int) -> str:
         {"id": memory_id},
     )
 
-    return {
+    out = {
         "status": "found",
         "id": row[0],
         "content": row[1],
@@ -4200,6 +4817,48 @@ def memory_get(memory_id: int) -> str:
         "updated_at": row[7],
         "workspace": row[8] or "",
     }
+
+    if include_edges:
+        try:
+            # _save_memory_relationships already queries all six directions for
+            # the delete+recreate paths; reuse it rather than a seventh copy.
+            saved = _save_memory_relationships(conn, memory_id)
+            edges: dict = {}
+
+            def _ids(rows):
+                return [r[0] for r in rows if r]
+
+            if saved["rels_out"] or saved["rels_in"]:
+                edges["related_to"] = {
+                    "out": [{"id": r[0], "provenance": r[1], "confidence": r[2]}
+                            for r in saved["rels_out"] if r],
+                    "in": [{"id": r[0], "provenance": r[1], "confidence": r[2]}
+                           for r in saved["rels_in"] if r],
+                }
+            if saved["sup_out"] or saved["sup_in"]:
+                edges["supersedes"] = _ids(saved["sup_out"])
+                edges["superseded_by"] = _ids(saved["sup_in"])
+            if saved["exp_out"] or saved["exp_in"]:
+                edges["explains"] = [
+                    {"id": r[0], "rationale_type": (r[1] if len(r) > 1 else None)}
+                    for r in saved["exp_out"] if r
+                ]
+                edges["explained_by"] = [
+                    {"id": r[0], "rationale_type": (r[1] if len(r) > 1 else None)}
+                    for r in saved["exp_in"] if r
+                ]
+
+            out["edges"] = edges
+            # Promoted to the top level because it changes how the memory should
+            # be USED: a superseded memory must not be presented as current.
+            if saved["sup_in"]:
+                out["superseded"] = True
+                out["superseded_by"] = _ids(saved["sup_in"])
+        except Exception as e:
+            logger.debug(f"Edge lookup failed for memory {memory_id}: {e}")
+            out["edges_error"] = str(e)[:200]
+
+    return out
 
 
 @mcp.tool()
@@ -4213,15 +4872,19 @@ def memory_list(
     sort: Literal["recent", "importance", "accessed"] = "recent",
     global_search: bool = False,
 ) -> str:
-    """List memories filtered by recency, category, topic, or importance.
+    """Enumerate memories by recency, category, topic, or importance — no ranking.
 
-    Compatibility alias retained from 0.1.x. For arbitrary queries use
-    `memory_query`. Sort: 'recent' (updated_at DESC), 'importance' (importance
-    DESC then updated_at DESC), or 'accessed' (access_count DESC).
+    Use this when you want an ordered slice rather than an answer: "the 20 newest
+    memories", "everything tagged auth", "all importance-5 decisions". Use
+    memory_search when you have a question. Unlike search, this pages to
+    arbitrary depth via offset.
+
+    Sort: 'recent' (updated_at DESC), 'importance' (importance DESC then
+    updated_at DESC), or 'accessed' (access_count DESC).
     """
     conn = get_conn()
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
+    limit = _clamp_int(limit, 1, 200, MAX_LIST_RESULTS)
+    offset = _clamp_int(offset, 0, 1_000_000, 0)
 
     where = []
     params: dict = {"limit": limit, "offset": offset, "ws": WORKSPACE}
@@ -4229,8 +4892,14 @@ def memory_list(
         where.append("m.category = $cat")
         params["cat"] = category
     if min_importance is not None:
+        # int() on a non-numeric string used to raise a raw ValueError out of
+        # the tool instead of returning the module's error shape.
+        try:
+            params["min_imp"] = int(min_importance)
+        except (TypeError, ValueError):
+            return {"status": "error",
+                    "message": f"min_importance must be an integer 1-5, got {min_importance!r}."}
         where.append("m.importance >= $min_imp")
-        params["min_imp"] = int(min_importance)
     if not global_search:
         where.append("m.workspace IN ['', $ws]")
 
@@ -4284,11 +4953,11 @@ def memory_list(
 @mcp.tool()
 @_timed("memory_traverse")
 def memory_traverse(cypher_query: str) -> str:
-    """Run a READ-ONLY Cypher query (compatibility alias for memory_query).
+    """DEPRECATED — use memory_query(cypher_query=..., read_only=True) instead.
 
-    This shim forwards to memory_query with read_only=True. Destructive
-    operations are always rejected here, regardless of MEMORY_ALLOW_DESTRUCTIVE.
-    For writes, use memory_query directly.
+    Exactly equivalent to that call and kept only so existing hooks and steering
+    files keep working. Any mutation is rejected regardless of
+    MEMORY_ALLOW_DESTRUCTIVE.
     """
     # Call the underlying implementation directly (not the decorated wrapper)
     # so we avoid double-timing and keep a single elapsed_ms for memory_traverse.

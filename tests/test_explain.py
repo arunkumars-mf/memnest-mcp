@@ -73,7 +73,7 @@ def test_explain_meta_describes_the_vector_window():
     _seed()
     out = server.memory_search.__wrapped__(query=QUERY, top_k=3, explain=True)
     meta = out["explain_meta"]
-    assert meta["vector_k"] == 9  # top_k * 3
+    assert meta["candidate_pool"] >= 9
     assert meta["query_embedded"] is True
     assert meta["fusion_mode"] in ("legacy", "normalized")
     assert 0 < meta["vector_hits"] <= meta["candidates_scored"]
