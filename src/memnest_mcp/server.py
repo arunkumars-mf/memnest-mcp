@@ -859,6 +859,61 @@ def _same_subject(tags_a, tags_b) -> bool:
     return (len(sa & sb) / len(union)) >= MERGE_TAG_OVERLAP
 
 
+def _conflict_dismissed(conn: lb.Connection, a: int, b: int) -> Optional[str]:
+    """Whether an agent has already resolved the relationship between a and b.
+
+    Wider than _semantically_linked on purpose. That function governs MERGE
+    protection, where an auto-created RELATED_TO must not count — it is inferred
+    from shared topics and asserts nothing.
+
+    Conflict flagging is a different question. Its hint tells the agent that if
+    both facts hold, it should "link them with memory_relate" — so an
+    agent-asserted RELATED_TO has to silence the flag, or the advice is a dead
+    end: the agent does exactly what it was told and the same warning returns on
+    every subsequent search. Reported by a user who wired the edge and watched
+    the flag persist, with SUPERSEDES the only thing that cleared it — which
+    would have been factually false and would have demoted a true fact.
+
+    provenance distinguishes the two: INFERRED comes from _compute_graph_scores,
+    while EXTRACTED and AMBIGUOUS are written by a caller who looked at the pair.
+    """
+    linked = _semantically_linked(conn, a, b)
+    if linked:
+        return linked
+    try:
+        r = conn.execute(
+            """MATCH (x:Memory)-[e:RELATED_TO]-(y:Memory)
+               WHERE x.id = $a AND y.id = $b AND e.provenance <> 'INFERRED'
+               RETURN COUNT(e);""",
+            {"a": a, "b": b},
+        )
+        if r.has_next() and (r.get_next()[0] or 0) > 0:
+            return "RELATED_TO"
+    except Exception as e:
+        logger.debug(f"Conflict-dismissal check failed for {a}/{b}: {e}")
+    return None
+
+
+# Phrasings that mark a statement as revising something already known. Corrections
+# are the case value_disagreement exists to catch, and they announce themselves:
+# an agent recording one naturally writes "Correction:", "now", "no longer",
+# "changed to", "extended to". Complementary facts about the same subject
+# ("depends on Redis for caching" / "depends on Kafka for event delivery") do not.
+_CORRECTION_MARKER_RE = re.compile(
+    r"\b(correct(?:ion|ed)?|update[ds]?|revis(?:ed|ion)|amend(?:ed|ment)?|"
+    r"supersed(?:es|ed)|replac(?:es|ed|ing)|instead\s+of|rather\s+than|"
+    r"no\s+longer|previously|formerly|used\s+to|was\s+changed|"
+    r"chang(?:ed|es)\s+(?:to|from)|mov(?:ed|es)\s+(?:to|from)|"
+    r"(?:extended|reduced|raised|lowered|increased|decreased|bumped)\s+(?:to|from)|"
+    r"actually|in\s+fact|as\s+of\s+\d|now\s+(?:uses?|is|are|set|configured|runs?))\b",
+    re.I,
+)
+
+
+def _has_correction_marker(*texts: str) -> bool:
+    return any(_CORRECTION_MARKER_RE.search(t or "") for t in texts)
+
+
 def _semantically_linked(conn: lb.Connection, a: int, b: int) -> Optional[str]:
     """Return the edge type if SUPERSEDES or EXPLAINS connects a and b.
 
@@ -1642,6 +1697,16 @@ def _store_one(conn, content: str, category: str, tags: list[str],
                     and conflict_with is None
                     and CONFLICT_VALUE_FLOOR <= similarity < DEDUP_THRESHOLD
                     and _same_subject(tags, _parse_tags(row[3]))
+                    # Mirror the read path's two triggers exactly, or write time
+                    # becomes stricter than read time and the asymmetry this was
+                    # built to remove comes back in the other direction:
+                    #   >= CONFLICT_THRESHOLD  -> near-duplicate, no marker needed
+                    #   below it               -> needs a correction marker,
+                    #      because differing values alone describe complementary
+                    #      facts as often as contradictions ("depends on Redis
+                    #      for caching" / "depends on Kafka for event delivery").
+                    and (similarity >= CONFLICT_THRESHOLD
+                         or _has_correction_marker(content, row[1]))
                     and _values_conflict(content, row[1])
                 ):
                     conflict_with = row[0]
@@ -2413,23 +2478,44 @@ def memory_search(
                     #    thoroughly an agent rewords a correction, the less
                     #    likely cosine was to notice.
                     near_duplicate = sim >= CONFLICT_THRESHOLD
+                    # Below the near-duplicate threshold, differing values are
+                    # NOT enough on their own. "X depends on Redis for caching"
+                    # and "X depends on Kafka for event delivery" disagree on a
+                    # value token while both being true — and that shape (same
+                    # entity, same predicate, different object) is the norm in a
+                    # dependency or architecture graph, so flagging it buried
+                    # the signal in noise. Measured false positives on organic
+                    # corpus pairs at 0.73-0.82, including two memories about
+                    # DIFFERENT subjects (a search feature and a checkout flow)
+                    # that shared only their tags.
+                    #
+                    # A correction announces itself. Requiring that marker keeps
+                    # the case this was built for — a correction rewritten from
+                    # scratch, too differently worded for similarity to catch —
+                    # while dropping complementary facts, which never carry one.
                     value_disagreement = (
                         sim >= CONFLICT_VALUE_FLOOR
+                        and _has_correction_marker(contents_by_id.get(a, ""),
+                                                   contents_by_id.get(b, ""))
                         and _values_conflict(contents_by_id.get(a, ""),
                                              contents_by_id.get(b, ""))
                     )
                     if not (near_duplicate or value_disagreement):
                         continue
 
-                    if _semantically_linked(conn, a, b):
-                        continue  # already resolved by an edge
+                    # Any agent-asserted edge dismisses the flag, RELATED_TO
+                    # included — that is what the hint tells the agent to write.
+                    if _conflict_dismissed(conn, a, b):
+                        continue
 
                     if near_duplicate:
                         reason = "near_duplicate"
-                        hint = ("Near-identical memories with no SUPERSEDES edge. If one "
-                                "replaces the other, re-store the current version with "
-                                "memory_store(..., supersedes=<old_id>); if both are true, "
-                                "link them with memory_relate.")
+                        hint = (f"Near-identical memories with no edge marking which is "
+                                f"current. If one replaces the other, re-store the current "
+                                f"version with memory_store(..., supersedes=<old_id>). If both "
+                                f"are true, call memory_relate(from_id={a}, to_id={b}, "
+                                f"relationship='RELATED_TO') — that dismisses this flag "
+                                f"permanently.")
                     else:
                         _v = _name_vocab(contents_by_id.get(a, ""), contents_by_id.get(b, ""))
                         differing = sorted(
@@ -2437,12 +2523,13 @@ def memory_search(
                             ^ _discriminating_tokens(contents_by_id.get(b, ""), _v)
                         )[:6]
                         reason = "value_disagreement"
-                        hint = (f"Same subject but disagreeing values {differing} — these are "
-                                f"not phrased alike, so nothing else would flag them. Do NOT "
-                                f"present one as current without checking: if one replaces the "
-                                f"other, re-store it with memory_store(..., supersedes=<old_id>); "
-                                f"if both hold in different scopes, say so in the content and "
-                                f"link them with memory_relate.")
+                        hint = (f"One of these reads like a correction of the other, and they "
+                                f"disagree on {differing}. They are not phrased alike, so "
+                                f"nothing else would flag them. If one replaces the other, "
+                                f"re-store it with memory_store(..., supersedes=<old_id>). If "
+                                f"both are true, call memory_relate(from_id={a}, to_id={b}, "
+                                f"relationship='RELATED_TO') — that dismisses this flag "
+                                f"permanently.")
 
                     conflicts.append({
                         "ids": [a, b],

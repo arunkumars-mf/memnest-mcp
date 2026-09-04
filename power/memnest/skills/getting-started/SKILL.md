@@ -103,21 +103,26 @@ disagree with no edge marking which is current — typically a fact learned in o
 session and a conflicting one learned later. Each entry carries a `reason`:
 
 - `near_duplicate` — they read almost identically (high similarity)
-- `value_disagreement` — same subject, different value (`30 days` vs `a full
-  year`, `Kafka` vs `Kinesis`). These are worded *differently*, so similarity
-  alone would never surface them, and the stale one often ranks higher because
-  the query's wording matches it better. Do not present the top hit as current
-  without checking this list.
+- `value_disagreement` — one reads like a *correction* of the other and they
+  disagree on a value (`30 days` vs `a full year`). Worded differently enough
+  that similarity alone would never surface them, and the stale one often ranks
+  higher because the query's wording matches it better.
 
 Resolve it rather than picking one silently:
 - If one replaces the other → re-store the current version with
   `memory_store(..., supersedes=<old_id>)`
-- If both are true (different scopes, environments, time periods) → make that
-  explicit in the content and link them with `memory_relate`
+- If both are true (different scopes, environments, time periods) →
+  `memory_relate(from_id=<a>, to_id=<b>, relationship="RELATED_TO")`. **That
+  dismisses the flag permanently** — it is the recorded answer to "I looked, and
+  both hold", so the pair is never reported again. Do not use `SUPERSEDES` for
+  this: it would demote a true fact out of results.
 - If you cannot tell → ask the user; do not guess which is current
 
-This is flagged as *potential* because the server does no LLM inference: it
-knows the two look alike and are unresolved, not which one is right.
+This is flagged as *potential* because the server does no LLM inference: it knows
+the two look alike and are unresolved, not which one is right. Complementary
+facts about the same subject ("depends on Redis for caching" / "depends on Kafka
+for event delivery") are deliberately not flagged, so a flag you see is worth
+spending a moment on.
 
 ### Step 3: Store new information
 

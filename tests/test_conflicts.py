@@ -574,3 +574,149 @@ def test_unrelated_memories_sharing_tags_are_not_flagged():
     out = server.memory_search.__wrapped__(query="Izar service history", top_k=3)
     for c in out.get("potential_conflicts", []):
         assert c["similarity"] >= server.CONFLICT_VALUE_FLOOR
+
+
+# ---------------------------------------------------------------------------
+# value_disagreement false-positived on complementary facts, with no way out.
+#
+# Reported against 0.19.0, two cases organic rather than constructed:
+#
+#   "Rigel depends on Redis for caching" / "... Kafka for event delivery"   0.7966
+#   "Vela exposes 8080 for HTTP" / "... 9090 for metrics"                   0.7804
+#   "Helios checkout depends on payments-core" / "... inventory-cache"      0.8235
+#   "Helios SEARCH depends on query-index" / "Helios CHECKOUT depends on
+#    payments-core"                                                        0.7297
+#
+# All four are true simultaneously. The last is worse than a false positive on
+# the value: the two memories are about different subjects and coincide only on
+# tags, which is tag-Jaccard being too coarse a subject proxy for one-to-many
+# relations. "X depends on A" / "X depends on B" is complementary by nature, and
+# that shape is the norm in a dependency or architecture graph — the primary
+# AI-memory shape — so the flag was firing on most same-entity pairs.
+#
+# And there was no exit. The hint said "if both hold, link them with
+# memory_relate"; doing exactly that left the flag firing on every subsequent
+# search, because only SUPERSEDES cleared it — which would have been factually
+# false and would have demoted a true fact out of results.
+#
+# Fix: below the near-duplicate threshold, require a CORRECTION MARKER. A
+# correction announces itself ("Correction:", "now uses", "extended to", "no
+# longer"); complementary facts never do. And any agent-asserted edge dismisses
+# the flag, RELATED_TO included.
+# ---------------------------------------------------------------------------
+
+COMPLEMENTARY = [
+    ("Rigel Redis/Kafka",
+     "The Rigel service depends on Redis for caching.",
+     "The Rigel service depends on Kafka for event delivery.",
+     ["rigel", "dependency"], "what does Rigel depend on"),
+    ("Vela ports",
+     "The Vela service exposes port 8080 for HTTP traffic.",
+     "The Vela service exposes port 9090 for metrics.",
+     ["vela", "ports"], "what ports does Vela expose"),
+    ("Helios two deps",
+     "Helios checkout depends on payments-core for authorisation.",
+     "Helios checkout depends on inventory-cache for stock lookups.",
+     ["helios", "dependency"], "what does Helios checkout depend on"),
+    ("different subjects, shared tags",
+     "The Helios search feature depends on the query-index service.",
+     "Helios checkout depends on the payments-core service.",
+     ["helios", "dependency"], "Helios dependencies"),
+]
+
+
+def _flag_for(a_id, b_id, query):
+    out = server.memory_search.__wrapped__(query=query, top_k=4)
+    for c in out.get("potential_conflicts", []):
+        if set(c["ids"]) == {a_id, b_id}:
+            return c
+    return None
+
+
+@pytest.mark.parametrize("label,text_a,text_b,tags,query", COMPLEMENTARY,
+                         ids=[c[0] for c in COMPLEMENTARY])
+def test_complementary_facts_are_not_flagged(label, text_a, text_b, tags, query):
+    a = server.memory_store.__wrapped__(content=text_a, tags=tags)
+    b = server.memory_store.__wrapped__(content=text_b, tags=tags)
+    assert _flag_for(a["id"], b["id"], query) is None, \
+        f"{label}: both facts are true; flagging them makes a compliant agent hedge"
+
+
+def test_complementary_facts_do_not_warn_at_write_time_either():
+    server.memory_store.__wrapped__(content="The Rigel service depends on Redis for caching.",
+                                    tags=["rigel", "dependency"])
+    r = server.memory_store.__wrapped__(
+        content="The Rigel service depends on Kafka for event delivery.",
+        tags=["rigel", "dependency"])
+    assert "potential_conflict_with" not in r
+
+
+CORRECTIONS = [
+    ("explicit Correction: prefix", IZAR_OLD, IZAR_NEW, IZAR_TAGS, IZAR_QUERY),
+    ("'now uses' phrasing",
+     "Zephyr rounds currency with HALF_UP.",
+     "Zephyr now uses HALF_EVEN for currency rounding.",
+     ["zephyr", "rounding"], "how does Zephyr round currency"),
+    ("'no longer' phrasing",
+     "The Mizar service writes audit events to S3.",
+     "Mizar no longer writes audit events to S3; they go to CloudWatch.",
+     ["mizar", "audit"], "where does Mizar write audit events"),
+]
+
+
+@pytest.mark.parametrize("label,text_a,text_b,tags,query", CORRECTIONS,
+                         ids=[c[0] for c in CORRECTIONS])
+def test_corrections_are_still_flagged(label, text_a, text_b, tags, query):
+    """The middle gap must stay closed: these are the cases nothing else catches."""
+    a = server.memory_store.__wrapped__(content=text_a, tags=tags)
+    b = server.memory_store.__wrapped__(content=text_b, tags=tags)
+    assert _flag_for(a["id"], b["id"], query) is not None, f"{label} was missed"
+
+
+def test_related_to_dismisses_the_flag_permanently():
+    """The documented remedy has to actually work, or the hint is a dead end."""
+    a = server.memory_store.__wrapped__(content=IZAR_OLD, tags=IZAR_TAGS)
+    b = server.memory_store.__wrapped__(content=IZAR_NEW, tags=IZAR_TAGS)
+    assert _flag_for(a["id"], b["id"], IZAR_QUERY) is not None
+
+    rel = server.memory_relate.__wrapped__(from_id=b["id"], to_id=a["id"],
+                                           relationship="RELATED_TO")
+    assert rel["status"] == "created"
+
+    assert _flag_for(a["id"], b["id"], IZAR_QUERY) is None
+    # And it stays dismissed on later searches.
+    assert _flag_for(a["id"], b["id"], IZAR_QUERY) is None
+    # Both facts still rank — RELATED_TO must not demote anything.
+    ids = {r["id"] for r in
+           server.memory_search.__wrapped__(query=IZAR_QUERY, top_k=4)["results"]}
+    assert {a["id"], b["id"]} <= ids
+
+
+def test_inferred_related_to_does_not_dismiss():
+    """_compute_graph_scores auto-creates RELATED_TO from shared topics, so an
+    INFERRED edge asserts nothing and must not silence a real conflict."""
+    a = server.memory_store.__wrapped__(content=IZAR_OLD, tags=IZAR_TAGS)
+    b = server.memory_store.__wrapped__(content=IZAR_NEW, tags=IZAR_TAGS)
+    server.memory_relate.__wrapped__(from_id=b["id"], to_id=a["id"],
+                                     relationship="RELATED_TO", provenance="INFERRED")
+    assert _flag_for(a["id"], b["id"], IZAR_QUERY) is not None
+
+
+def test_hint_names_related_to_as_the_dismissal():
+    a = server.memory_store.__wrapped__(content=IZAR_OLD, tags=IZAR_TAGS)
+    b = server.memory_store.__wrapped__(content=IZAR_NEW, tags=IZAR_TAGS)
+    hint = _flag_for(a["id"], b["id"], IZAR_QUERY)["hint"]
+    assert "RELATED_TO" in hint
+    assert "supersedes" in hint.lower()
+
+
+def test_correction_marker_helper():
+    assert server._has_correction_marker("Correction: the TTL is now 300s") is True
+    assert server._has_correction_marker("Zephyr now uses HALF_EVEN") is True
+    assert server._has_correction_marker("retention was extended to a year") is True
+    assert server._has_correction_marker("Mizar no longer writes to S3") is True
+    assert server._has_correction_marker("This supersedes the earlier value") is True
+    # Complementary phrasings carry no marker.
+    assert server._has_correction_marker("Rigel depends on Redis for caching") is False
+    assert server._has_correction_marker("Vela exposes port 8080 for HTTP") is False
+    assert server._has_correction_marker("Helios checkout depends on payments-core") is False
