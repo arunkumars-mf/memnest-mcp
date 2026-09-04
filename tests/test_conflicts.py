@@ -492,12 +492,15 @@ def test_reworded_contradiction_is_flagged_despite_low_similarity():
         "this pair is below the near-duplicate threshold — that is the point"
 
 
-def test_value_disagreement_hint_names_the_differing_tokens():
+def test_value_disagreement_hint_says_what_differs():
+    """A pair that does not read alike gives the agent no other clue what the
+    conflict is about, so the hint has to name it — either the differing tokens
+    or, when comparable quantities fired, the dimension they share."""
     server.memory_store.__wrapped__(content=IZAR_OLD, tags=IZAR_TAGS)
     server.memory_store.__wrapped__(content=IZAR_NEW, tags=IZAR_TAGS)
     out = server.memory_search.__wrapped__(query=IZAR_QUERY, top_k=3)
     hint = out["potential_conflicts"][0]["hint"]
-    assert "30" in hint, "the hint should show what actually differs"
+    assert ("30" in hint) or ("duration" in hint), hint
     assert "supersedes" in hint.lower()
 
 
@@ -720,3 +723,147 @@ def test_correction_marker_helper():
     assert server._has_correction_marker("Rigel depends on Redis for caching") is False
     assert server._has_correction_marker("Vela exposes port 8080 for HTTP") is False
     assert server._has_correction_marker("Helios checkout depends on payments-core") is False
+
+
+# ---------------------------------------------------------------------------
+# The correction marker is anti-correlated with need, so it cannot be the only
+# sub-threshold trigger.
+#
+# A marker means the agent KNOWS it is correcting something — and an agent that
+# knows would pass supersedes= and never need the detector at all. Detection
+# earns its keep in the opposite case: a fact learned in a fresh session and
+# written down plainly, with no marker, because from the agent's point of view
+# nothing is being corrected. Measured on 0.19.1:
+#
+#   "The Mira service retains audit logs for 30 days."      #1  0.7695  STALE
+#   "Audit logs on the Mira service are kept for one year."  #2  0.7024  CURRENT
+#   potential_conflicts: none      <- stale value served as the answer
+#
+# Second trigger: the two texts state COMPARABLE QUANTITIES — the same dimension
+# or literally the same unit noun — with differing magnitudes. Word order does
+# the identifier filtering, and for a real reason: English writes measurements as
+# "<number> <unit>" and identifiers as "<label> <number>", so requiring a unit
+# after the number skips ports and versions without enumerating them.
+# ---------------------------------------------------------------------------
+
+MIRA_OLD = "The Mira service retains audit logs for 30 days."
+MIRA_NEW = "Audit logs on the Mira service are kept for one year."
+MIRA_TAGS = ["mira", "retention"]
+MIRA_QUERY = "how long does the Mira service retain audit logs"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("The Mira service retains audit logs for 30 days.", {"duration": {2592000.0}}),
+    ("Audit logs on the Mira service are kept for one year.", {"duration": {31536000.0}}),
+    ("The Alkaid queue depth limit is 500 messages.", {"unit:message": {500.0}}),
+    # "<label> <number>" is an identifier: no unit follows the digits.
+    ("The Vela service exposes port 8080 for HTTP traffic.", {}),
+    ("Checkout is written in Java 17.", {}),
+    # A digit run glued to a letter prefix is an identifier, not a measurement.
+    ("The service runs v2 of the protocol.", {}),
+    # ...but a real measurement in the same sentence still registers.
+    ("Helios checkout p99 latency is 850ms at peak load.", {"duration": {0.85}}),
+])
+def test_quantity_extraction(text, expected):
+    assert server._extract_quantities(text) == expected
+
+
+@pytest.mark.parametrize("label,a,b,expected", [
+    ("cross-unit durations", MIRA_OLD, MIRA_NEW, True),
+    ("same unit noun",
+     "The Alkaid queue depth limit is 500 messages.",
+     "The Alkaid queue depth limit is 800 messages.", True),
+    ("port identifiers are not magnitudes",
+     "The Vela service exposes port 8080 for HTTP traffic.",
+     "The Vela service exposes port 9090 for metrics.", False),
+    ("version identifiers are not magnitudes",
+     "Checkout is written in Java 17.", "Checkout is written in Java 21.", False),
+    ("different unit nouns are not comparable",
+     "The service handles 500 messages per batch.",
+     "The service handles 800 requests per batch.", False),
+    ("no quantities at all",
+     "Rigel depends on Redis for caching.",
+     "Rigel depends on Kafka for event delivery.", False),
+    ("the same duration written two ways does not disagree",
+     "The TTL is 300 seconds.", "The TTL is 5 minutes.", False),
+    ("a quantity the other never states is elaboration",
+     "Retry policy is 5 attempts.",
+     "Retry policy is 5 attempts with a 10 second cap.", False),
+])
+def test_quantities_disagree(label, a, b, expected):
+    assert server._quantities_disagree(a, b) is expected, label
+
+
+def test_markerless_quantitative_contradiction_is_flagged():
+    """The reported limit case: same subject, contradictory durations, no marker."""
+    a = server.memory_store.__wrapped__(content=MIRA_OLD, tags=MIRA_TAGS)
+    b = server.memory_store.__wrapped__(content=MIRA_NEW, tags=MIRA_TAGS)
+    assert not server._has_correction_marker(MIRA_OLD, MIRA_NEW), \
+        "fixture must contain no correction marker, or it tests the wrong trigger"
+
+    hit = _flag_for(a["id"], b["id"], MIRA_QUERY)
+    assert hit is not None, "a stale value was served as the answer with no flag"
+    assert hit["reason"] == "value_disagreement"
+    assert "duration" in hit["hint"], "the hint should name the dimension that differs"
+
+
+def test_markerless_contradiction_warns_at_write_time_too():
+    server.memory_store.__wrapped__(content=MIRA_OLD, tags=MIRA_TAGS)
+    b = server.memory_store.__wrapped__(content=MIRA_NEW, tags=MIRA_TAGS)
+    assert b["potential_conflict_with"] is not None
+
+
+def test_quantity_flag_is_dismissible_like_any_other():
+    a = server.memory_store.__wrapped__(content=MIRA_OLD, tags=MIRA_TAGS)
+    b = server.memory_store.__wrapped__(content=MIRA_NEW, tags=MIRA_TAGS)
+    assert _flag_for(a["id"], b["id"], MIRA_QUERY) is not None
+    server.memory_relate.__wrapped__(from_id=b["id"], to_id=a["id"],
+                                     relationship="RELATED_TO")
+    assert _flag_for(a["id"], b["id"], MIRA_QUERY) is None
+
+
+def test_quantity_trigger_does_not_resurrect_the_reported_false_positives():
+    """The four organic false positives must stay silent under BOTH triggers."""
+    for text_a, text_b, tags, query in [
+        ("The Rigel service depends on Redis for caching.",
+         "The Rigel service depends on Kafka for event delivery.",
+         ["rigel", "dependency"], "what does Rigel depend on"),
+        ("The Vela service exposes port 8080 for HTTP traffic.",
+         "The Vela service exposes port 9090 for metrics.",
+         ["vela", "ports"], "what ports does Vela expose"),
+    ]:
+        server._conn = None
+        server._db = None
+        a = server.memory_store.__wrapped__(content=text_a, tags=tags)
+        b = server.memory_store.__wrapped__(content=text_b, tags=tags)
+        assert _flag_for(a["id"], b["id"], query) is None, text_a
+
+
+def test_known_limitation_qualified_measurements_of_the_same_dimension():
+    """DOCUMENTED FALSE POSITIVE, accepted deliberately.
+
+    "connect timeout is 500ms" and "read timeout is 2000ms" are both true, and
+    the quantity trigger flags them. Bag-of-words cannot separate this from the
+    Mira case (synonymous predicates, contradictory values) because the only
+    difference is one content word — "connect"/"read" vs "retains"/"kept" — and
+    telling a differentiating QUALIFIER from a SYNONYM needs semantics.
+
+    Similarity does not separate them either: this pair measures 0.8466 and Mira
+    0.8318, so any threshold that silenced one would silence the other.
+
+    Accepted because the errors are not symmetric. A false positive costs one
+    memory_relate call and is then dismissed permanently; a false negative
+    serves a stale value as the answer with no signal at all. If this test starts
+    failing because the pair is no longer flagged, that is an improvement —
+    check the Mira case above still passes.
+    """
+    a = server.memory_store.__wrapped__(
+        content="Vega connect timeout is 500 milliseconds.", tags=["vega", "timeout"])
+    b = server.memory_store.__wrapped__(
+        content="Vega read timeout is 2000 milliseconds.", tags=["vega", "timeout"])
+    hit = _flag_for(a["id"], b["id"], "what are the Vega timeouts")
+    assert hit is not None, "behaviour changed — see the docstring"
+    # The remedy has to work, which is what makes the limitation tolerable.
+    server.memory_relate.__wrapped__(from_id=a["id"], to_id=b["id"],
+                                     relationship="RELATED_TO")
+    assert _flag_for(a["id"], b["id"], "what are the Vega timeouts") is None

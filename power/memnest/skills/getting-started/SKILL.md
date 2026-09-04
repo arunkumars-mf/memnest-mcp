@@ -103,10 +103,12 @@ disagree with no edge marking which is current — typically a fact learned in o
 session and a conflicting one learned later. Each entry carries a `reason`:
 
 - `near_duplicate` — they read almost identically (high similarity)
-- `value_disagreement` — one reads like a *correction* of the other and they
-  disagree on a value (`30 days` vs `a full year`). Worded differently enough
-  that similarity alone would never surface them, and the stale one often ranks
-  higher because the query's wording matches it better.
+- `value_disagreement` — they are about the same subject and either one reads
+  like a correction of the other, or both state a comparable quantity with
+  different magnitudes (`30 days` vs `one year`). Worded differently enough that
+  similarity alone would never surface them, and the stale one often ranks higher
+  because the query's wording matches it better — so check this list before
+  presenting the top hit as current.
 
 Resolve it rather than picking one silently:
 - If one replaces the other → re-store the current version with
@@ -119,10 +121,17 @@ Resolve it rather than picking one silently:
 - If you cannot tell → ask the user; do not guess which is current
 
 This is flagged as *potential* because the server does no LLM inference: it knows
-the two look alike and are unresolved, not which one is right. Complementary
-facts about the same subject ("depends on Redis for caching" / "depends on Kafka
-for event delivery") are deliberately not flagged, so a flag you see is worth
-spending a moment on.
+the two are about the same subject and disagree on something, not which one is
+right. Complementary facts that differ in kind rather than magnitude ("depends on
+Redis for caching" / "depends on Kafka for event delivery", "port 8080 for HTTP" /
+"port 9090 for metrics") are deliberately not flagged.
+
+Two measurements of the *same* dimension under different qualifiers ("connect
+timeout 500ms" / "read timeout 2000ms") will flag even though both are true —
+telling a qualifier from a synonym needs semantics the server does not have. One
+`memory_relate(..., relationship="RELATED_TO")` dismisses it for good, which is
+why the detector errs toward flagging: a dismissal costs one call, a miss serves
+a stale value as the answer.
 
 ### Step 3: Store new information
 

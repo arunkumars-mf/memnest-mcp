@@ -914,6 +914,155 @@ def _has_correction_marker(*texts: str) -> bool:
     return any(_CORRECTION_MARKER_RE.search(t or "") for t in texts)
 
 
+# --- Comparable quantities -------------------------------------------------
+#
+# The correction marker above is anti-correlated with need, which is the whole
+# problem with relying on it alone: a marker means the agent KNOWS it is
+# correcting something, and an agent that knows would pass supersedes= and never
+# need the detector. Detection earns its keep in the opposite case — a fact
+# learned in a fresh session and written down plainly, with no marker, because
+# from the agent's point of view nothing is being corrected. Measured:
+#
+#   "The Mira service retains audit logs for 30 days."      #1  0.7695  STALE
+#   "Audit logs on the Mira service are kept for one year."  #2  0.7024  CURRENT
+#   potential_conflicts: none
+#
+# So a second, marker-free trigger: the two texts state QUANTITIES that are
+# directly comparable — the same dimension, or literally the same unit noun —
+# and the magnitudes differ.
+#
+# Word order does the work of excluding identifiers, and it does it for a real
+# reason rather than a lucky one: English writes measurements as
+# "<number> <unit>" ("30 days", "500 messages") and identifiers as
+# "<label> <number>" ("port 8080", "version 3", "Java 17"). Requiring a unit
+# AFTER the number therefore skips port numbers and version numbers without
+# needing a list of them — which is what keeps "exposes port 8080 for HTTP" and
+# "exposes port 9090 for metrics" out of the detector.
+_WORD_NUMBERS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "half": 0.5,
+}
+
+# Units that can be compared ACROSS wording, normalised to a base unit. Only
+# unambiguous spellings: bare "m" and "s" are skipped because they collide with
+# metres/seconds and with each other in practice.
+_DIMENSIONAL_UNITS = {
+    "duration": {
+        "ms": 0.001, "millisecond": 0.001, "milliseconds": 0.001, "msec": 0.001,
+        "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+        "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+        "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+        "day": 86400, "days": 86400,
+        "week": 604800, "weeks": 604800,
+        "month": 2592000, "months": 2592000,
+        "quarter": 7776000, "quarters": 7776000,
+        "year": 31536000, "years": 31536000,
+    },
+    "size": {
+        "byte": 1, "bytes": 1,
+        "kb": 1e3, "kib": 1024, "kilobyte": 1e3, "kilobytes": 1e3,
+        "mb": 1e6, "mib": 1024 ** 2, "megabyte": 1e6, "megabytes": 1e6,
+        "gb": 1e9, "gib": 1024 ** 3, "gigabyte": 1e9, "gigabytes": 1e9,
+        "tb": 1e12, "tib": 1024 ** 4, "terabyte": 1e12, "terabytes": 1e12,
+    },
+}
+_UNIT_TO_FAMILY = {
+    unit: (family, factor)
+    for family, units in _DIMENSIONAL_UNITS.items()
+    for unit, factor in units.items()
+}
+
+# Words that can never BE the unit, only sit between a number and its unit
+# ("8080 for HTTP", "a full year"). Without this filter "8080 for" parsed as
+# 8080 of unit "for", which made two port numbers look like comparable
+# magnitudes — the Vela false positive.
+_UNIT_STOPWORDS = frozenset({
+    "for", "of", "in", "on", "at", "to", "and", "or", "the", "a", "an", "with",
+    "per", "from", "by", "as", "is", "are", "was", "were", "be", "been", "that",
+    "this", "than", "then", "over", "under", "up", "down", "out", "into", "via",
+    "full", "total", "about", "around", "approximately", "roughly", "only",
+    "just", "more", "less", "least", "most", "max", "maximum", "min", "minimum",
+    "peak", "average", "avg", "each", "every", "all", "any", "some", "no",
+})
+_TOKEN_RE = re.compile(r"[A-Za-z]+|\d+(?:[.,]\d+)?")
+
+
+def _quantity_family(unit: str) -> str:
+    """Family key for a unit word. Unknown units become their own family keyed
+    on the singular form, so "500 messages" and "800 messages" compare while
+    "500 messages" and "800 requests" do not."""
+    u = unit.lower()
+    if u in _UNIT_TO_FAMILY:
+        return _UNIT_TO_FAMILY[u][0]
+    return "unit:" + (u[:-1] if len(u) > 3 and u.endswith("s") else u)
+
+
+def _extract_quantities(text: str) -> dict:
+    """Map family -> set of normalised magnitudes found in the text.
+
+    Walks tokens rather than pattern-matching a fixed gap, because the unit can
+    sit one or two words after the number ("a full year", "800 queued messages")
+    and the words in between must not be mistaken for it. Within a 3-token
+    lookahead a KNOWN dimensional unit wins over a nearer unknown word, so
+    "a full year" reads as a duration rather than a quantity of "full".
+    """
+    raw = text or ""
+    spans = list(_TOKEN_RE.finditer(raw))
+    tokens = [m.group(0) for m in spans]
+    out: dict = {}
+    for i, tok in enumerate(tokens):
+        low = tok.lower()
+        if low in _WORD_NUMBERS:
+            value = float(_WORD_NUMBERS[low])
+        elif tok[0].isdigit():
+            # A digit run glued to a letter prefix is an identifier, not a
+            # measurement: p99, v2, s3, h2. Without this check "p99 latency"
+            # yielded 99 of unit "latency", so p99 and p50 latency figures —
+            # complementary by definition — looked like disagreeing magnitudes.
+            start = spans[i].start()
+            if start > 0 and raw[start - 1].isalpha():
+                continue
+            try:
+                value = float(tok.replace(",", ""))
+            except ValueError:
+                continue
+        else:
+            continue
+
+        window = [t.lower() for t in tokens[i + 1:i + 4] if not t[0].isdigit()]
+        # A KNOWN dimensional unit counts from up to three words away, so
+        # "a full year" and "30 to 60 seconds" still read as durations.
+        unit = next((w for w in window if w in _UNIT_TO_FAMILY), None)
+        if unit is None:
+            # An UNKNOWN unit must be the very next word. Scanning further let
+            # "port 8080 for HTTP" attach 8080 to "http", which then collided
+            # with another port sharing the same trailing word — the number is
+            # labelled by what precedes it, so nothing after the preposition is
+            # its unit.
+            unit = window[0] if window and window[0] not in _UNIT_STOPWORDS else None
+        if unit is None:
+            continue
+
+        family = _quantity_family(unit)
+        factor = _UNIT_TO_FAMILY.get(unit, (None, 1.0))[1]
+        out.setdefault(family, set()).add(round(value * factor, 6))
+    return out
+
+
+def _quantities_disagree(a: str, b: str) -> bool:
+    """True when both texts state a comparable quantity and the values differ.
+
+    Requires the family to appear in BOTH texts: a fact that adds a quantity the
+    other never mentions is elaboration, not disagreement.
+    """
+    qa, qb = _extract_quantities(a), _extract_quantities(b)
+    for family in set(qa) & set(qb):
+        if qa[family] != qb[family]:
+            return True
+    return False
+
+
 def _semantically_linked(conn: lb.Connection, a: int, b: int) -> Optional[str]:
     """Return the edge type if SUPERSEDES or EXPLAINS connects a and b.
 
@@ -1705,9 +1854,13 @@ def _store_one(conn, content: str, category: str, tags: list[str],
                     #      because differing values alone describe complementary
                     #      facts as often as contradictions ("depends on Redis
                     #      for caching" / "depends on Kafka for event delivery").
-                    and (similarity >= CONFLICT_THRESHOLD
-                         or _has_correction_marker(content, row[1]))
-                    and _values_conflict(content, row[1])
+                    and (
+                        (similarity >= CONFLICT_THRESHOLD
+                         and _values_conflict(content, row[1]))
+                        or (_has_correction_marker(content, row[1])
+                            and _values_conflict(content, row[1]))
+                        or _quantities_disagree(content, row[1])
+                    )
                 ):
                     conflict_with = row[0]
                     conflict_sim = similarity
@@ -2489,16 +2642,27 @@ def memory_search(
                     # DIFFERENT subjects (a search feature and a checkout flow)
                     # that shared only their tags.
                     #
-                    # A correction announces itself. Requiring that marker keeps
-                    # the case this was built for — a correction rewritten from
-                    # scratch, too differently worded for similarity to catch —
-                    # while dropping complementary facts, which never carry one.
+                    # Two independent marker-free-or-not signals, either of
+                    # which is enough:
+                    #
+                    #  a correction marker  — catches NON-quantitative
+                    #     corrections ("now uses HALF_EVEN"), where there is no
+                    #     magnitude to compare.
+                    #  comparable quantities — catches corrections that carry NO
+                    #     marker, which is the case that matters most: an agent
+                    #     that knows it is correcting would pass supersedes= and
+                    #     never need this. "retains audit logs for 30 days" vs
+                    #     "are kept for one year" states the same dimension with
+                    #     different magnitudes and announces nothing.
+                    text_a = contents_by_id.get(a, "")
+                    text_b = contents_by_id.get(b, "")
                     value_disagreement = (
                         sim >= CONFLICT_VALUE_FLOOR
-                        and _has_correction_marker(contents_by_id.get(a, ""),
-                                                   contents_by_id.get(b, ""))
-                        and _values_conflict(contents_by_id.get(a, ""),
-                                             contents_by_id.get(b, ""))
+                        and (
+                            (_has_correction_marker(text_a, text_b)
+                             and _values_conflict(text_a, text_b))
+                            or _quantities_disagree(text_a, text_b)
+                        )
                     )
                     if not (near_duplicate or value_disagreement):
                         continue
@@ -2517,17 +2681,28 @@ def memory_search(
                                 f"relationship='RELATED_TO') — that dismisses this flag "
                                 f"permanently.")
                     else:
-                        _v = _name_vocab(contents_by_id.get(a, ""), contents_by_id.get(b, ""))
+                        _v = _name_vocab(text_a, text_b)
                         differing = sorted(
-                            _discriminating_tokens(contents_by_id.get(a, ""), _v)
-                            ^ _discriminating_tokens(contents_by_id.get(b, ""), _v)
+                            str(t) for t in (
+                                _discriminating_tokens(text_a, _v)
+                                ^ _discriminating_tokens(text_b, _v)
+                            )
                         )[:6]
+                        qa, qb = _extract_quantities(text_a), _extract_quantities(text_b)
+                        shared = [f for f in set(qa) & set(qb) if qa[f] != qb[f]]
+                        if shared:
+                            # Naming the dimension is more actionable than the raw
+                            # tokens: "these both state a duration, and they differ".
+                            detail = (f"both state a {', '.join(sorted(shared))} but the "
+                                      f"values differ")
+                        else:
+                            detail = f"they disagree on {differing}"
                         reason = "value_disagreement"
-                        hint = (f"One of these reads like a correction of the other, and they "
-                                f"disagree on {differing}. They are not phrased alike, so "
-                                f"nothing else would flag them. If one replaces the other, "
-                                f"re-store it with memory_store(..., supersedes=<old_id>). If "
-                                f"both are true, call memory_relate(from_id={a}, to_id={b}, "
+                        hint = (f"These are about the same subject and {detail}. They are not "
+                                f"phrased alike, so nothing else would flag them. If one "
+                                f"replaces the other, re-store it with "
+                                f"memory_store(..., supersedes=<old_id>). If both are true, "
+                                f"call memory_relate(from_id={a}, to_id={b}, "
                                 f"relationship='RELATED_TO') — that dismisses this flag "
                                 f"permanently.")
 
