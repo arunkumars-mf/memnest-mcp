@@ -27,3 +27,4 @@ memnest-export-*.json
 # memory_graph_html output and its rotated snapshots
 memory_graph.html
 memory_graph-*.html
+benchmark/results/soak/
