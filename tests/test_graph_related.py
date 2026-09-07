@@ -190,3 +190,42 @@ def test_min_ratio_is_configurable(store, monkeypatch):
     # A ratio above 1.0 makes even the top result fail the floor
     monkeypatch.setattr(server, "GRAPH_EXPAND_MIN_RATIO", 1.5)
     assert "related" not in _search(), "no seed should clear an impossible floor"
+
+
+def test_rrf_seed_floor_reads_raw_cosine(monkeypatch):
+    """Rank fusion compresses fused scores: rank 2 lands at ~0.96x the top
+    regardless of how weak the underlying match is, which would let junk
+    seeds sail over GRAPH_EXPAND_MIN_RATIO and neuter the guard the previous
+    test exists for. In rrf mode the floor must read the raw pre-rank
+    cosines snapshotted before the transform.
+    """
+    server._conn = None
+    server._db = None
+    monkeypatch.setattr(server, "FUSION_MODE", "rrf")
+    monkeypatch.setattr(server, "GRAPH_EXPAND_MIN_RATIO", 0.9)
+
+    res = server.memory_store.__wrapped__(items=[
+        {"content": DECISION},
+        # Shares a token ("orders") so it places in BOTH channels — the
+        # shape where rank compression makes fused scores incomparable.
+        {"content": "Order fulfillment reports are archived quarterly."},
+        {"content": "Parking garage badge readers were replaced in March."},
+    ])
+    a, b, c = [r["id"] for r in res["results"]]
+    server.memory_relate.__wrapped__(from_id=c, to_id=b,
+                                     relationship="RELATED_TO")
+
+    out = _search(top_k=2)
+    assert out["results"][0]["id"] == a
+
+    # The premise: rank compression lifts the junk rank-2 hit over a 0.9
+    # FUSED-score floor, so a fused test cannot see its weakness.
+    assert out["results"][1]["score"] >= out["results"][0]["score"] * 0.9, \
+        "fixture drifted: rank 2 no longer demonstrates rank compression"
+
+    # The fix: its raw cosine does NOT clear 0.9x the top's cosine, so it
+    # must not seed expansion — its neighbour stays out of `related`.
+    ranked = {r["id"] for r in out["results"]}
+    related = {r["id"] for r in out.get("related", [])}
+    assert not (({b, c} - ranked) & related), \
+        "expanded from a junk seed that only rank compression made look strong"

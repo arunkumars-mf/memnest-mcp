@@ -344,7 +344,8 @@ Three layers — you don't need to check manually:
 | `MEMORY_MAX_BATCH` | `500` | Max items per batch call |
 | `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max search results |
-| `MEMORY_FUSION` | `legacy` | Vector-channel scaling: `legacy` (raw cosine) or `normalized` (min-max, matching the FTS channel). `normalized` is more robust on very small memory sets |
+| `MEMORY_FUSION` | `legacy` | Channel fusion: `legacy` (raw cosine), `normalized` (min-max vector), or `rrf` (reciprocal rank fusion — rank-based, immune to channel-scale artifacts and stable under corpus edits; opt-in pending benchmark re-run) |
+| `MEMORY_RRF_K` | `60` | Rank-decay constant for `rrf` mode: channel value is `(K+1)/(K+rank)` |
 
 ## Backup and transfer
 

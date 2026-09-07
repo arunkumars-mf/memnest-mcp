@@ -217,6 +217,8 @@ All settings are optional — defaults work out of the box.
 | `MEMORY_CONSOLIDATE_SCAN` | `1000` | Max memories scanned per dream phase |
 | `MEMORY_ALLOW_DESTRUCTIVE` | `false` | Allow DELETE/DROP/TRUNCATE/REMOVE/SET/COPY through `memory_query`. **Off by default for safety.** Prefer `memory_update`, `memory_delete`, `memory_unrelate` |
 | `MEMORY_SEARCH_CANDIDATES` | `100` | Rows each search channel retrieves before fusion. Independent of `top_k` |
+| `MEMORY_FUSION` | `legacy` | Channel fusion: `legacy` (raw cosine + max-normalized FTS), `normalized` (min-max vector), or `rrf` (reciprocal rank fusion — only each channel's *ordering* enters the score, so channel scales can't interact and scores stay stable when memories are added or deleted). `rrf` is opt-in pending a LOCOMO re-run; the published benchmark was measured under `legacy` |
+| `MEMORY_RRF_K` | `60` | Rank-decay constant for `rrf` mode. Channel value is `(K+1)/(K+rank)`: 1.0 at rank 1, ~0.87 at rank 10 |
 | `MEMORY_MAX_STORE_CHARS` | `20000` | Content longer than this is truncated on store |
 | `MEMORY_MAX_BATCH` | `500` | Max items per batch call |
 | `MEMORY_GRAPH_MAX_NODES` | `2000` | Max nodes `memory_graph_html` will render before refusing |

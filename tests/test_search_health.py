@@ -77,7 +77,7 @@ def test_stats_reports_embedding_health_and_fusion_mode():
     server.memory_store.__wrapped__(content="Kinesis feeds the search indexer")
     rt = server.memory_stats.__wrapped__()["runtime"]
 
-    assert rt["fusion_mode"] in ("legacy", "normalized")
+    assert rt["fusion_mode"] in ("legacy", "normalized", "rrf")
     emb = rt["embeddings"]
     assert emb["model"], "embedding model name should be reported"
     assert emb["missing"] == 0
@@ -116,7 +116,7 @@ def test_both_fusion_modes_produce_valid_rankings():
     ])
     original = server.FUSION_MODE
     try:
-        for mode in ("legacy", "normalized"):
+        for mode in ("legacy", "normalized", "rrf"):
             server.FUSION_MODE = mode
             res = _search("what database does the payments service use", top_k=3)
             assert res["results"], f"{mode}: no results"

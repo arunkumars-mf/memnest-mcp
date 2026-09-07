@@ -236,10 +236,13 @@ CONFLICT_VALUE_FLOOR = float(os.environ.get("MEMORY_CONFLICT_VALUE_FLOOR", "0.5"
 MERGE_TAG_OVERLAP = float(os.environ.get("MEMORY_MERGE_TAG_OVERLAP", "0.5"))
 
 FUSION_MODE = os.environ.get("MEMORY_FUSION", "legacy").strip().lower()
-if FUSION_MODE not in ("legacy", "normalized"):
+if FUSION_MODE not in ("legacy", "normalized", "rrf"):
     raise RuntimeError(
-        f"Invalid MEMORY_FUSION={FUSION_MODE!r}: expected 'legacy' or 'normalized'."
+        f"Invalid MEMORY_FUSION={FUSION_MODE!r}: expected 'legacy', 'normalized' or 'rrf'."
     )
+# Reciprocal-rank constant for MEMORY_FUSION=rrf. Standard value 60: rank 1
+# scores 1.0, rank 10 ~0.87, rank 50 ~0.55 after the (K+1)/(K+rank) scaling.
+RRF_K = int(os.environ.get("MEMORY_RRF_K", "60"))
 
 # Response format: 'json' (default) or 'toon' (compact for LLM context)
 RESPONSE_FORMAT = os.environ.get("MEMORY_RESPONSE_FORMAT", "toon" if _TOON_AVAILABLE else "json").lower()
@@ -2570,6 +2573,46 @@ def memory_search(
             for m in vector_hits:
                 raw_scores[m]["vector"] = (raw_scores[m]["vector"] - v_lo) / v_span
 
+    # --- MEMORY_FUSION=rrf: replace channel VALUES with rank decay ---
+    #
+    # The root cause of a whole bug class was summing incomparable scales: raw
+    # cosine has a ~0.5 floor for unrelated text, while FTS is max-normalised
+    # so its top hit is always exactly 1.0 regardless of absolute quality.
+    # Three measured symptoms of that one cause: a plateau of identical scores
+    # when FTS dominated (0.425 across unrelated results); deleting the top
+    # FTS hit roughly DOUBLING every survivor's keyword score (the normalising
+    # max halved), which inverted a ranking in the field; and scores that were
+    # not comparable across corpora.
+    #
+    # Reciprocal Rank Fusion is the standard remedy: only each retriever's
+    # ORDERING enters the fusion, so channel scales cannot interact. Channel
+    # value becomes (K+1)/(K+rank) — 1.0 at rank 1, decaying gently — which
+    # keeps the documented channel weights meaningful and lets the explain
+    # block still reconstruct the score. Membership changes shift a survivor's
+    # rank by at most the number of removed items, so scores are stable under
+    # corpus edits instead of rescaling.
+    #
+    # Per-item features (recency, importance) are not retrievers and keep
+    # their absolute 0-1 forms. Opt-in until a LOCOMO re-run: the published
+    # 82.9% was measured under 'legacy'.
+    # Snapshot raw cosines BEFORE the rank transform. Rank fusion compresses
+    # fused scores (rank 2 is ~0.96x the top regardless of how weak it really
+    # is), which would neuter the `related` seed floor — a guard that exists
+    # because a rank-3 hit at 53% of the top's cosine once dragged its
+    # superseded pair into `related`. The floor reads these raw values in rrf
+    # mode so "weak" stays measurable.
+    pre_rank_vector: dict[int, float] = {}
+    if FUSION_MODE == "rrf":
+        pre_rank_vector = {m: raw_scores[m]["vector"] for m in raw_scores}
+        for channel in ("vector", "fts", "graph"):
+            ranked = sorted(
+                (m for m in raw_scores
+                 if raw_scores[m][channel] > 0 or (channel == "vector" and m in vector_hits)),
+                key=lambda m: (-raw_scores[m][channel], m),
+            )
+            for rank, m in enumerate(ranked, start=1):
+                raw_scores[m][channel] = (RRF_K + 1) / (RRF_K + rank)
+
     now = time.time()
     final_scores: dict[int, float] = {}
     # Per-memory fusion inputs, kept when explain=True so a caller can see WHY
@@ -2898,9 +2941,18 @@ def memory_search(
             # its neighbours are noise: observed a pricing correction placing
             # rank 3 at 53% of the top score on a billing query, dragging its
             # superseded pair into `related` where it had no business being.
-            floor = results[0]["score"] * GRAPH_EXPAND_MIN_RATIO
-            seeds = [r["id"] for r in results[:GRAPH_EXPAND_SEEDS]
-                     if r["score"] >= floor]
+            # In rrf mode fused scores are rank-decayed and compressed (rank 2
+            # is always ~0.96x the top), so the ratio test runs on the raw
+            # pre-rank cosines snapshotted before the transform instead.
+            if FUSION_MODE == "rrf" and pre_rank_vector.get(results[0]["id"], 0.0) > 0:
+                ref = pre_rank_vector[results[0]["id"]]
+                floor = ref * GRAPH_EXPAND_MIN_RATIO
+                seeds = [r["id"] for r in results[:GRAPH_EXPAND_SEEDS]
+                         if pre_rank_vector.get(r["id"], 0.0) >= floor]
+            else:
+                floor = results[0]["score"] * GRAPH_EXPAND_MIN_RATIO
+                seeds = [r["id"] for r in results[:GRAPH_EXPAND_SEEDS]
+                         if r["score"] >= floor]
             if not seeds:
                 raise StopIteration  # nothing confident enough to expand from
             returned = {r["id"] for r in results}
