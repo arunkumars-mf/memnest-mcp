@@ -122,16 +122,23 @@ Resolve it rather than picking one silently:
 
 This is flagged as *potential* because the server does no LLM inference: it knows
 the two are about the same subject and disagree on something, not which one is
-right. Complementary facts that differ in kind rather than magnitude ("depends on
-Redis for caching" / "depends on Kafka for event delivery", "port 8080 for HTTP" /
-"port 9090 for metrics") are deliberately not flagged.
+right. Deliberately **not** flagged:
 
-Two measurements of the *same* dimension under different qualifiers ("connect
-timeout 500ms" / "read timeout 2000ms") will flag even though both are true —
-telling a qualifier from a synonym needs semantics the server does not have. One
-`memory_relate(..., relationship="RELATED_TO")` dismisses it for good, which is
-why the detector errs toward flagging: a dismissal costs one call, a miss serves
-a stale value as the answer.
+- facts differing in kind rather than magnitude — "depends on Redis for caching"
+  / "depends on Kafka for event delivery", "port 8080 for HTTP" / "port 9090 for
+  metrics"
+- quantities partitioned across disjoint scopes — "3 nodes in `us-east-1`" /
+  "5 nodes in `us-west-2`", "timeout in `prod`" / "timeout in `staging`".
+  Recognised scopes are cloud regions and environment names. Note that both
+  sides must name a scope: "timeout is 500ms" / "timeout in prod is now 900ms"
+  still flags, because a correction that adds the detail is a real conflict.
+
+**Known limitation:** two measurements of the *same* dimension under different
+qualifiers ("connect timeout 500ms" / "read timeout 2000ms") will flag even
+though both are true — telling a qualifier from a synonym needs semantics the
+server does not have. One `memory_relate(..., relationship="RELATED_TO")`
+dismisses it for good, which is why the detector errs toward flagging: a
+dismissal costs one call, a miss serves a stale value as the answer.
 
 ### Step 3: Store new information
 

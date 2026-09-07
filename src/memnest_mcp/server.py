@@ -203,6 +203,11 @@ SUPERSEDED_PENALTY = float(os.environ.get("MEMORY_SUPERSEDED_PENALTY", "0.5"))
 # MEMORY_GRAPH_EXPAND_SEEDS=0 to disable.
 GRAPH_EXPAND_SEEDS = int(os.environ.get("MEMORY_GRAPH_EXPAND_SEEDS", "3"))
 GRAPH_EXPAND_LIMIT = int(os.environ.get("MEMORY_GRAPH_EXPAND_LIMIT", "5"))
+# Traversal depth for the `related` expansion. 2 reaches the transitive cases
+# measured to matter (checkout -> payments-core -> ledger-db deprecation) while
+# hop-decay ordering keeps direct neighbours ahead of distant ones. Depth is
+# clamped to 4: beyond that everything connects to everything.
+GRAPH_EXPAND_HOPS = min(4, max(1, int(os.environ.get("MEMORY_GRAPH_EXPAND_HOPS", "2"))))
 # A seed must score at least this fraction of the top result to expand from.
 # Weak hits are coincidences and their neighbours are noise.
 GRAPH_EXPAND_MIN_RATIO = float(os.environ.get("MEMORY_GRAPH_EXPAND_MIN_RATIO", "0.6"))
@@ -1050,6 +1055,63 @@ def _extract_quantities(text: str) -> dict:
     return out
 
 
+# --- Scope partitioning ----------------------------------------------------
+#
+# Quantities attached to DIFFERENT scopes are complementary, not contradictory:
+# "3 nodes in us-east-1" and "5 nodes in us-west-2" are both permanently true.
+#
+# This shape needs its own rule rather than being folded into the accepted
+# qualifier limitation, because it does not cost one dismissal — it costs one per
+# PAIR. Per-region, per-environment and per-tenant quantities are among the most
+# common things in infrastructure memory, so N partitions of one metric means
+# N(N-1)/2 dismissals, and adding a new region re-triggers against every
+# existing one. Quadratic nuisance is a different problem from a single flag.
+#
+# Same shape of heuristic as the unit families above, applied to the qualifier
+# instead of the magnitude: recognisable scope vocabularies, not open-ended
+# semantics.
+_REGION_RE = re.compile(
+    r"\b(?:us|eu|ap|sa|ca|me|af|cn)-(?:gov-)?"
+    r"(?:east|west|north|south|central|northeast|northwest|southeast|southwest)"
+    r"-\d[a-f]?\b",
+    re.I,
+)
+_ENVIRONMENT_SCOPES = frozenset({
+    "prod", "production", "prd", "live",
+    "staging", "stage", "stg", "preprod", "pre-production",
+    "dev", "development", "devo",
+    "test", "testing", "qa", "uat", "sandbox", "sbx",
+    "canary", "beta", "alpha", "gamma", "onebox", "one-box", "local",
+})
+
+
+def _scope_tokens(text: str) -> set:
+    """Scope markers found in the text: cloud regions and environment names.
+
+    Multi-word identifiers are matched whole, so a deployment target like
+    "prod-checkout" is NOT read as the environment "prod" — it names a specific
+    thing rather than partitioning a fact across environments.
+    """
+    raw = text or ""
+    scopes = {m.group(0).lower() for m in _REGION_RE.finditer(raw)}
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*", raw):
+        low = word.lower()
+        if low in _ENVIRONMENT_SCOPES:
+            scopes.add(low)
+    return scopes
+
+
+def _differently_scoped(a: str, b: str) -> bool:
+    """True when both texts name scopes and share none of them.
+
+    Requires BOTH sides to be scoped. If only one names a scope, the pair may
+    still be a genuine correction that added the detail ("timeout is 500ms" ->
+    "timeout in prod is now 900ms"), so suppressing there would hide it.
+    """
+    sa, sb = _scope_tokens(a), _scope_tokens(b)
+    return bool(sa) and bool(sb) and not (sa & sb)
+
+
 def _quantities_disagree(a: str, b: str) -> bool:
     """True when both texts state a comparable quantity and the values differ.
 
@@ -1854,6 +1916,7 @@ def _store_one(conn, content: str, category: str, tags: list[str],
                     #      because differing values alone describe complementary
                     #      facts as often as contradictions ("depends on Redis
                     #      for caching" / "depends on Kafka for event delivery").
+                    and not _differently_scoped(content, row[1])
                     and (
                         (similarity >= CONFLICT_THRESHOLD
                          and _values_conflict(content, row[1]))
@@ -2667,6 +2730,11 @@ def memory_search(
                     if not (near_duplicate or value_disagreement):
                         continue
 
+                    # Facts partitioned across disjoint scopes are complementary
+                    # however alike they read, so this suppresses BOTH triggers.
+                    if _differently_scoped(text_a, text_b):
+                        continue
+
                     # Any agent-asserted edge dismisses the flag, RELATED_TO
                     # included — that is what the hint tells the agent to write.
                     if _conflict_dismissed(conn, a, b):
@@ -2732,20 +2800,38 @@ def memory_search(
             if not seeds:
                 raise StopIteration  # nothing confident enough to expand from
             returned = {r["id"] for r in results}
+
+            # Variable-length traversal, ordered by hop distance. 1-hop-only
+            # missed exactly the connections the graph exists to record: on the
+            # measured corpus, "what deprecated infrastructure does checkout
+            # depend on?" needed checkout -> payments-core -> ledger-db — two
+            # hops — and the answer never surfaced. min(length(p)) gives each
+            # neighbour its SHORTEST distance to any seed, so direct neighbours
+            # always outrank transitive ones and a memory reachable both ways
+            # counts as direct. (Personalized PageRank would be the textbook
+            # tool, but the engine's PAGE_RANK has no source-node support —
+            # probed: `sourceNodes` is rejected — and hop decay is the honest
+            # cheap substitute. Workspace filter on the endpoint keeps another
+            # project's memories out of the walk.)
             r = conn.execute(
-                """MATCH (s:Memory)-[e:RELATED_TO|SUPERSEDES|EXPLAINS]-(n:Memory)
-                   WHERE s.id IN $seeds
-                   RETURN DISTINCT n.id, n.content, n.importance, s.id;""",
-                {"seeds": seeds},
+                f"""MATCH p = (s:Memory)-[:RELATED_TO|SUPERSEDES|EXPLAINS*1..{GRAPH_EXPAND_HOPS}]-(n:Memory)
+                   WHERE s.id IN $seeds AND NOT n.id IN $returned
+                     AND n.workspace IN ['', $ws]
+                   RETURN n.id, n.content, min(length(p)) AS hops, min(s.id) AS seed
+                   ORDER BY hops ASC, n.id ASC;""",
+                {"seeds": seeds, "returned": list(returned), "ws": WORKSPACE},
             )
             for row in _collect_results(r):
-                if row[0] in returned:
-                    continue  # already ranked on its own merits
-                related.append({
+                entry = {
                     "id": row[0],
                     "content": _truncate(row[1], preview_chars),
                     "linked_to": row[3],
-                })
+                }
+                if (row[2] or 1) > 1:
+                    # Only annotate the non-obvious case: a transitive
+                    # connection the agent could not see from any single edge.
+                    entry["hops"] = row[2]
+                related.append(entry)
                 if len(related) >= GRAPH_EXPAND_LIMIT:
                     break
         except StopIteration:
@@ -4048,18 +4134,99 @@ def memory_set_workspace(path: str) -> str:
     }
 
 
-def _compute_graph_scores(conn: lb.Connection):
-    """Pre-compute PageRank and Louvain communities for all Memory nodes.
+def _kcore_peel(edges: list) -> dict:
+    """Core number per node, by the standard peeling algorithm.
+
+    Replaces CALL K_CORE_DECOMPOSITION, which hangs the engine (unkillable
+    C-level loop) on a filtered projection whose graph combines density,
+    parallel edges and excluded nodes — minimal reproduction: a K10 of inferred
+    edges plus 7 parallel hub edges in one workspace, with 4 filtered-out nodes
+    holding one edge in another. Each ingredient alone completes; together they
+    never return. Peeling is O(E log V) here, deterministic, and the workspace
+    subgraphs it runs on are small.
+
+    Parallel edges are collapsed first: two RELATED_TO rows between the same
+    pair (one inferred, one asserted) are one adjacency, not degree 2.
+    """
+    adj: dict = {}
+    for a, b in edges:
+        if a == b:
+            continue
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    core = {n: len(ns) for n, ns in adj.items()}
+    # Peel lowest-degree nodes; a removed node decrements its neighbours, but a
+    # neighbour's core number never drops below that of the node being removed.
+    import heapq
+    heap = [(d, n) for n, d in core.items()]
+    heapq.heapify(heap)
+    removed: set = set()
+    while heap:
+        d, n = heapq.heappop(heap)
+        if n in removed or d > core[n]:
+            continue  # stale heap entry
+        removed.add(n)
+        for m in adj[n]:
+            if m in removed:
+                continue
+            if core[m] > core[n]:
+                core[m] -= 1
+                heapq.heappush(heap, (core[m], m))
+    return core
+
+
+def _cypher_str_literal(value: str) -> str:
+    """Escape a Python string for embedding inside a single-quoted Cypher literal."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _ws_node_predicate(workspace: str) -> str:
+    """Cypher predicate selecting nodes visible to `workspace` ('' = global)."""
+    ws = _cypher_str_literal(workspace)
+    return f"n.workspace = '{ws}' OR n.workspace = ''"
+
+
+def _project_graph_scoped(conn: lb.Connection, name: str, workspace: str,
+                          rels: list, include_topics: bool = False) -> None:
+    """PROJECT_GRAPH filtered to one workspace's memories.
+
+    Filtered projection also excludes edges whose other endpoint fell outside
+    the filter (verified empirically), so a cross-workspace RELATED_TO cannot
+    pull another project's memories into an algorithm run.
+    """
+    try:
+        conn.execute(f"CALL DROP_PROJECTED_GRAPH('{name}');")
+    except Exception:
+        pass
+    pred = _ws_node_predicate(workspace)
+    node_part = f"{{'Memory': \"{pred}\""
+    if include_topics:
+        node_part += ", 'Topic': 'true'"
+    node_part += "}"
+    rel_part = "{" + ", ".join(f"'{r}': 'true'" for r in rels) + "}"
+    conn.execute(f"CALL PROJECT_GRAPH('{name}', {node_part}, {rel_part});")
+
+
+def _compute_graph_scores(conn: lb.Connection, workspace: Optional[str] = None):
+    """Pre-compute PageRank and Louvain communities for one workspace's memories.
 
     Called after ingest/dream to update graph-based importance scores.
-    
+
     1. Creates RELATED_TO edges between memories sharing 3+ meaningful topics
        (inferred relationships for community detection).
     2. Runs PageRank on Memory+Topic graph for importance scoring.
     3. Runs Louvain on Memory-only graph for community detection.
-    
+
     Stores `pagerank` and `community_id` on each Memory node for use in search.
+
+    Every projection is FILTERED to `workspace` (plus '' globals). The previous
+    code projected the whole database, so PageRank/Louvain/K-Core were computed
+    across every workspace in a shared DB file and leaked into workspace-scoped
+    search through the 0.15 graph channel — another project's densely-tagged
+    memories could raise or depress this project's rankings. Other workspaces'
+    stored scores are left untouched; they get recomputed when THEIR dream runs.
     """
+    ws = WORKSPACE if workspace is None else workspace
     try:
         # Add columns if not exists
         _safe_execute(conn, "ALTER TABLE Memory ADD pagerank DOUBLE DEFAULT 0.0;",
@@ -4077,11 +4244,15 @@ def _compute_graph_scores(conn: lb.Connection):
         existing_inferred = result.get_next()[0] if result.has_next() else 0
         
         if existing_inferred == 0:
-            # Create edges between memories sharing 3+ meaningful topics
-            # Exclude conversation-level tags (conv-*) and 'chunk' which are on everything
+            # Create edges between memories sharing 3+ meaningful topics.
+            # Exclude conversation-level tags (conv-*) and 'chunk' which are on
+            # everything. Same-workspace only: shared topic NAMES are common
+            # across projects ("auth", "config"), and an inferred edge between
+            # two projects' memories would wire their graphs together.
             _safe_execute(conn, """
                 MATCH (a:Memory)-[:ABOUT]->(t:Topic)<-[:ABOUT]-(b:Memory)
                 WHERE a.id < b.id 
+                  AND a.workspace = b.workspace
                   AND NOT t.name STARTS WITH 'conv-'
                   AND t.name <> 'chunk'
                 WITH a, b, COUNT(DISTINCT t.name) AS shared_topics
@@ -4090,14 +4261,8 @@ def _compute_graph_scores(conn: lb.Connection):
             """)
 
         # --- Step 2: PageRank on Memory + Topic graph ---
-        try:
-            conn.execute("CALL DROP_PROJECTED_GRAPH('memory_pr');")
-        except Exception:
-            pass
-
-        conn.execute(
-            "CALL PROJECT_GRAPH('memory_pr', ['Memory', 'Topic'], ['ABOUT', 'RELATED_TO']);"
-        )
+        _project_graph_scoped(conn, "memory_pr", ws, ["ABOUT", "RELATED_TO"],
+                              include_topics=True)
 
         result = conn.execute("CALL PAGE_RANK('memory_pr') RETURN node, rank;")
         pr_updates = 0
@@ -4117,27 +4282,46 @@ def _compute_graph_scores(conn: lb.Connection):
             pass
 
         # --- Step 3: Louvain on Memory-only graph ---
-        try:
-            conn.execute("CALL DROP_PROJECTED_GRAPH('memory_louvain');")
-        except Exception:
-            pass
-
-        # Check if we have enough Memory→Memory edges for Louvain
-        result = conn.execute("MATCH ()-[r:RELATED_TO]->() RETURN COUNT(r);")
+        # Edge count scoped like the projection, so five edges in some OTHER
+        # workspace do not convince us this one has enough structure.
+        result = conn.execute(
+            """MATCH (a:Memory)-[r:RELATED_TO]->(b:Memory)
+               WHERE a.workspace IN ['', $ws] AND b.workspace IN ['', $ws]
+               RETURN COUNT(r);""",
+            {"ws": ws},
+        )
         edge_count = result.get_next()[0] if result.has_next() else 0
 
         louvain_communities = 0
         if edge_count >= 5:
             try:
+                # UNFILTERED on purpose: LOUVAIN silently ignores node
+                # predicates (measured — a projection filtered to 10 nodes
+                # returned louvain_ids for all 14), so a filtered projection
+                # would only pretend to scope. Since same-workspace inferred
+                # edges (Step 1) and workspace-checked memory_relate endpoints
+                # mean RELATED_TO rarely crosses workspaces, global communities
+                # are usually correct anyway; scoping is enforced where it is
+                # actually under our control, at the WRITE-BACK below.
+                try:
+                    conn.execute("CALL DROP_PROJECTED_GRAPH('memory_louvain');")
+                except Exception:
+                    pass
                 conn.execute(
                     "CALL PROJECT_GRAPH('memory_louvain', ['Memory'], ['RELATED_TO']);"
                 )
+                ws_ids = {
+                    r[0] for r in _collect_results(conn.execute(
+                        "MATCH (m:Memory) WHERE m.workspace IN ['', $ws] RETURN m.id;",
+                        {"ws": ws},
+                    ))
+                }
                 result = conn.execute(
                     "CALL LOUVAIN('memory_louvain') RETURN node.id, louvain_id;"
                 )
                 for row in _collect_results(result):
                     mem_id, community = row[0], row[1]
-                    if mem_id is not None:
+                    if mem_id is not None and mem_id in ws_ids:
                         _safe_execute(conn,
                             "MATCH (m:Memory {id: $id}) SET m.community_id = $cid;",
                             {"id": mem_id, "cid": community})
@@ -4151,33 +4335,26 @@ def _compute_graph_scores(conn: lb.Connection):
                 except Exception:
                     pass
 
-        # --- Step 4: K-Core Decomposition for structural importance ---
+        # --- Step 4: K-Core numbers for structural importance ---
+        # In-process peeling, NOT CALL K_CORE_DECOMPOSITION: the engine call
+        # hangs unkillably on certain filtered-projection graph shapes (see
+        # _kcore_peel), and it counted parallel edges as extra degree, so a
+        # pair linked both by inference and by assertion scored as if it had
+        # two neighbours.
         if edge_count >= 5:
             try:
-                # Reuse the memory_louvain projection or create fresh
-                try:
-                    conn.execute("CALL DROP_PROJECTED_GRAPH('memory_kcore');")
-                except Exception:
-                    pass
-                conn.execute(
-                    "CALL PROJECT_GRAPH('memory_kcore', ['Memory'], ['RELATED_TO']);"
-                )
-                result = conn.execute(
-                    "CALL K_CORE_DECOMPOSITION('memory_kcore') RETURN node.id, k_degree;"
-                )
-                for row in _collect_results(result):
-                    mem_id, k_deg = row[0], row[1]
-                    if mem_id is not None:
-                        _safe_execute(conn,
-                            "MATCH (m:Memory {id: $id}) SET m.k_degree = $kd;",
-                            {"id": mem_id, "kd": k_deg})
-                conn.execute("CALL DROP_PROJECTED_GRAPH('memory_kcore');")
+                edge_rows = _collect_results(conn.execute(
+                    """MATCH (a:Memory)-[:RELATED_TO]->(b:Memory)
+                       WHERE a.workspace IN ['', $ws] AND b.workspace IN ['', $ws]
+                       RETURN a.id, b.id;""",
+                    {"ws": ws},
+                ))
+                for mem_id, k_deg in _kcore_peel([(r[0], r[1]) for r in edge_rows]).items():
+                    _safe_execute(conn,
+                        "MATCH (m:Memory {id: $id}) SET m.k_degree = $kd;",
+                        {"id": mem_id, "kd": k_deg})
             except Exception as e:
                 logger.debug(f"K-Core failed (non-fatal): {e}")
-                try:
-                    conn.execute("CALL DROP_PROJECTED_GRAPH('memory_kcore');")
-                except Exception:
-                    pass
 
         logger.info(f"PageRank computed for {pr_updates} memories, "
                     f"Louvain communities detected, {edge_count} edges")
@@ -4279,7 +4456,12 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     {"limit": MAX_CONSOLIDATE_SCAN},
                 )
                 all_mems = _collect_results(scan_result)
-                visited = set()
+                # Pairs that pass every gate, resolved into components after
+                # the scan. seen_pairs stops double-counting: each pair shows
+                # up from both endpoints' probes.
+                merge_pairs: list = []
+                node_info: dict = {}
+                seen_pairs: set = set()
 
                 for mem in all_mems:
                     mid = mem[0]
@@ -4291,7 +4473,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     category = mem[6] or "general"
                     mem_ws = mem[7] or WORKSPACE
 
-                    if mid in visited or embedding is None:
+                    if embedding is None:
                         continue
 
                     def _merge_probe(emb_):
@@ -4338,19 +4520,25 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                             if index_rebuilt_by_audit:
                                 probe_rows = _merge_probe(embedding)
 
+                    # Collect gate-passing PAIRS; merging happens after the
+                    # scan, on union-find components. The old code merged
+                    # greedily inside this loop with a `visited` set, so the
+                    # outcome depended on scan order: which of three mutual
+                    # near-duplicates merged, and which id survived, changed
+                    # with updated_at ordering.
                     for row in (probe_rows or []):
                         other_id = row[0]
                         other_content = row[1]
                         other_tags = row[2]
-                        other_imp = row[3]
-                        other_created = row[4]
-                        other_cat = row[5] or "general"
                         other_ws = row[6] or WORKSPACE
-                        dist = row[7]
-                        sim = 1.0 - dist
+                        sim = 1.0 - row[7]
 
-                        if other_id == mid or other_id in visited:
+                        if other_id == mid:
                             continue
+                        pair_key = frozenset((mid, other_id))
+                        if pair_key in seen_pairs:
+                            continue  # probes run both directions; count once
+                        seen_pairs.add(pair_key)
                         # Don't merge across workspaces
                         if mem_ws != other_ws:
                             continue
@@ -4390,102 +4578,150 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                             value_conflict_skips += 1
                             continue
 
-                        # Keep the longer content, absorb tags, take max importance
-                        if len(content or "") >= len(other_content or ""):
-                            keep_id, drop_id = mid, other_id
-                            keep_content = content
-                            keep_created = created_at
-                            keep_category = category
-                            keep_workspace = mem_ws
-                            drop_created = other_created
-                        else:
-                            keep_id, drop_id = other_id, mid
-                            keep_content = other_content
-                            keep_created = other_created
-                            keep_category = other_cat
-                            keep_workspace = other_ws
-                            drop_created = created_at
+                        merge_pairs.append((mid, other_id, sim))
+                        node_info[other_id] = {
+                            "content": other_content, "tags": _parse_tags(other_tags),
+                            "importance": row[3], "created_at": row[4],
+                            "category": row[5] or "general", "workspace": other_ws,
+                        }
+                    node_info[mid] = {
+                        "content": content, "tags": _parse_tags(tags),
+                        "importance": importance, "created_at": created_at,
+                        "category": category, "workspace": mem_ws,
+                    }
 
-                        merged_tags = list(set(_parse_tags(tags) + _parse_tags(other_tags)))
-                        new_imp = min(5, max(importance or 3, other_imp or 3))
-                        # Preserve the older created_at
-                        preserved_created = min(keep_created or now, drop_created or now)
+                # --- Union-find over the passing pairs ---
+                parent: dict = {}
 
-                        if not dry_run:
-                            # Save BOTH memories' relationships, then merge them
-                            saved_keep = _save_memory_relationships(conn, keep_id)
-                            saved_drop = _save_memory_relationships(conn, drop_id)
+                def _find(x):
+                    parent.setdefault(x, x)
+                    while parent[x] != x:
+                        parent[x] = parent[parent[x]]  # path halving
+                        x = parent[x]
+                    return x
 
-                            # Combine the keeper's and dropped node's edges, then
-                            # collapse duplicates so we never end up with two
-                            # parallel edges of the same kind between the same
-                            # endpoints (which would silently inflate the
-                            # relationship count and confuse traversal queries).
-                            #
-                            # For RELATED_TO we key on the other endpoint and
-                            # keep the row with the higher confidence; for
-                            # SUPERSEDES/EXPLAINS we key on the other endpoint.
-                            def _dedupe_related(rows):
-                                by_endpoint: dict = {}
-                                for r in rows:
-                                    if not r:
-                                        continue
-                                    other = r[0]
-                                    if other == keep_id or other == drop_id:
-                                        continue
-                                    prev = by_endpoint.get(other)
-                                    if prev is None or (r[2] or 0) > (prev[2] or 0):
-                                        by_endpoint[other] = r
-                                return list(by_endpoint.values())
+                for a, b, _s in merge_pairs:
+                    parent[_find(a)] = _find(b)
 
-                            def _dedupe_simple(rows, key_indices=(0,)):
-                                seen = {}
-                                for r in rows:
-                                    if not r:
-                                        continue
-                                    other = r[0]
-                                    if other == keep_id or other == drop_id:
-                                        continue
-                                    k = tuple(r[i] if i < len(r) else None for i in key_indices)
-                                    seen[k] = r
-                                return list(seen.values())
+                components: dict = {}
+                for a, b, s in merge_pairs:
+                    root = _find(a)
+                    comp = components.setdefault(root, {"ids": set(), "sim": {}})
+                    comp["ids"].update((a, b))
+                    comp["sim"][a] = max(comp["sim"].get(a, 0.0), s)
+                    comp["sim"][b] = max(comp["sim"].get(b, 0.0), s)
 
-                            combined = {
-                                "rels_out": _dedupe_related(saved_keep["rels_out"] + saved_drop["rels_out"]),
-                                "rels_in": _dedupe_related(saved_keep["rels_in"] + saved_drop["rels_in"]),
-                                "sup_out": _dedupe_simple(saved_keep["sup_out"] + saved_drop["sup_out"]),
-                                "sup_in": _dedupe_simple(saved_keep["sup_in"] + saved_drop["sup_in"]),
-                                # EXPLAINS rows carry rationale_type at index 1 — key on (endpoint, rationale).
-                                "exp_out": _dedupe_simple(saved_keep["exp_out"] + saved_drop["exp_out"], (0, 1)),
-                                "exp_in": _dedupe_simple(saved_keep["exp_in"] + saved_drop["exp_in"], (0, 1)),
-                            }
+                for comp in components.values():
+                    ids = sorted(comp["ids"])
+                    # Transitivity can join two memories whose DIRECT pair never
+                    # passed the gates (A~B and B~C passed, but A and C hold a
+                    # SUPERSEDES edge, or their values conflict). Greedy never
+                    # had this failure mode, so union-find must not introduce
+                    # it: every internal pair has to be safe, or the component
+                    # is left for the review clusters instead. A missed merge
+                    # is a recoverable duplicate; a wrong merge is not.
+                    unsafe = False
+                    for i in range(len(ids)):
+                        for j in range(i + 1, len(ids)):
+                            a, b = ids[i], ids[j]
+                            if _semantically_linked(conn, a, b):
+                                protected_pairs += 1
+                                unsafe = True
+                            elif _values_conflict(node_info[a]["content"],
+                                                  node_info[b]["content"]):
+                                value_conflict_skips += 1
+                                unsafe = True
+                            if unsafe:
+                                break
+                        if unsafe:
+                            break
+                    if unsafe:
+                        logger.info(f"Component {ids} not merged: an internal "
+                                    f"pair fails a destructive-merge gate")
+                        continue
 
-                            new_emb = _embed(keep_content)
-                            if new_emb is None:
-                                logger.warning(f"Dream merge skipped: embedding failed for memory {keep_id}")
-                                continue
-                            conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;", {"id": keep_id})
-                            conn.execute(
-                                """CREATE (m:Memory {
-                                       id: $id, content: $content, content_hash: $hash,
-                                       category: $cat, tags: $tags, workspace: $ws,
-                                       importance: $imp, access_count: 0,
-                                       created_at: $created, updated_at: $now, embedding: $emb
-                                   });""",
-                                {"id": keep_id, "content": keep_content, "hash": _content_hash(keep_content),
-                                 "cat": keep_category, "tags": _format_tags(merged_tags),
-                                 "ws": keep_workspace, "imp": new_imp,
-                                 "created": preserved_created, "now": now, "emb": new_emb},
-                            )
-                            _ensure_topics(conn, keep_id, merged_tags)
-                            conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;", {"id": drop_id})
-                            _restore_memory_relationships(conn, keep_id, combined)
+                    # Deterministic survivor: longest content, with the CONTENT
+                    # itself as the tiebreak. An id tiebreak looked stable but
+                    # was not — ids depend on insertion order, so two equal-
+                    # length variants produced different survivors for the same
+                    # set of memories stored in a different order.
+                    keep_id = max(ids, key=lambda i: (len(node_info[i]["content"] or ""),
+                                                      node_info[i]["content"] or ""))
+                    drop_ids = [i for i in ids if i != keep_id]
+                    keep = node_info[keep_id]
+                    merged_tags = sorted({t for i in ids for t in node_info[i]["tags"]})
+                    new_imp = min(5, max((node_info[i]["importance"] or 3) for i in ids))
+                    preserved_created = min((node_info[i]["created_at"] or now) for i in ids)
 
-                        trivial_merged.append({"kept": keep_id, "dropped": drop_id, "similarity": round(sim, 4)})
-                        visited.add(mid)
-                        visited.add(other_id)
-                        visited.add(keep_id)  # ensure keeper not re-processed (issue #16)
-                        break
+                    if not dry_run:
+                        member_set = set(ids)
+
+                        def _dedupe_related(rows):
+                            by_endpoint: dict = {}
+                            for r in rows:
+                                if not r or r[0] in member_set:
+                                    continue
+                                prev = by_endpoint.get(r[0])
+                                if prev is None or (r[2] or 0) > (prev[2] or 0):
+                                    by_endpoint[r[0]] = r
+                            return list(by_endpoint.values())
+
+                        def _dedupe_simple(rows, key_indices=(0,)):
+                            seen = {}
+                            for r in rows:
+                                if not r or r[0] in member_set:
+                                    continue
+                                k = tuple(r[i] if i < len(r) else None for i in key_indices)
+                                seen[k] = r
+                            return list(seen.values())
+
+                        saved = [_save_memory_relationships(conn, i) for i in ids]
+
+                        def _gather(key):
+                            out = []
+                            for s_ in saved:
+                                out.extend(s_[key])
+                            return out
+
+                        combined = {
+                            "rels_out": _dedupe_related(_gather("rels_out")),
+                            "rels_in": _dedupe_related(_gather("rels_in")),
+                            "sup_out": _dedupe_simple(_gather("sup_out")),
+                            "sup_in": _dedupe_simple(_gather("sup_in")),
+                            # EXPLAINS rows carry rationale_type at index 1.
+                            "exp_out": _dedupe_simple(_gather("exp_out"), (0, 1)),
+                            "exp_in": _dedupe_simple(_gather("exp_in"), (0, 1)),
+                        }
+
+                        new_emb = _embed(keep["content"])
+                        if new_emb is None:
+                            logger.warning(f"Dream merge skipped: embedding failed for memory {keep_id}")
+                            continue
+                        conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;", {"id": keep_id})
+                        conn.execute(
+                            """CREATE (m:Memory {
+                                   id: $id, content: $content, content_hash: $hash,
+                                   category: $cat, tags: $tags, workspace: $ws,
+                                   importance: $imp, access_count: 0,
+                                   created_at: $created, updated_at: $now, embedding: $emb
+                               });""",
+                            {"id": keep_id, "content": keep["content"],
+                             "hash": _content_hash(keep["content"]),
+                             "cat": keep["category"], "tags": _format_tags(merged_tags),
+                             "ws": keep["workspace"], "imp": new_imp,
+                             "created": preserved_created, "now": now, "emb": new_emb},
+                        )
+                        _ensure_topics(conn, keep_id, merged_tags)
+                        for drop_id in drop_ids:
+                            conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;",
+                                         {"id": drop_id})
+                        _restore_memory_relationships(conn, keep_id, combined)
+
+                    for drop_id in drop_ids:
+                        trivial_merged.append({
+                            "kept": keep_id, "dropped": drop_id,
+                            "similarity": round(comp["sim"].get(drop_id, 0.0), 4),
+                        })
             except Exception as e:
                 logger.warning(f"Dream trivial merge failed: {e}")
 
@@ -4603,13 +4839,9 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                 sup_count = sup_result.get_next()[0] if sup_result.has_next() else 0
 
                 if sup_count >= 2:
-                    try:
-                        conn.execute("CALL DROP_PROJECTED_GRAPH('memory_scc');")
-                    except Exception:
-                        pass
-                    conn.execute(
-                        "CALL PROJECT_GRAPH('memory_scc', ['Memory'], ['SUPERSEDES']);"
-                    )
+                    # Scoped like every other projection: a contradiction cycle
+                    # in another project is that project's report, not this one's.
+                    _project_graph_scoped(conn, "memory_scc", WORKSPACE, ["SUPERSEDES"])
                     result = conn.execute(
                         "CALL STRONGLY_CONNECTED_COMPONENTS('memory_scc') "
                         "RETURN group_id, collect(node.id) AS members;"

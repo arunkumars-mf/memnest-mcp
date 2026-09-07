@@ -867,3 +867,103 @@ def test_known_limitation_qualified_measurements_of_the_same_dimension():
     server.memory_relate.__wrapped__(from_id=a["id"], to_id=b["id"],
                                      relationship="RELATED_TO")
     assert _flag_for(a["id"], b["id"], "what are the Vega timeouts") is None
+
+
+# ---------------------------------------------------------------------------
+# Scope-partitioned quantities are complementary, and their false-positive cost
+# is quadratic rather than per-pair.
+#
+# "The Pyxis cluster runs 3 nodes in us-east-1." and "... 5 nodes in us-west-2."
+# are both permanently true, and the quantity trigger flagged them at 0.7929.
+# This is the same class as the accepted qualifier limitation, but it does not
+# cost one dismissal — it costs one per PAIR. Per-region, per-environment and
+# per-tenant quantities are among the most common shapes in infrastructure
+# memory, so N partitions of one metric means N(N-1)/2 dismissals, and adding a
+# region re-triggers against every existing one.
+#
+# Handled with the same kind of heuristic as the unit families: recognisable
+# scope vocabularies (cloud regions, environment names), not open-ended
+# semantics. Suppression requires BOTH sides to be scoped and to share no scope.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,expected", [
+    ("The Pyxis cluster runs 3 nodes in us-east-1.", {"us-east-1"}),
+    ("Helios runs 4 replicas in eu-west-1.", {"eu-west-1"}),
+    ("The checkout timeout in prod is 500ms.", {"prod"}),
+    ("The checkout timeout in staging is 2000ms.", {"staging"}),
+    # A deployment target names a specific thing; it does not partition a fact
+    # across environments, so it must not read as the environment "prod".
+    ("Helios deploys via Apollo to prod-checkout.", set()),
+    ("The Mira service retains audit logs for 30 days.", set()),
+])
+def test_scope_extraction(text, expected):
+    assert server._scope_tokens(text) == expected
+
+
+@pytest.mark.parametrize("label,a,b,expected", [
+    ("two regions", "3 nodes in us-east-1.", "5 nodes in us-west-2.", True),
+    ("two environments", "Timeout in prod is 500ms.", "Timeout in staging is 2000ms.", True),
+    ("same region", "3 nodes in us-east-1.", "5 nodes in us-east-1.", False),
+    ("same environment", "Timeout in prod is 500ms.", "Timeout in prod is 900ms.", False),
+    # Suppressing a one-sided scope would hide a correction that added the detail.
+    ("only one side scoped", "The timeout is 500ms.",
+     "The timeout in prod is now 900ms.", False),
+    ("neither scoped", "Retains logs for 30 days.", "Kept for one year.", False),
+    ("overlapping scopes", "3 nodes in us-east-1 and us-west-2.",
+     "5 nodes in us-east-1.", False),
+])
+def test_differently_scoped(label, a, b, expected):
+    assert server._differently_scoped(a, b) is expected, label
+
+
+@pytest.mark.parametrize("label,a,b,tags,query", [
+    ("per-region node counts",
+     "The Pyxis cluster runs 3 nodes in us-east-1.",
+     "The Pyxis cluster runs 5 nodes in us-west-2.",
+     ["pyxis", "capacity"], "how many nodes does the Pyxis cluster run"),
+    ("per-environment timeouts",
+     "The checkout request timeout in prod is 500 milliseconds.",
+     "The checkout request timeout in staging is 2000 milliseconds.",
+     ["checkout", "timeout"], "what is the checkout request timeout"),
+])
+def test_scope_partitioned_quantities_are_not_flagged(label, a, b, tags, query):
+    ma = server.memory_store.__wrapped__(content=a, tags=tags)
+    mb = server.memory_store.__wrapped__(content=b, tags=tags)
+    assert _flag_for(ma["id"], mb["id"], query) is None, label
+
+
+@pytest.mark.parametrize("label,a,b,tags,query", [
+    ("same region, different counts",
+     "The Pyxis cluster runs 3 nodes in us-east-1.",
+     "The Pyxis cluster runs 5 nodes in us-east-1.",
+     ["pyxis", "capacity"], "how many nodes does the Pyxis cluster run"),
+    ("same environment, different values",
+     "The checkout request timeout in prod is 500 milliseconds.",
+     "The checkout request timeout in prod is 900 milliseconds.",
+     ["checkout", "timeout"], "what is the checkout request timeout"),
+    ("a correction that ADDS the scope must still flag",
+     "The checkout timeout is 500 milliseconds.",
+     "The checkout timeout in prod is now 900 milliseconds.",
+     ["checkout", "timeout"], "what is the checkout timeout"),
+])
+def test_scope_suppression_does_not_hide_real_contradictions(label, a, b, tags, query):
+    ma = server.memory_store.__wrapped__(content=a, tags=tags)
+    mb = server.memory_store.__wrapped__(content=b, tags=tags)
+    assert _flag_for(ma["id"], mb["id"], query) is not None, label
+
+
+def test_cross_unit_size_contradiction_still_flags():
+    """Sizes normalise like durations: 512 MB and 2 GB are comparable."""
+    a = server.memory_store.__wrapped__(content="The Argo cache capacity is 512 MB.",
+                                        tags=["argo", "cache"])
+    b = server.memory_store.__wrapped__(content="The Argo cache capacity is 2 GB.",
+                                        tags=["argo", "cache"])
+    assert _flag_for(a["id"], b["id"], "what is the Argo cache capacity") is not None
+
+
+def test_scope_partitioned_facts_do_not_warn_at_write_time_either():
+    server.memory_store.__wrapped__(content="The Pyxis cluster runs 3 nodes in us-east-1.",
+                                    tags=["pyxis", "capacity"])
+    r = server.memory_store.__wrapped__(content="The Pyxis cluster runs 5 nodes in us-west-2.",
+                                        tags=["pyxis", "capacity"])
+    assert "potential_conflict_with" not in r
