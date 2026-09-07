@@ -1725,6 +1725,55 @@ def _restore_memory_relationships(conn: lb.Connection, memory_id: int, saved: di
         )
 
 
+def _recreate_memory_node(conn: lb.Connection, memory_id: int, *, content: str,
+                          category: str, tags: list[str], workspace: str,
+                          importance: int, access_count: int, created_at: float,
+                          embedding: list[float], now: Optional[float] = None,
+                          rels: Optional[dict] = None) -> None:
+    """THE single implementation of the delete + recreate dance.
+
+    LadybugDB cannot update an indexed embedding in place, so every content
+    change is a DETACH DELETE + CREATE that must carry identity, provenance
+    and edges across the gap. Three call sites (store dedup-merge, update
+    content branch, dream merge) used to carry private copies of this block,
+    and they drifted: dream zeroed access_count where the other two preserved
+    it. Callers now state access_count explicitly — store/update pass the
+    existing count through, dream passes the SUM of the merged members'
+    counts, because the survivor represents all of their usage.
+
+    `rels` is a pre-saved `_save_memory_relationships` bundle; when omitted
+    the live node's edges are saved here. Dream passes the deduped union of
+    every merged member's edges instead.
+
+    updated_at is always set to `now`: every caller is changing content, and
+    a recreate with unchanged content would reset ranking recency — the
+    restatement bug 0.15.0 fixed — so this helper deliberately offers no way
+    to express that.
+
+    The caller must have a non-None embedding in hand before calling; failure
+    semantics (abort the merge, error the update, skip the dream pair) belong
+    to the call sites.
+    """
+    now = time.time() if now is None else now
+    if rels is None:
+        rels = _save_memory_relationships(conn, memory_id)
+    conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;", {"id": memory_id})
+    conn.execute(
+        """CREATE (m:Memory {
+               id: $id, content: $content, content_hash: $hash,
+               category: $cat, tags: $tags, workspace: $ws, importance: $imp,
+               access_count: $ac, created_at: $ca, updated_at: $now,
+               embedding: $emb
+           });""",
+        {"id": memory_id, "content": content, "hash": _content_hash(content),
+         "cat": category, "tags": _format_tags(tags), "ws": workspace,
+         "imp": importance, "ac": access_count, "ca": created_at, "now": now,
+         "emb": embedding},
+    )
+    _ensure_topics(conn, memory_id, tags)
+    _restore_memory_relationships(conn, memory_id, rels)
+
+
 def _collect_results(result) -> list:
     """Collect all rows from a query result."""
     rows = []
@@ -2068,21 +2117,11 @@ def _store_one(conn, content: str, category: str, tags: list[str],
                             return {"status": "merge_aborted", "id": match_id,
                                     "message": "Embedding failed; merge aborted to preserve data."}
 
-                        saved_rels = _save_memory_relationships(conn, match_id)
-                        conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;", {"id": match_id})
-                        conn.execute(
-                            """CREATE (m:Memory {
-                                   id: $id, content: $content, content_hash: $hash,
-                                   category: $cat, tags: $tags, workspace: $ws, importance: $imp,
-                                   access_count: $ac, created_at: $ca, updated_at: $now,
-                                   embedding: $emb
-                               });""",
-                            {"id": match_id, "content": keep, "hash": _content_hash(keep),
-                             "cat": match_category, "tags": _format_tags(merged_tags), "ws": ws,
-                             "imp": new_imp, "ac": ac, "ca": ca, "now": now, "emb": new_emb},
-                        )
-                        _ensure_topics(conn, match_id, merged_tags)
-                        _restore_memory_relationships(conn, match_id, saved_rels)
+                        _recreate_memory_node(
+                            conn, match_id, content=keep, category=match_category,
+                            tags=merged_tags, workspace=ws, importance=new_imp,
+                            access_count=ac, created_at=ca, embedding=new_emb,
+                            now=now)
                     else:
                         # Content unchanged — absorb tags/importance in place and
                         # keep the existing embedding (no index rebuild needed).
@@ -3168,31 +3207,18 @@ def _update_one(conn, memory_id: int, content: Optional[str] = None,
     now = time.time()
 
     if content is not None:
-        new_hash = _content_hash(content)
         new_emb = embedding if embedding is not None else _embed(content)
         if new_emb is None:
             return {"status": "error", "id": memory_id,
                     "message": "Embedding generation failed; update aborted to preserve data."}
-        new_tags = _format_tags(tags) if tags is not None else r[4]
+        new_tags = tags if tags is not None else _parse_tags(r[4])
         new_imp = min(5, max(1, importance)) if importance is not None else r[5]
 
-        # Save and restore relationships across the delete + recreate
-        saved_rels = _save_memory_relationships(conn, memory_id)
-        conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;", {"id": memory_id})
-        conn.execute(
-            """CREATE (m:Memory {
-                   id: $id, content: $content, content_hash: $hash,
-                   category: $cat, tags: $tags, workspace: $ws, importance: $imp,
-                   access_count: $ac, created_at: $ca, updated_at: $now,
-                   embedding: $emb
-               });""",
-            {"id": memory_id, "content": content, "hash": new_hash,
-             "cat": r[3], "tags": new_tags, "ws": r[9] or WORKSPACE, "imp": new_imp,
-             "ac": r[6] or 0, "ca": r[7] or now, "now": now, "emb": new_emb},
-        )
-        parsed_tags = _parse_tags(new_tags)
-        _ensure_topics(conn, memory_id, parsed_tags)
-        _restore_memory_relationships(conn, memory_id, saved_rels)
+        _recreate_memory_node(
+            conn, memory_id, content=content, category=r[3], tags=new_tags,
+            workspace=r[9] or WORKSPACE, importance=new_imp,
+            access_count=r[6] or 0, created_at=r[7] or now, embedding=new_emb,
+            now=now)
     else:
         if importance is not None:
             conn.execute(
@@ -4676,7 +4702,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                 scan_result = conn.execute(
                     """MATCH (m:Memory)
                        RETURN m.id, m.content, m.tags, m.importance, m.embedding,
-                              m.created_at, m.category, m.workspace
+                              m.created_at, m.category, m.workspace, m.access_count
                        ORDER BY m.updated_at DESC LIMIT $limit;""",
                     {"limit": MAX_CONSOLIDATE_SCAN},
                 )
@@ -4697,6 +4723,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     created_at = mem[5]
                     category = mem[6] or "general"
                     mem_ws = mem[7] or WORKSPACE
+                    mem_ac = mem[8] or 0
 
                     if embedding is None:
                         continue
@@ -4710,7 +4737,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                                 """CALL QUERY_VECTOR_INDEX('Memory', 'memory_vec_idx', $query, $k)
                                    WITH node AS m, distance
                                    RETURN m.id, m.content, m.tags, m.importance, m.created_at,
-                                          m.category, m.workspace, distance;""",
+                                          m.category, m.workspace, distance, m.access_count;""",
                                 {"query": list(emb_), "k": 4},
                             )
                             return _collect_results(r_)
@@ -4808,11 +4835,13 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                             "content": other_content, "tags": _parse_tags(other_tags),
                             "importance": row[3], "created_at": row[4],
                             "category": row[5] or "general", "workspace": other_ws,
+                            "access_count": (row[8] if len(row) > 8 else 0) or 0,
                         }
                     node_info[mid] = {
                         "content": content, "tags": _parse_tags(tags),
                         "importance": importance, "created_at": created_at,
                         "category": category, "workspace": mem_ws,
+                        "access_count": mem_ac,
                     }
 
                 # --- Union-find over the passing pairs ---
@@ -4922,25 +4951,23 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                         if new_emb is None:
                             logger.warning(f"Dream merge skipped: embedding failed for memory {keep_id}")
                             continue
-                        conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;", {"id": keep_id})
-                        conn.execute(
-                            """CREATE (m:Memory {
-                                   id: $id, content: $content, content_hash: $hash,
-                                   category: $cat, tags: $tags, workspace: $ws,
-                                   importance: $imp, access_count: 0,
-                                   created_at: $created, updated_at: $now, embedding: $emb
-                               });""",
-                            {"id": keep_id, "content": keep["content"],
-                             "hash": _content_hash(keep["content"]),
-                             "cat": keep["category"], "tags": _format_tags(merged_tags),
-                             "ws": keep["workspace"], "imp": new_imp,
-                             "created": preserved_created, "now": now, "emb": new_emb},
-                        )
-                        _ensure_topics(conn, keep_id, merged_tags)
+                        # The survivor represents every member's usage, so it
+                        # carries the SUM of their access counts. (This path
+                        # used to zero it — the first observable drift between
+                        # the three recreate copies the shared helper replaced.)
+                        merged_ac = sum(node_info[i]["access_count"] for i in ids)
+                        # `combined` excludes edges to/from members, so the
+                        # restore inside the helper cannot recreate an edge to
+                        # a node the drop loop below is about to delete.
+                        _recreate_memory_node(
+                            conn, keep_id, content=keep["content"],
+                            category=keep["category"], tags=merged_tags,
+                            workspace=keep["workspace"], importance=new_imp,
+                            access_count=merged_ac, created_at=preserved_created,
+                            embedding=new_emb, now=now, rels=combined)
                         for drop_id in drop_ids:
                             conn.execute("MATCH (m:Memory {id: $id}) DETACH DELETE m;",
                                          {"id": drop_id})
-                        _restore_memory_relationships(conn, keep_id, combined)
 
                     for drop_id in drop_ids:
                         trivial_merged.append({
