@@ -197,3 +197,117 @@ def test_same_engine_does_not_rebuild():
         assert calls["n"] == 0, "matching signature must not touch the indexes"
     finally:
         server._ensure_vector_index = orig
+
+
+# --- census completeness boundary ---------------------------------------------
+#
+# The per-query census is complete only while the candidate pool covers the
+# corpus — beyond that it verifies a pool-sized slice, which is exactly the
+# regime long-lived memory grows into (at 5,000 memories a 100-pool checks 2%).
+# A partial check must not read as a complete one, and the FULL census (probe
+# with k = every embedded memory, valid at any corpus size) must run somewhere
+# that acts: dream, at most daily.
+
+
+def test_search_census_declares_incompleteness_when_pool_is_smaller(monkeypatch):
+    _seed(12)
+    monkeypatch.setattr(server, "SEARCH_CANDIDATE_POOL", 6)
+    out = server.memory_search.__wrapped__(query="diagnostics endpoint", top_k=2,
+                                           explain=True)
+    meta = out["explain_meta"]
+    assert meta["census_complete"] is False
+    assert meta["vector_census_expected"] == 0
+    # And crucially: no bogus degraded flag from an inapplicable comparison.
+    assert "degraded" not in out
+
+
+def test_search_census_declares_completeness_when_pool_covers_corpus():
+    _seed(12)
+    out = server.memory_search.__wrapped__(query="diagnostics endpoint", top_k=2,
+                                           explain=True)
+    assert out["explain_meta"]["census_complete"] is True
+
+
+def test_dream_full_census_reports_healthy_counts():
+    _seed(12)
+    out = server.memory_dream.__wrapped__(force=True)
+    assert out["vector_census"] == {"reachable": 12, "embedded": 12, "rebuilt": False}
+
+
+def test_dream_full_census_detects_and_repairs_partial_unreachability():
+    """The backstop must act at ANY corpus size, including past the pool."""
+    _seed(12)
+    conn = server.get_conn()
+    fake = _PartialIndex(conn, drop={3, 4, 5, 6})
+    fake.install()
+
+    out = server.memory_dream.__wrapped__(force=True)
+    census = out["vector_census"]
+    # Two layers can catch this: the self-recall audit (fires if the damage is
+    # visible to stored-embedding probes, as this simulation is) or the full
+    # census (fires regardless). Either way the run must END fully reachable.
+    assert census["rebuilt"] or out["index_rebuilt"], \
+        "no layer repaired the unreachable nodes"
+    assert census["reachable"] == census["embedded"] == 12, \
+        "the dream must not finish with unreachable memories"
+
+
+def test_dream_dry_run_census_reports_without_repairing():
+    _seed(12)
+    conn = server.get_conn()
+    fake = _PartialIndex(conn, drop={3, 4})
+    fake.install()
+
+    out = server.memory_dream.__wrapped__(force=True, dry_run=True)
+    census = out["vector_census"]
+    assert census["reachable"] == 10
+    assert census["rebuilt"] is False, "dry_run must not mutate the index"
+    assert fake.broken is True
+
+
+def test_dream_full_census_catches_audit_invisible_damage():
+    """The field shape: stored-embedding self-recall PASSES (the audit reads
+    index_self_misses: 0) while fresh query points miss nodes. Simulated by
+    dropping rows only from large-k probes (the census asks k=embedded; the
+    audit's merge probes ask k=4), so the audit sees a healthy index and the
+    census is the only layer that can fire."""
+    _seed(12)
+    conn = server.get_conn()
+
+    state = {"broken": True}
+    orig = conn.execute
+
+    def wrapper(query, *a, **k):
+        q = str(query)
+        if "CREATE_VECTOR_INDEX" in q.upper():
+            state["broken"] = False
+        result = orig(query, *a, **k)
+        params = a[0] if a else (k.get("parameters") or {})
+        big_k = isinstance(params, dict) and (params.get("k") or 0) >= 12
+        if state["broken"] and "QUERY_VECTOR_INDEX" in q.upper() and big_k:
+            rows = [r for r in server._collect_results(result) if r[0] not in {3, 4, 5}]
+
+            class _Fake:
+                def __init__(self, rows_):
+                    self._rows = list(rows_)
+                    self._i = 0
+
+                def has_next(self):
+                    return self._i < len(self._rows)
+
+                def get_next(self):
+                    row = self._rows[self._i]
+                    self._i += 1
+                    return row
+
+            return _Fake(rows)
+        return result
+
+    conn.execute = wrapper
+
+    out = server.memory_dream.__wrapped__(force=True)
+    assert out["index_self_misses"] == 0, \
+        "precondition: the audit must be blind to this damage, as in the field"
+    census = out["vector_census"]
+    assert census["rebuilt"] is True, "the census is the only layer that can fire here"
+    assert census["reachable"] == census["embedded"] == 12

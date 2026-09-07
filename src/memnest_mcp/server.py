@@ -2996,6 +2996,11 @@ def memory_search(
             # hits < expected after repair = the index STILL has unreachable
             # nodes; run memory_reindex() and check library versions.
             "vector_census_expected": _census_expected,
+            # The per-query census is complete only while the candidate pool
+            # covers the corpus. Beyond that it verifies a pool-sized slice,
+            # and this flag keeps a partial check from reading as a complete
+            # one — the full census runs in memory_stats and at every dream.
+            "census_complete": bool(_census_expected),
             "candidates_scored": len(raw_scores),
             "superseded_penalty": SUPERSEDED_PENALTY,
         }
@@ -4993,6 +4998,39 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
         if not dry_run and memories_after > 0:
             fts_rebuilt = _rebuild_fts_index(conn).get("rebuilt", False)
 
+        # FULL vector census — the completeness backstop for the per-query one.
+        # The search-time census verifies the whole corpus only while the
+        # candidate pool (default 100) covers it, which is exactly the regime
+        # long-lived memory outgrows: at 5,000 memories the fast path checks a
+        # 2% slice. This probe asks the index for k = every embedded memory,
+        # so reachable < embedded is proof of unreachable nodes at ANY corpus
+        # size. Dream runs at most daily, making this the cadence guarantee;
+        # it detects AND repairs, where memory_stats only reports.
+        vector_census: dict = {}
+        if memories_after > 0:
+            try:
+                emb_total = _collect_results(conn.execute(
+                    "MATCH (m:Memory) WHERE m.embedding IS NOT NULL RETURN COUNT(m);"
+                ))[0][0] or 0
+                reachable = _probe_vector_index(conn, k=max(1, emb_total)) or 0
+                census_rebuilt = False
+                if emb_total and reachable < emb_total and not dry_run:
+                    logger.error(
+                        f"Full vector census: {reachable} of {emb_total} embedded "
+                        f"memories reachable. Rebuilding memory_vec_idx..."
+                    )
+                    state = _ensure_vector_index(conn, force_rebuild=True)
+                    census_rebuilt = bool(state.get("rebuilt"))
+                    if census_rebuilt:
+                        reachable = _probe_vector_index(conn, k=max(1, emb_total)) or 0
+                vector_census = {
+                    "reachable": reachable,
+                    "embedded": emb_total,
+                    "rebuilt": census_rebuilt,
+                }
+            except Exception as e:
+                logger.debug(f"Full vector census failed: {e}")
+
         # --- Phase 4: SCC contradiction detection on SUPERSEDES subgraph ---
         contradictions = []
         if not dry_run:
@@ -5037,6 +5075,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "index_self_misses": index_self_misses,
             "index_rebuilt": index_rebuilt_by_audit,
             "fts_rebuilt": fts_rebuilt,
+            "vector_census": vector_census,
             "memories_after": memories_after,
             "clusters_for_review": clusters,
             "contradictions": contradictions,
