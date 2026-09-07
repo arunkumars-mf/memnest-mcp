@@ -2387,7 +2387,10 @@ def memory_search(
     # long-lived DB, with index_self_misses reading 0 throughout. vector_hits
     # sat at 26 on every query; this comparison would have flagged it on the
     # first search.
-    _census_expected = 0
+    # None = census not applicable (pool smaller than corpus, or no vector
+    # channel). Deliberately not 0, which is a legal count and read as
+    # "expected zero reachable" in the field.
+    _census_expected = None
     if embedding is not None and _count_memories(conn) > 0:
         try:
             _total_embedded = _collect_results(conn.execute(

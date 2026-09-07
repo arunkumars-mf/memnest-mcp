@@ -216,7 +216,9 @@ def test_search_census_declares_incompleteness_when_pool_is_smaller(monkeypatch)
                                            explain=True)
     meta = out["explain_meta"]
     assert meta["census_complete"] is False
-    assert meta["vector_census_expected"] == 0
+    # None, not 0: zero is a legal count and read in the field as "expected
+    # zero reachable" rather than "not applicable".
+    assert meta["vector_census_expected"] is None
     # And crucially: no bogus degraded flag from an inapplicable comparison.
     assert "degraded" not in out
 
