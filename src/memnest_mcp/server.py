@@ -208,6 +208,10 @@ GRAPH_EXPAND_LIMIT = int(os.environ.get("MEMORY_GRAPH_EXPAND_LIMIT", "5"))
 # hop-decay ordering keeps direct neighbours ahead of distant ones. Depth is
 # clamped to 4: beyond that everything connects to everything.
 GRAPH_EXPAND_HOPS = min(4, max(1, int(os.environ.get("MEMORY_GRAPH_EXPAND_HOPS", "2"))))
+# Per-hop discount on a neighbour's relevance when competing for `related`
+# slots: selection_score = cosine(query, neighbour) * DECAY^(hops-1). At 0.7 a
+# 2-hop neighbour needs ~1.4x the relevance of a 1-hop one to outrank it.
+GRAPH_EXPAND_HOP_DECAY = float(os.environ.get("MEMORY_GRAPH_EXPAND_HOP_DECAY", "0.7"))
 # A seed must score at least this fraction of the top result to expand from.
 # Weak hits are coincidences and their neighbours are noise.
 GRAPH_EXPAND_MIN_RATIO = float(os.environ.get("MEMORY_GRAPH_EXPAND_MIN_RATIO", "0.6"))
@@ -2801,27 +2805,57 @@ def memory_search(
                 raise StopIteration  # nothing confident enough to expand from
             returned = {r["id"] for r in results}
 
-            # Variable-length traversal, ordered by hop distance. 1-hop-only
-            # missed exactly the connections the graph exists to record: on the
-            # measured corpus, "what deprecated infrastructure does checkout
-            # depend on?" needed checkout -> payments-core -> ledger-db — two
-            # hops — and the answer never surfaced. min(length(p)) gives each
-            # neighbour its SHORTEST distance to any seed, so direct neighbours
-            # always outrank transitive ones and a memory reachable both ways
-            # counts as direct. (Personalized PageRank would be the textbook
-            # tool, but the engine's PAGE_RANK has no source-node support —
-            # probed: `sourceNodes` is rejected — and hop decay is the honest
-            # cheap substitute. Workspace filter on the endpoint keeps another
-            # project's memories out of the walk.)
+            # Variable-length traversal. 1-hop-only missed exactly the
+            # connections the graph exists to record: on the measured corpus,
+            # "what deprecated infrastructure does checkout depend on?" needed
+            # checkout -> payments-core -> ledger-db — two hops — and the
+            # answer never surfaced. min(length(p)) gives each neighbour its
+            # SHORTEST distance to any seed. (Personalized PageRank would be
+            # the textbook tool, but the engine's PAGE_RANK has no source-node
+            # support — probed: `sourceNodes` is rejected. Workspace filter on
+            # the endpoint keeps another project's memories out of the walk.)
             r = conn.execute(
                 f"""MATCH p = (s:Memory)-[:RELATED_TO|SUPERSEDES|EXPLAINS*1..{GRAPH_EXPAND_HOPS}]-(n:Memory)
                    WHERE s.id IN $seeds AND NOT n.id IN $returned
                      AND n.workspace IN ['', $ws]
-                   RETURN n.id, n.content, min(length(p)) AS hops, min(s.id) AS seed
+                   RETURN n.id, n.content, min(length(p)) AS hops, min(s.id) AS seed,
+                          n.embedding
                    ORDER BY hops ASC, n.id ASC;""",
                 {"seeds": seeds, "returned": list(returned), "ws": WORKSPACE},
             )
-            for row in _collect_results(r):
+            candidates = _collect_results(r)
+
+            # Selection is by HOP-DECAYED RELEVANCE, not raw distance. Pure
+            # distance ordering starved deeper hops of the capped slots and
+            # broke ties arbitrarily — measured on the corpus this feature was
+            # built for: four 1-hop neighbours filled the list, and of the two
+            # equal-distance 2-hop candidates the slot went to an ownership
+            # fact rather than the deprecation that ANSWERED the query, purely
+            # by id order. The query embedding is already computed and every
+            # candidate's embedding is stored, so relevance costs one dot
+            # product per candidate:
+            #
+            #   selection_score = cosine(query, candidate) * DECAY^(hops-1)
+            #
+            # A relevant 2-hop memory can therefore beat an irrelevant 1-hop
+            # one (which per-hop quotas cannot express), while the decay keeps
+            # equal-relevance neighbours in distance order. Fall back to plain
+            # distance when the query has no embedding (degraded mode) or a
+            # candidate lacks one.
+            def _sel_score(row):
+                hops = row[2] or 1
+                emb = row[4] if len(row) > 4 else None
+                if embedding is None or not emb:
+                    return (0.0, -hops)
+                dot = sum(x * y for x, y in zip(embedding, emb))
+                na = sum(x * x for x in embedding) ** 0.5
+                nb = sum(y * y for y in emb) ** 0.5
+                cos = (dot / (na * nb)) if na and nb else 0.0
+                return (max(0.0, cos) * (GRAPH_EXPAND_HOP_DECAY ** (hops - 1)), -hops)
+
+            candidates.sort(key=lambda row: (_sel_score(row), -row[0]), reverse=True)
+
+            for row in candidates[:GRAPH_EXPAND_LIMIT]:
                 entry = {
                     "id": row[0],
                     "content": _truncate(row[1], preview_chars),
@@ -2832,8 +2866,6 @@ def memory_search(
                     # connection the agent could not see from any single edge.
                     entry["hops"] = row[2]
                 related.append(entry)
-                if len(related) >= GRAPH_EXPAND_LIMIT:
-                    break
         except StopIteration:
             pass  # no seed cleared the relevance floor
         except Exception as e:

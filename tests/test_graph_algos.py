@@ -176,13 +176,59 @@ def test_related_reaches_two_hops_with_hop_annotation():
         "the two-hop deprecation must surface, annotated"
 
 
-def test_related_orders_by_hop_distance():
-    _seed_chain()
+def test_related_selection_is_hop_decayed_relevance():
+    """Distance-only ordering starved deeper hops of the capped slots and broke
+    equal-distance ties by id. Reported shape: four 1-hop neighbours filled the
+    list, and of two 2-hop candidates the slot went to an ownership fact rather
+    than the deprecation that ANSWERED the query. Selection is now
+    cosine(query, candidate) * DECAY^(hops-1), so the answer must win the
+    contested slot even when the noise has the smaller id."""
+    store = server.memory_store.__wrapped__
+    relate = server.memory_relate.__wrapped__
+    checkout = store(content="Helios checkout depends on payments-core for authorisation.",
+                     tags=["helios", "deps"])["id"]
+    one_hop = []
+    for text, tg in [
+        ("INC-4400: a ledger-db failover caused twelve minutes of checkout errors.",
+         ["helios", "incident"]),
+        ("The payments-core service depends on the ledger-db cluster.",
+         ["payments", "deps"]),
+        ("Helios checkout also depends on inventory-cache for stock lookups.",
+         ["helios", "deps"]),
+        ("The fintech-infra team operates the checkout escalation rota.",
+         ["fintech", "ownership"]),
+    ]:
+        mid = store(content=text, tags=tg)["id"]
+        one_hop.append(mid)
+        relate(from_id=checkout, to_id=mid, relationship="RELATED_TO")
+    pcore = one_hop[1]
+    # Noise stored FIRST (smaller id): the old (hops, id) ordering picked it.
+    noise = store(content="The payments-core service is owned by Marcus Webb's team.",
+                  tags=["payments", "ownership"])["id"]
+    answer = store(content="The ledger-db cluster is deprecated and will be decommissioned in Q2 2026.",
+                   tags=["ledger", "lifecycle"])["id"]
+    relate(from_id=pcore, to_id=noise, relationship="RELATED_TO")
+    relate(from_id=pcore, to_id=answer, relationship="RELATED_TO")
+
     out = server.memory_search.__wrapped__(
-        query="What deprecated infrastructure does the Helios checkout flow depend on?",
+        query="What deprecated infrastructure does the Helios checkout flow "
+              "transitively depend on?",
         top_k=1)
-    hops = [r.get("hops", 1) for r in out.get("related", [])]
-    assert hops == sorted(hops)
+    ids = [r["id"] for r in out.get("related", [])]
+    assert answer in ids, "the 2-hop answer was starved out of the capped list"
+    assert noise not in ids, "the irrelevant equal-distance candidate took the slot"
+
+
+def test_related_falls_back_to_hop_order_without_a_query_embedding(monkeypatch):
+    """Degraded mode has no relevance signal; distance ordering must still work."""
+    _seed_chain()
+    monkeypatch.setattr(server, "_embed", lambda t: None)
+    out = server.memory_search.__wrapped__(
+        query="ledger-db deprecated checkout", top_k=1)
+    related = out.get("related", [])
+    assert related, "expected FTS-ranked results to still expand"
+    hops = [r.get("hops", 1) for r in related]
+    assert hops == sorted(hops), "fallback should preserve distance ordering"
 
 
 def test_related_walk_respects_workspace():
