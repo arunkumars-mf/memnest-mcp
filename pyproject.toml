@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memnest-mcp"
-version = "0.20.1"
+version = "0.21.0"
 description = "Persistent graph memory MCP server for AI agents using LadybugDB"
 readme = "README.md"
 license = "MIT"
@@ -23,7 +23,11 @@ classifiers = [
 dependencies = [
     "mcp>=1.0.0,<2",
     "fastembed>=0.3.0",
-    "real-ladybug>=0.15.0",
+    # Upper bound is deliberate: the engine persists index structures inside
+    # the database file, and two field incidents traced to indexes built by an
+    # older engine being read by a newer one. Minor bumps are taken explicitly,
+    # with the engine-signature stamp rebuilding indexes on first connect.
+    "real-ladybug>=0.15.0,<0.16",
 ]
 
 [project.optional-dependencies]

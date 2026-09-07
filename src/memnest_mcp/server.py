@@ -678,6 +678,17 @@ def get_conn() -> lb.Connection:
         pass
 
     _init_schema(_conn)
+    # Rebuild indexes when the ENGINE changed underneath this database file.
+    # The dependency is an open range (real-ladybug>=0.15.0) and clients run
+    # `uvx memnest-mcp@latest`, so every release can silently swap the engine
+    # under a persistent DB whose HNSW graph and BM25 statistics were built by
+    # an older one. Both index types have now degraded in the field in exactly
+    # this situation, in separate events, with every health probe reading
+    # green — churn alone (~370 delete/recreate cycles) does NOT reproduce
+    # either, so version drift is the prime trigger. Content and edges are
+    # transactional data; indexes are DERIVED state, cheap to rebuild and not
+    # worth trusting across an engine swap.
+    _rebuild_indexes_on_engine_change(_conn)
     # Repair a stale HNSW index before serving any query, otherwise semantic
     # search silently degrades to keyword-only for the whole session.
     global _vector_index_state
@@ -1166,6 +1177,56 @@ def _semantically_linked(conn: lb.Connection, a: int, b: int) -> Optional[str]:
         except Exception:
             pass
     return None
+
+
+def _engine_signature() -> str:
+    """Identity of the engine that builds/reads the index structures."""
+    lib = getattr(lb, "__version__", "unknown")
+    storage = getattr(lb, "storage_version", None)
+    try:
+        storage = storage() if callable(storage) else storage
+    except Exception:
+        storage = "unknown"
+    return f"{lib}/{storage}"
+
+
+def _rebuild_indexes_on_engine_change(conn: lb.Connection) -> Optional[str]:
+    """Drop and recreate both search indexes if the engine version changed.
+
+    Returns the previous signature when a rebuild happened, else None. A brand
+    new database just records the signature — its indexes were built by the
+    current engine moments ago.
+    """
+    sig = _engine_signature()
+    stored = None
+    try:
+        r = conn.execute("MATCH (s:SchemaMeta {key: 'engine_sig'}) RETURN s.value;")
+        if r.has_next():
+            stored = r.get_next()[0]
+    except Exception as e:
+        logger.debug(f"Engine signature read failed: {e}")
+        return None
+
+    if stored == sig:
+        return None
+
+    if stored is not None:
+        logger.warning(
+            f"Engine changed under this database ({stored} -> {sig}); rebuilding "
+            f"search indexes built by the previous engine."
+        )
+        _rebuild_fts_index(conn)
+        _ensure_vector_index(conn, force_rebuild=True)
+
+    try:
+        conn.execute("MATCH (s:SchemaMeta {key: 'engine_sig'}) DETACH DELETE s;")
+    except Exception:
+        pass
+    try:
+        conn.execute("CREATE (:SchemaMeta {key: 'engine_sig', value: $v});", {"v": sig})
+    except Exception as e:
+        logger.debug(f"Engine signature write failed: {e}")
+    return stored
 
 
 def _probe_vector_index(conn: lb.Connection, k: int = 1) -> Optional[int]:
@@ -2311,24 +2372,60 @@ def memory_search(
             logger.error(f"Vector search failed (semantic channel disabled): {e}")
         return len(vector_hits)
 
+    # Census expectation. When the candidate pool covers the whole corpus, a
+    # healthy HNSW index must return EVERY embedded memory for ANY query —
+    # cosine distance is defined for all vector pairs, so nothing can be "too
+    # far" to appear in a window bigger than the corpus. vector_hits below the
+    # workspace-visible embedded count is therefore a COMPLETE reachability
+    # check, free, on every search.
+    #
+    # This exists because every narrower invariant has produced a false
+    # negative during a real failure: k=1 probes (index answers), FTS term
+    # probes (matches rare terms), and stored-embedding self-recall — which
+    # trivially returns the query point even on a broken graph. The field
+    # event: 12 of 38 memories unreachable from FRESH-TEXT query points on a
+    # long-lived DB, with index_self_misses reading 0 throughout. vector_hits
+    # sat at 26 on every query; this comparison would have flagged it on the
+    # first search.
+    _census_expected = 0
     if embedding is not None and _count_memories(conn) > 0:
+        try:
+            _total_embedded = _collect_results(conn.execute(
+                "MATCH (m:Memory) WHERE m.embedding IS NOT NULL RETURN COUNT(m);"
+            ))[0][0] or 0
+            if _pool >= _total_embedded:
+                if global_search:
+                    _census_expected = _total_embedded
+                else:
+                    _census_expected = _collect_results(conn.execute(
+                        """MATCH (m:Memory)
+                           WHERE m.embedding IS NOT NULL AND m.workspace IN ['', $ws]
+                           RETURN COUNT(m);""",
+                        {"ws": WORKSPACE},
+                    ))[0][0] or 0
+        except Exception as e:
+            logger.debug(f"Census count failed: {e}")
+
         _run_vector_channel()
 
-        # Repair on use. A healthy HNSW index always returns the k nearest
-        # neighbours for any query — cosine distance is defined for every
-        # vector pair, so even nonsense queries match something. Zero rows
-        # while embeddings exist therefore means the index is broken, not that
-        # nothing was similar. That makes this signal safe to act on.
-        #
-        # The connection-time check alone is not enough: a server can run for
-        # days, and an index that goes stale mid-session would otherwise serve
-        # keyword-only results until restart.
-        if not vector_hits and _index_repair_allowed():
+        # Repair on use. Zero rows while embeddings exist means the index is
+        # broken; a census shortfall means it is PARTIALLY broken — some nodes
+        # exist in storage but are unreachable from fresh query points. Both
+        # are unambiguous (see above), so both trigger the budgeted rebuild.
+        _census_short = _census_expected and len(vector_hits) < _census_expected
+        if (not vector_hits or _census_short) and _index_repair_allowed():
+            if _census_short:
+                logger.error(
+                    f"Vector census shortfall: {len(vector_hits)} of "
+                    f"{_census_expected} reachable memories returned — the HNSW "
+                    f"graph has unreachable nodes. Rebuilding..."
+                )
             _note_index_repair_attempt()
-            state = _ensure_vector_index(conn)
+            state = _ensure_vector_index(conn, force_rebuild=bool(_census_short))
             if state.get("rebuilt"):
                 global _vector_index_state
                 _vector_index_state = state
+                vector_hits.clear()
                 if _run_vector_channel():
                     _note_index_repair_success()
                     logger.info("Search recovered after automatic index rebuild")
@@ -2896,6 +2993,9 @@ def memory_search(
             # and how many candidates survived the filter.
             "candidate_pool": _pool,
             "vector_hits": len(vector_hits),
+            # hits < expected after repair = the index STILL has unreachable
+            # nodes; run memory_reindex() and check library versions.
+            "vector_census_expected": _census_expected,
             "candidates_scored": len(raw_scores),
             "superseded_penalty": SUPERSEDED_PENALTY,
         }
@@ -2906,6 +3006,13 @@ def memory_search(
             "without embeddings, or the HNSW index is stale. Call memory_stats() and "
             "check runtime.embeddings / runtime.vector_index, then run "
             "memory_reindex() to rebuild the index."
+        )
+    elif _census_expected and len(vector_hits) < _census_expected:
+        out["degraded"] = (
+            f"Semantic search reached only {len(vector_hits)} of {_census_expected} "
+            f"memories — the vector index has unreachable nodes and automatic repair "
+            f"did not restore them (budget spent, or rebuild ineffective). Results may "
+            f"omit relevant memories. Run memory_reindex()."
         )
 
     # Wrap in a key so TOON can recognize the uniform array
@@ -3663,8 +3770,21 @@ def memory_stats() -> str:
     # probe that errored and one that returned no rows — from search's point of
     # view those are the same failure.
     vector_index_live: Optional[bool] = None
+    vector_reachable: Optional[int] = None
+    embedded_total = 0
     if total > 0:
-        probe = _probe_vector_index(conn)
+        try:
+            r = conn.execute(
+                "MATCH (m:Memory) WHERE m.embedding IS NOT NULL RETURN COUNT(m);")
+            if r.has_next():
+                embedded_total = r.get_next()[0] or 0
+        except Exception:
+            pass
+        # Census, not a k=1 liveness poke: ask for the whole corpus and count
+        # what comes back. k=1 said "the index answers" while 12 of 38 memories
+        # were unreachable; reachable < embedded is the actual failure shape.
+        probe = _probe_vector_index(conn, k=max(1, embedded_total))
+        vector_reachable = probe
         vector_index_live = probe is not None and probe > 0
 
     # Dream state — useful for hooks deciding whether to trigger consolidation
@@ -3701,13 +3821,26 @@ def memory_stats() -> str:
                 # is what search actually depends on — so probe the query path.
                 "stored_ok": missing_embeddings == 0,
                 "index_returns_rows": vector_index_live,
-                "healthy": missing_embeddings == 0 and vector_index_live is not False,
+                "healthy": (
+                    missing_embeddings == 0
+                    and vector_index_live is not False
+                    and (vector_reachable is None or vector_reachable >= embedded_total)
+                ),
                 "queryable": vector_index_live,
             },
             "vector_index": {
                 **(_vector_index_state or {"status": "unknown"}),
                 "repair_attempts": _index_repair_attempts,
+                # reachable < embedded means the HNSW graph has nodes fresh
+                # queries cannot reach — run memory_reindex().
+                "reachable": vector_reachable,
+                "embedded": embedded_total,
+                "fully_reachable": (
+                    None if vector_reachable is None
+                    else vector_reachable >= embedded_total
+                ),
             },
+            "engine": _engine_signature(),
             # answering=True means the index matches a term drawn from real
             # content. CAVEAT: this cannot prove BM25 scoring is sound — the
             # observed field failure passed every such probe and only misfired
@@ -4527,17 +4660,17 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
 
                     probe_rows = _merge_probe(embedding)
 
-                    # Self-recall audit. A healthy HNSW index queried with a
-                    # memory's OWN embedding must return that memory (distance
-                    # ~0 beats every other vector). A miss means the index has
-                    # PARTIAL recall degradation: it still returns rows, so the
-                    # zero-rows self-heal in search/dedup never fires, yet some
-                    # memories are unreachable from some query points. Observed
-                    # on a long-lived DB: a memory absent from results for a
-                    # query it answered at 0.74, while still reachable via its
-                    # own wording — and dedup/conflict-protection silently
-                    # blind to the missing partner. Dream probes every memory
-                    # anyway, so the audit is free; rebuild once and rescan.
+                    # Self-recall audit — with a known blind spot. Querying
+                    # with a memory's STORED embedding must return that memory,
+                    # so a miss is proof of damage. But the converse failed in
+                    # the field: an index with 12 of 38 memories unreachable
+                    # from FRESH-TEXT query points passed this audit (the
+                    # stored vector IS the query point, so HNSW returns it
+                    # trivially even on a broken graph) while index_self_misses
+                    # read 0. The census check in memory_search — vector_hits
+                    # vs the embedded count — is the complete detector; this
+                    # audit stays because dream probes every memory anyway and
+                    # a hit here is unambiguous.
                     if not dry_run and (
                         probe_rows is None or mid not in {r[0] for r in probe_rows}
                     ):

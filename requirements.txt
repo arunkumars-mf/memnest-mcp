@@ -3,4 +3,4 @@
 # this file is kept for tooling that pre-dates pyproject.toml.
 mcp>=1.0.0,<2
 fastembed>=0.3.0
-real-ladybug>=0.15.0
+real-ladybug>=0.15.0,<0.16

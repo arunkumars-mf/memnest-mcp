@@ -324,7 +324,7 @@ def test_repair_budget_prevents_rebuild_storm(monkeypatch):
 
     # Simulate a rebuild that never succeeds
     monkeypatch.setattr(server, "_ensure_vector_index",
-                        lambda c: {"status": "rebuild_failed", "rebuilt": False})
+                        lambda c, force_rebuild=False: {"status": "rebuild_failed", "rebuilt": False})
     monkeypatch.setattr(server, "INDEX_REPAIR_COOLDOWN_S", 0.0)
 
     for _ in range(6):
@@ -363,7 +363,7 @@ def test_stats_exposes_repair_attempts():
 
     # Make the rebuild itself fail so the attempt is not reset by success.
     original = server._ensure_vector_index
-    server._ensure_vector_index = lambda c: {"status": "error", "rebuilt": False}
+    server._ensure_vector_index = lambda c, force_rebuild=False: {"status": "error", "rebuilt": False}
     try:
         _search("classifier retraining schedule")
         vi = server.memory_stats.__wrapped__()["runtime"]["vector_index"]
