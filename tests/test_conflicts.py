@@ -176,6 +176,86 @@ def test_review_clusters_state_the_available_resolutions():
         assert "supersedes" in clusters[0]["resolution"]
 
 
+# --- Review clusters only carry pairs that still need a DECISION -------------
+#
+# Field observation (0.24.1): a dream run offered 5 clusters, 4 of which were
+# pairs the merge gates had deliberately kept apart — so the agent's correct
+# answer for most of the list was "leave separate, this was already handled",
+# and it had been told so at write time. Re-offering permanent verdicts every
+# dream trains an agent to skim the list.
+#
+# The cut is by whether the verdict is PERMANENT, not by whether it was warned:
+#   different subject        -> separate forever  -> drop
+#   disjoint scope           -> separate forever  -> drop
+#   same-subject value clash -> UNRESOLVED        -> keep, labelled
+# The last is the one worth attention: the gate refused to merge (correct — a
+# merge would destroy a value) but one of the pair is stale and wants an edge.
+
+def _unlinked_pair(a, b, tags_a, tags_b):
+    """Store a near-identical pair around write-time dedup, then unlink."""
+    r1 = server.memory_store.__wrapped__(content=a, tags=tags_a)
+    r2 = server.memory_store.__wrapped__(content=b, tags=tags_b, supersedes=r1["id"])
+    if r2.get("status") == "stored_new":
+        server.memory_unrelate.__wrapped__(from_id=r2["id"], to_id=r1["id"],
+                                          relationship="SUPERSEDES")
+    return r1["id"], r2["id"]
+
+
+def _filler(n=24):
+    server.memory_store.__wrapped__(items=[
+        {"content": f"Filler note {i} on unrelated capacity planning {i}.",
+         "tags": [f"filler{i}"]} for i in range(n)])
+
+
+def _review_ids(res):
+    ids = set()
+    for c in res.get("clusters_for_review") or []:
+        ids.add(c["anchor"]["id"])
+        ids |= {m["id"] for m in c["similar"]}
+    return ids
+
+
+def test_review_keeps_unresolved_value_conflicts_and_labels_them():
+    a, b = _unlinked_pair(
+        "The Nunki service request timeout is set to 500ms.",
+        "The Nunki service request timeout is set to 900ms.",
+        ["nunki", "timeout"], ["nunki", "timeout"])
+    _filler()
+
+    res = server.memory_dream.__wrapped__(force=True, dry_run=True)
+    assert {a, b} <= _review_ids(res), \
+        "a same-subject value contradiction is unresolved and must be reviewable"
+    labelled = [m for c in res["clusters_for_review"] for m in c["similar"]
+                if m.get("gate") == "value_conflict"]
+    assert labelled, "the contradiction must be labelled, not left as a lookalike"
+    assert "supersedes" in labelled[0]["note"].lower(), \
+        "the label should point at the non-destructive resolution"
+
+
+def test_review_drops_cross_subject_lookalikes():
+    a, b = _unlinked_pair(
+        "Runbook for the Unukalhai service: drain, patch, verify, restore.",
+        "Runbook for the Alphecca service: drain, patch, verify, restore.",
+        ["unukalhai"], ["alphecca"])
+    _filler()
+
+    res = server.memory_dream.__wrapped__(force=True, dry_run=True)
+    assert not ({a, b} <= _review_ids(res)), \
+        "different subjects stay separate forever — re-offering them is noise"
+
+
+def test_review_drops_differently_scoped_pairs():
+    a, b = _unlinked_pair(
+        "The Wezen cache holds 40 GB in us-east-1.",
+        "The Wezen cache holds 80 GB in us-west-2.",
+        ["wezen", "cache"], ["wezen", "cache"])
+    _filler()
+
+    res = server.memory_dream.__wrapped__(force=True, dry_run=True)
+    assert not ({a, b} <= _review_ids(res)), \
+        "per-region facts are both current — not a duplicate to resolve"
+
+
 # --- Subject gate on destructive merges --------------------------------------
 #
 # Store-time dedup (>=0.92) and dream auto-merge (>=0.95) are the two paths that

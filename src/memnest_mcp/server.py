@@ -5079,7 +5079,8 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             try:
                 scan_result = conn.execute(
                     """MATCH (m:Memory)
-                       RETURN m.id, m.content, m.importance, m.embedding, m.workspace
+                       RETURN m.id, m.content, m.importance, m.embedding, m.workspace,
+                              m.tags
                        ORDER BY m.updated_at DESC LIMIT $limit;""",
                     {"limit": MAX_CONSOLIDATE_SCAN},
                 )
@@ -5096,9 +5097,10 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     result = conn.execute(
                         """CALL QUERY_VECTOR_INDEX('Memory', 'memory_vec_idx', $query, $k)
                            WITH node AS m, distance
-                           RETURN m.id, m.content, distance, m.workspace;""",
+                           RETURN m.id, m.content, distance, m.workspace, m.tags;""",
                         {"query": list(embedding), "k": 6},
                     )
+                    anchor_tags = _parse_tags(mem[5]) if len(mem) > 5 else []
                     cluster_members = []
                     for row in _collect_results(result):
                         sim = round(1.0 - row[2], 4)
@@ -5119,7 +5121,42 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                                 protected_pairs += 1
                                 visited_clusters.add(row[0])
                                 continue
-                            cluster_members.append({"id": row[0], "preview": _truncate(row[1], 100), "similarity": sim})
+
+                            # Review is for pairs where an agent still has a
+                            # DECISION to make. The merge gates already know
+                            # which pairs those are, and two of their verdicts
+                            # are permanent: different subjects, and disjoint
+                            # scopes (us-east-1 vs us-west-2) stay separate
+                            # forever. Re-offering those every dream trains an
+                            # agent to skim a list whose right answer is
+                            # usually "leave separate" — and it had already
+                            # been told at write time.
+                            #
+                            # A same-subject VALUE CONFLICT is the opposite: the
+                            # gate refused to merge (correct, merging destroys a
+                            # value) but the contradiction is unresolved — one
+                            # of the two is stale and wants a SUPERSEDES edge.
+                            # Those stay, labelled, because they are the ones
+                            # worth an agent's attention.
+                            other_tags = _parse_tags(row[4]) if len(row) > 4 else []
+                            if not _same_subject(anchor_tags, other_tags):
+                                distinct_subject_skips += 1
+                                visited_clusters.add(row[0])
+                                continue
+                            if _differently_scoped(content, row[1]):
+                                visited_clusters.add(row[0])
+                                continue
+
+                            member = {"id": row[0], "preview": _truncate(row[1], 100),
+                                      "similarity": sim}
+                            if _values_conflict(content, row[1]):
+                                member["gate"] = "value_conflict"
+                                member["note"] = (
+                                    "same subject, disagreeing values — one is "
+                                    "probably stale; prefer memory_relate("
+                                    "SUPERSEDES) over merging"
+                                )
+                            cluster_members.append(member)
                             visited_clusters.add(row[0])
 
                     if cluster_members:
@@ -5127,11 +5164,13 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                         clusters.append({
                             "anchor": {"id": mid, "preview": _truncate(content, 100), "importance": importance},
                             "similar": cluster_members,
-                            # None of these are edge-linked (linked pairs were
-                            # filtered above), so each is one of: a true
-                            # duplicate to merge, OR competing versions that
-                            # need a SUPERSEDES edge, OR distinct facts that
-                            # merely read alike. The agent must decide which.
+                            # Every member here is same-subject, same-scope and
+                            # unlinked — the permanent-verdict pairs were
+                            # filtered above. So each is: a true duplicate to
+                            # merge, OR competing versions needing a SUPERSEDES
+                            # edge, OR distinct facts that merely read alike.
+                            # Members carrying gate="value_conflict" are the
+                            # unresolved contradictions; start with those.
                             "resolution": "merge_duplicate | link_with_supersedes | leave_separate",
                         })
                         if len(clusters) >= MAX_CONSOLIDATE_CLUSTERS:
