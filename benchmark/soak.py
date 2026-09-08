@@ -208,6 +208,24 @@ def main():
         track.deleted(len(res.get("deleted", victims)))
         track.ids -= set(victims)
 
+        # transient burst: store a batch, then delete exactly that batch.
+        # This is the pattern that progressively orphans SURVIVING nodes in
+        # the HNSW graph (engine 0.15.3; see docs/upstream/
+        # ladybug-hnsw-delete-churn-unreachable.md) — the census invariant
+        # below is what catches it if the post-delete repair ever regresses.
+        burst = []
+        for i in range(20):
+            c, tags, imp = _fact(i)
+            burst.append({"content": f"transient c{cycle}: {c}", "tags": tags})
+        bres = S.memory_store.__wrapped__(items=burst)
+        burst_ids = [r["id"] for r in bres["results"]
+                     if r.get("status", "").startswith("stored_new")]
+        track.stored(bres)
+        if burst_ids:
+            bdel = S.memory_delete.__wrapped__(memory_id=burst_ids)
+            track.deleted(len(bdel.get("deleted", burst_ids)))
+            track.ids -= set(burst_ids)
+
         # searches interleaved (census fast-path exercised at corpus > pool)
         for q in ("incident connection pool", "release train cut time",
                   "retention policy raw events", "cache eviction sizing"):

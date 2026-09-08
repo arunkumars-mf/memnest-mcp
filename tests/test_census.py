@@ -57,9 +57,13 @@ def _seed(n=12):
 class _PartialIndex:
     """Wrap conn.execute so QUERY_VECTOR_INDEX drops rows until a rebuild.
 
-    Simulates the field failure shape (index answers, but from a subset) which
-    cannot be constructed through the engine — it indexes incrementally, and
-    ~370 delete/recreate churn cycles leave the census full.
+    Simulates the field failure shape (index answers, but from a subset)
+    deterministically. The real thing IS constructible through the engine —
+    transient insert+delete churn progressively orphans surviving nodes
+    (docs/upstream/ladybug-hnsw-delete-churn-unreachable.md) — but onset
+    varies with vector geometry and RNG seed, so tests use this wrapper.
+    (Same-id delete/recreate, the embedding-update pattern, never damages
+    the graph; only transient population does.)
     """
 
     def __init__(self, conn, drop: set):
@@ -149,6 +153,27 @@ def test_stats_census_is_a_full_count_not_a_liveness_poke():
     assert vi["reachable"] == 12
     assert vi["fully_reachable"] is True
     assert st["runtime"]["engine"] == server._engine_signature()
+
+
+def test_stats_status_cannot_say_ok_while_census_says_degraded():
+    """Observed in the field: `status: "ok"` (a stale probe verdict) sitting
+    next to `fully_reachable: false` from the fresh census in the same block.
+    A field reading "ok" beside fields reading "not ok" invites exactly the
+    misreading the null-census sentinel was added to prevent — the census
+    verdict must win."""
+    _seed()
+    conn = server.get_conn()
+    fake = _PartialIndex(conn, drop={3, 4, 5, 6})
+    fake.install()
+
+    vi = server.memory_stats.__wrapped__()["runtime"]["vector_index"]
+    if vi["fully_reachable"] is False:
+        assert vi["status"] == "degraded", \
+            f"status {vi['status']!r} contradicts fully_reachable=False"
+    else:
+        # Stats repaired on the way (acceptable) — then everything must agree.
+        assert vi["reachable"] >= vi["embedded"]
+        assert vi["status"] != "degraded"
 
 
 # --- engine-version stamp -----------------------------------------------------
@@ -313,3 +338,48 @@ def test_dream_full_census_catches_audit_invisible_damage():
     census = out["vector_census"]
     assert census["rebuilt"] is True, "the census is the only layer that can fire here"
     assert census["reachable"] == census["embedded"] == 12
+
+
+# --- post-delete census -------------------------------------------------------
+
+def test_delete_runs_census_and_repairs_shortfall():
+    """Deletes are the damage source (engine delete maintenance orphans
+    SURVIVING nodes — reproduced standalone, monotonic, in-process). A session
+    that deletes and exits must not hand the next session a broken graph, so
+    memory_delete itself runs the census and rebuilds on shortfall."""
+    _seed()
+    conn = server.get_conn()
+    victim = server._collect_results(conn.execute(
+        "MATCH (m:Memory) RETURN m.id LIMIT 1;"))[0][0]
+    fake = _PartialIndex(conn, drop={3, 4, 5, 6} - {victim})
+    fake.install()
+
+    out = server.memory_delete.__wrapped__(memory_id=victim)
+    assert out["status"] == "deleted"
+    assert fake.broken is False, \
+        "the post-delete census should have detected the shortfall and rebuilt"
+
+    st = server.memory_stats.__wrapped__()["runtime"]["vector_index"]
+    assert st["fully_reachable"] is True, f"not repaired: {st}"
+
+
+def test_delete_census_is_quiet_on_a_healthy_index():
+    """No shortfall, no rebuild — the census must not churn the index."""
+    _seed()
+    conn = server.get_conn()
+    victim = server._collect_results(conn.execute(
+        "MATCH (m:Memory) RETURN m.id LIMIT 1;"))[0][0]
+
+    rebuilds = []
+    orig = conn.execute
+
+    def spy(query, *a, **k):
+        if "CREATE_VECTOR_INDEX" in str(query).upper():
+            rebuilds.append(str(query))
+        return orig(query, *a, **k)
+
+    conn.execute = spy
+    out = server.memory_delete.__wrapped__(memory_id=victim)
+    conn.execute = orig
+    assert out["status"] == "deleted"
+    assert not rebuilds, "healthy index must not be rebuilt on delete"

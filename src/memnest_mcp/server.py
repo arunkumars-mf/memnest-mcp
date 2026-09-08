@@ -1251,6 +1251,52 @@ def _probe_vector_index(conn: lb.Connection, k: int = 1) -> Optional[int]:
         return None
 
 
+def _census_and_repair_after_churn(conn: lb.Connection) -> Optional[bool]:
+    """Full reachability census; budgeted force-rebuild on shortfall.
+
+    Called after deletes — the operation shown to damage the HNSW graph
+    (engine 0.15.3 progressively orphans surviving nodes during delete
+    maintenance; see docs/upstream/ladybug-hnsw-delete-churn-unreachable.md).
+    Probing from a single point is sufficient: the entry point is fixed, so
+    every query point sees the same reachable set (verified in the field —
+    per-point counts were identical across all 38 query points).
+
+    Returns True (healthy or repaired), False (shortfall unrepaired),
+    None (census not applicable: nothing embedded, or probe failed).
+    """
+    try:
+        r = conn.execute(
+            "MATCH (m:Memory) WHERE m.embedding IS NOT NULL RETURN COUNT(m);")
+        embedded = (r.get_next()[0] or 0) if r.has_next() else 0
+    except Exception:
+        return None
+    if embedded == 0:
+        return None
+    reachable = _probe_vector_index(conn, k=embedded)
+    if reachable is None:
+        return None
+    if reachable >= embedded:
+        return True
+    logger.error(
+        f"Post-delete census shortfall: {reachable} of {embedded} embedded "
+        f"memories reachable — delete maintenance orphaned surviving nodes. "
+        f"Rebuilding memory_vec_idx..."
+    )
+    if not _index_repair_allowed():
+        return False
+    _note_index_repair_attempt()
+    state = _ensure_vector_index(conn, force_rebuild=True)
+    if state.get("rebuilt"):
+        global _vector_index_state
+        _vector_index_state = state
+        after = _probe_vector_index(conn, k=embedded)
+        if after is not None and after >= embedded:
+            _note_index_repair_success()
+            logger.info(f"Post-delete rebuild recovered {after}/{embedded}")
+            return True
+    return False
+
+
 def _ensure_vector_index(conn: lb.Connection, force_rebuild: bool = False) -> dict:
     """Detect and repair an HNSW index that does not cover existing rows.
 
@@ -3277,6 +3323,17 @@ def memory_delete(memory_id: int | list[int]) -> str:
     else:
         status = "not_found" if not invalid else "error"
 
+    # Deletes are the damage source for HNSW unreachability: reproduced
+    # standalone (docs/upstream/ladybug-hnsw-delete-churn-unreachable.md),
+    # delete maintenance progressively orphans SURVIVING nodes, in-process,
+    # monotonically, and the damage persists across checkpoints. Search,
+    # stats and dream all census after the fact; running the census HERE
+    # closes the window where a session deletes, exits, and the next session
+    # inherits a broken graph. One index query at k=corpus — cheap next to
+    # the deletes themselves.
+    if deleted:
+        _census_and_repair_after_churn(conn)
+
     out = {"status": status, "deleted": deleted, "not_found": not_found}
     if invalid:
         out["invalid"] = invalid
@@ -3925,6 +3982,15 @@ def memory_stats() -> str:
                     None if vector_reachable is None
                     else vector_reachable >= embedded_total
                 ),
+                # `status` is whatever the last structural probe recorded and
+                # can be stale "ok" while the census right beside it reads
+                # not-fully-reachable. A field saying "ok" next to fields
+                # saying "not ok" invites misreading (observed in the field),
+                # so the fresh census overrides the stale probe verdict.
+                **({"status": "degraded"}
+                   if (vector_reachable is not None
+                       and vector_reachable < embedded_total)
+                   else {}),
             },
             "engine": _engine_signature(),
             # answering=True means the index matches a term drawn from real
