@@ -1,0 +1,61 @@
+{
+  "legacy_run1": {
+    "overall": {
+      "correct": 168,
+      "total": 199,
+      "score_pct": 84.42
+    },
+    "by_category": {
+      "temporal": 94.59,
+      "multi_hop": 76.92,
+      "single_hop": 71.88,
+      "open_domain": 87.14,
+      "adversarial": 82.98
+    }
+  },
+  "rrf_run1": {
+    "overall": {
+      "correct": 164,
+      "total": 199,
+      "score_pct": 82.41
+    },
+    "by_category": {
+      "temporal": 89.19,
+      "multi_hop": 76.92,
+      "single_hop": 75.0,
+      "open_domain": 88.57,
+      "adversarial": 74.47
+    }
+  },
+  "legacy_run2": {
+    "overall": {
+      "correct": 170,
+      "total": 199,
+      "score_pct": 85.43
+    },
+    "by_category": {
+      "temporal": 91.89,
+      "multi_hop": 84.62,
+      "single_hop": 71.88,
+      "open_domain": 90.0,
+      "adversarial": 82.98
+    }
+  },
+  "retrieval_only_no_llm": {
+    "legacy": {
+      "hit@5": 0.4694,
+      "hit@20": 0.5816,
+      "mrr@20": 0.3541
+    },
+    "rrf": {
+      "hit@5": 0.4541,
+      "hit@20": 0.6429,
+      "mrr@20": 0.3374
+    }
+  },
+  "top1_score_on_unanswerable": {
+    "legacy": 0.7048,
+    "rrf": 0.9254
+  },
+  "notes": "conv-26, 199 questions, memnest 0.24.1, engine 0.15.3/40. Two identical-config legacy runs differ by 1.0 pt and flip 16 individual questions: that is the noise floor. rrf is 2.0 pts below legacy run1 with 26 flips. Retrieval-only rows are deterministic (no LLM) and show the real trade: rrf +6.1 pts recall@20, -0.017 MRR. Decision: legacy stays the default; rrf remains opt-in."
+}

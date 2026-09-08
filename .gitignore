@@ -28,3 +28,4 @@ memnest-export-*.json
 memory_graph.html
 memory_graph-*.html
 benchmark/results/soak/
+benchmark/results/archive/

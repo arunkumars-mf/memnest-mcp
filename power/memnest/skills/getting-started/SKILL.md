@@ -344,7 +344,7 @@ Three layers — you don't need to check manually:
 | `MEMORY_MAX_BATCH` | `500` | Max items per batch call |
 | `MEMORY_RESPONSE_FORMAT` | `toon` | Response format (`toon` or `json`) |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max search results |
-| `MEMORY_FUSION` | `legacy` | Channel fusion: `legacy` (raw cosine), `normalized` (min-max vector), or `rrf` (reciprocal rank fusion — rank-based, immune to channel-scale artifacts and stable under corpus edits; opt-in pending benchmark re-run) |
+| `MEMORY_FUSION` | `legacy` | Channel fusion: `legacy` (raw cosine), `normalized` (min-max vector), or `rrf` (reciprocal rank fusion — rank-based, immune to channel-scale artifacts, +6.1 pts gold-evidence recall@20, but measured 2 pts BELOW legacy on LOCOMO and its scores carry no absolute match-quality information; opt-in) |
 | `MEMORY_RRF_K` | `60` | Rank-decay constant for `rrf` mode: channel value is `(K+1)/(K+rank)` |
 
 ## Backup and transfer

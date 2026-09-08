@@ -34,6 +34,39 @@ Memnest scores **82.9%** on the [LOCOMO benchmark](https://snap-research.github.
 
 Evaluated with Claude Sonnet 4.5 as the answer agent and Haiku 4.5 as the judge, using the industry-standard LLM-as-a-Judge methodology. All 5 LOCOMO categories included.
 
+Re-measured on 0.24.1 (same protocol, 199 questions): **84.4%** and **85.4%**
+across two runs of the default `legacy` fusion. Note the run-to-run noise —
+two runs of the *identical* configuration flipped 16 individual questions and
+differed by 1.0 point, so treat sub-2-point differences on this benchmark as
+inconclusive.
+
+### Fusion modes
+
+`MEMORY_FUSION=rrf` (reciprocal rank fusion) exists because summing raw cosine
+with max-normalized BM25 adds incomparable scales. It fixes three measured
+scoring artifacts — see the [0.22.0 notes](#0220) — but it did **not** improve
+answers, so `legacy` remains the default:
+
+| | `legacy` | `rrf` |
+|---|---|---|
+| LOCOMO overall | 84.4% / 85.4% | 82.4% |
+| Gold-evidence recall @20 (no LLM) | 58.2% | **64.3%** |
+| Gold-evidence MRR @20 (no LLM) | **0.354** | 0.337 |
+| Top-1 score on *unanswerable* questions | 0.70 | 0.93 |
+
+The retrieval-only numbers are deterministic and show the real trade: `rrf`
+surfaces more gold evidence inside the top 20 (+6.1 points recall) but ranks
+it slightly lower (−0.017 MRR). Because the answer agent already reads the
+top 20, the extra recall didn't convert into better answers.
+
+`rrf` also inflates absolute scores (top-1 rises 0.70 → 0.93) and compresses
+their spread, since rank 1 scores 1.0 per channel however weak the match is.
+Neither mode separates answerable from unanswerable questions by score, so
+this isn't a lost refusal signal — but it does mean `rrf` scores carry no
+information about absolute match quality. Use it when you want rank
+robustness and stability under corpus edits; keep `legacy` when you want
+scores that mean something.
+
 ### Architecture advantages
 
 - **Zero LLM calls in the server** — intelligence lives in the agent, not the memory layer
@@ -217,7 +250,7 @@ All settings are optional — defaults work out of the box.
 | `MEMORY_CONSOLIDATE_SCAN` | `1000` | Max memories scanned per dream phase |
 | `MEMORY_ALLOW_DESTRUCTIVE` | `false` | Allow DELETE/DROP/TRUNCATE/REMOVE/SET/COPY through `memory_query`. **Off by default for safety.** Prefer `memory_update`, `memory_delete`, `memory_unrelate` |
 | `MEMORY_SEARCH_CANDIDATES` | `100` | Rows each search channel retrieves before fusion. Independent of `top_k` |
-| `MEMORY_FUSION` | `legacy` | Channel fusion: `legacy` (raw cosine + max-normalized FTS), `normalized` (min-max vector), or `rrf` (reciprocal rank fusion — only each channel's *ordering* enters the score, so channel scales can't interact and scores stay stable when memories are added or deleted). `rrf` is opt-in pending a LOCOMO re-run; the published benchmark was measured under `legacy` |
+| `MEMORY_FUSION` | `legacy` | Channel fusion: `legacy` (raw cosine + max-normalized FTS), `normalized` (min-max vector), or `rrf` (reciprocal rank fusion — only each channel's *ordering* enters the score, so channel scales can't interact and scores stay stable when memories are added or deleted). `rrf` stays opt-in: it measured **below** `legacy` on LOCOMO (see [Fusion modes](#fusion-modes)) |
 | `MEMORY_RRF_K` | `60` | Rank-decay constant for `rrf` mode. Channel value is `(K+1)/(K+rank)`: 1.0 at rank 1, ~0.87 at rank 10 |
 | `MEMORY_MAX_STORE_CHARS` | `20000` | Content longer than this is truncated on store |
 | `MEMORY_MAX_BATCH` | `500` | Max items per batch call |
@@ -302,6 +335,26 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.24.1
+
+- `memory_delete` reaps orphaned `Topic` nodes (a long-lived database had accumulated 273 orphans against 24 live topics); `memory_dream` does the same for its own prune/merge deletions and reports `topics_reaped`.
+- The post-delete index census is exception-isolated — diagnostics can never fail a committed write.
+
+### 0.24.0
+
+Root-caused the recurring silent loss of vector-search coverage: LadybugDB 0.15.3 delete maintenance progressively orphans *surviving* HNSW nodes when transient batches are inserted then deleted. Reproduced standalone ([repro](./docs/upstream/ladybug-hnsw-delete-churn-unreachable.md)), monotonic, in-process, persists across restarts. Onset is non-monotonic in burst size and seed-dependent, which is why several earlier experiments wrongly cleared it.
+
+- `memory_delete` now censuses index reachability and rebuilds on shortfall, so a session's deletes can't hand the next session a degraded index.
+- `memory_stats` reports `vector_index.status: "degraded"` when the census contradicts the cached probe verdict.
+
+### 0.23.0
+
+- One shared implementation of the delete+recreate path used by store-dedup, update and dream merge (three copies had drifted; dream was zeroing `access_count`). Store and update preserve the count; dream merge sums the merged members'.
+
+### 0.22.0
+
+- New `MEMORY_FUSION=rrf` (opt-in). Fixes three artifacts of summing incomparable channel scales: survivor keyword scores rescaling 2.24× when the top hit was deleted, a +0.166 score jump that inverted a ranking, and a plateau of identical scores when the vector channel was dead. See [Fusion modes](#fusion-modes) for why it is not the default.
 
 ### 0.19.0
 
