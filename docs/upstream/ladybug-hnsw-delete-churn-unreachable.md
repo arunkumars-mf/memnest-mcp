@@ -92,9 +92,22 @@ round 5: (38, 37)
 With real text embeddings (clustered geometry) and the same protocol the
 collapse is much faster and deeper: 38 → 21 → 19 → 13 → 10 across four rounds
 on a fresh database seeded with 38 production memories. Aged files behave the
-same. Onset and depth vary with RNG seed — some seeds survive five rounds,
-which is why small experiments can produce false exonerations; run several
-seeds before concluding safety.
+same.
+
+## Onset is non-monotonic and seed-dependent — read before dismissing
+
+Do not expect "bigger burst, more damage". On one production graph,
+**30-node bursts caused a reachability shortfall on every round while
+65-node bursts never did** — measured across 20 alternating rounds on the
+same database. Onset also varies with RNG seed for synthetic vectors: some
+seeds survive five rounds untouched.
+
+This matters for triage: a reproduction attempt with a single burst size or
+a single seed that happens to pass is **not** evidence the bug is absent —
+that exact shape produced multiple independent false exonerations downstream
+(same-id churn tests passing, large-burst rounds passing while small-burst
+rounds failed on the same graph). Sweep burst sizes and seeds before
+concluding safety.
 
 ## Controls
 
