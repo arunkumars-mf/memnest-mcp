@@ -3323,16 +3323,38 @@ def memory_delete(memory_id: int | list[int]) -> str:
     else:
         status = "not_found" if not invalid else "error"
 
-    # Deletes are the damage source for HNSW unreachability: reproduced
-    # standalone (docs/upstream/ladybug-hnsw-delete-churn-unreachable.md),
-    # delete maintenance progressively orphans SURVIVING nodes, in-process,
-    # monotonically, and the damage persists across checkpoints. Search,
-    # stats and dream all census after the fact; running the census HERE
-    # closes the window where a session deletes, exits, and the next session
-    # inherits a broken graph. One index query at k=corpus — cheap next to
-    # the deletes themselves.
     if deleted:
-        _census_and_repair_after_churn(conn)
+        # Topic nodes are created per tag but were never collected when their
+        # last memory died, so a long-lived DB accumulates orphans without
+        # bound (observed: +96 across two transient-burst rounds). Reap
+        # childless topics while we're already paying for delete work.
+        try:
+            conn.execute(
+                """MATCH (t:Topic)
+                   WHERE NOT EXISTS { MATCH (:Memory)-[:ABOUT]->(t) }
+                   DELETE t;""")
+        except Exception as e:
+            logger.debug(f"Orphan topic reap failed (non-fatal): {e}")
+
+        # Deletes are the damage source for HNSW unreachability: reproduced
+        # standalone (docs/upstream/ladybug-hnsw-delete-churn-unreachable.md),
+        # delete maintenance progressively orphans SURVIVING nodes,
+        # in-process, monotonically, and the damage persists across
+        # checkpoints. Search, stats and dream all census after the fact;
+        # running the census HERE closes the window where a session deletes,
+        # exits, and the next session inherits a broken graph. One index
+        # query at k=corpus — cheap next to the deletes themselves.
+        #
+        # The census is diagnostics + repair; it must never take the delete
+        # down with it. A field event (transport death immediately after a
+        # 30-node delete on 0.24.0) implicated this tail — 20 subprocess
+        # rounds incl. 4 in-delete force-rebuilds did not reproduce it, but
+        # the guard costs nothing and removes the class.
+        try:
+            _census_and_repair_after_churn(conn)
+        except Exception as e:
+            logger.error(f"Post-delete census failed (delete already "
+                         f"committed, index state unverified): {e}")
 
     out = {"status": status, "deleted": deleted, "not_found": not_found}
     if invalid:
@@ -5179,6 +5201,24 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             except Exception as e:
                 logger.debug(f"Full vector census failed: {e}")
 
+        # Dream's prune and merge delete Memory nodes directly, bypassing
+        # memory_delete's orphan reap — collect childless Topic nodes here so
+        # maintenance leaves the graph clean regardless of the delete path.
+        topics_reaped = 0
+        if not dry_run:
+            try:
+                before_t = conn.execute(
+                    "MATCH (t:Topic) RETURN COUNT(t);").get_next()[0] or 0
+                conn.execute(
+                    """MATCH (t:Topic)
+                       WHERE NOT EXISTS { MATCH (:Memory)-[:ABOUT]->(t) }
+                       DELETE t;""")
+                after_t = conn.execute(
+                    "MATCH (t:Topic) RETURN COUNT(t);").get_next()[0] or 0
+                topics_reaped = max(0, before_t - after_t)
+            except Exception as e:
+                logger.debug(f"Dream topic reap failed (non-fatal): {e}")
+
         # --- Phase 4: SCC contradiction detection on SUPERSEDES subgraph ---
         contradictions = []
         if not dry_run:
@@ -5217,6 +5257,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "status": "preview" if dry_run else "completed",
             "pruned": pruned_count,
             "auto_merged": merged_count,
+            "topics_reaped": topics_reaped,
             "protected_by_edges": protected_pairs,
             "protected_by_subject": distinct_subject_skips,
             "protected_by_value_conflict": value_conflict_skips,

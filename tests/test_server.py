@@ -200,6 +200,21 @@ def test_memory_delete_batch():
     assert res["not_found"] == [99999]
 
 
+def test_delete_reaps_orphaned_topics_but_keeps_shared_ones():
+    """Topic nodes were never collected when their last memory died, so a
+    long-lived DB accumulated them without bound (observed +96 across two
+    transient-burst rounds in the field)."""
+    a = _store("Note on the gateway rollout schedule.", tags=["gateway", "shared"])["id"]
+    _store("Note on the ledger cutover plan.", tags=["ledger", "shared"])
+
+    _unwrap(server.memory_delete.__wrapped__(memory_id=a))
+
+    names = {r[0] for r in server._collect_results(server.get_conn().execute(
+        "MATCH (t:Topic) RETURN t.name;"))}
+    assert "gateway" not in names, "orphaned topic must be reaped on delete"
+    assert {"ledger", "shared"} <= names, "referenced topics must survive"
+
+
 def test_dream_skips_when_too_few_memories():
     _store("Just one memory")
     res = _unwrap(server.memory_dream.__wrapped__())
