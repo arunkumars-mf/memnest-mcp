@@ -2546,6 +2546,11 @@ def memory_search(
     # overhead, and it keeps detection at 100% coverage at every size.
     _census_expected = None
     _census_mode = None
+    _total_embedded = 0
+    # Reachability measured AFTER a repair attempt, when one ran and did not
+    # fully restore the index. None means "no post-repair measurement", so the
+    # notice falls back to the hit count.
+    _post_repair_reach = None
     if embedding is not None and _count_memories(conn) > 0:
         try:
             _total_embedded = _collect_results(conn.execute(
@@ -2610,6 +2615,30 @@ def memory_search(
                 if _run_vector_channel():
                     _note_index_repair_success()
                     logger.info("Search recovered after automatic index rebuild")
+
+                # Re-VERIFY instead of assuming. The degraded notice below is
+                # the one message a user is most likely to act on, and it used
+                # to assert "automatic repair did not restore them" without
+                # checking: after a successful rebuild above the pool, the
+                # refilled ranked list is pool-capped (100) while the census
+                # expectation was the corpus (103), so a repaired index still
+                # tripped the comparison and told the user to run
+                # memory_reindex() for nothing. Crying wolf on the recovery
+                # path erodes exactly the signal this detector exists to give.
+                if _census_mode == "probe":
+                    _after = _probe_vector_index(conn, k=_total_embedded)
+                    if _after is not None and _after >= _total_embedded:
+                        # Repaired: compare like with like from here on.
+                        _census_short = False
+                        _census_expected = min(_total_embedded, len(vector_hits))
+                    elif _after is not None:
+                        # Genuinely still short — keep the flag, and report the
+                        # reachability the probe measured rather than the
+                        # pool-capped hit count.
+                        _census_expected = _total_embedded
+                        _post_repair_reach = _after
+                elif _census_expected and len(vector_hits) >= _census_expected:
+                    _census_short = False
 
     # --- Channel 2: Full-text search (BM25 via FTS index) ---
     if _count_memories(conn) > 0:
@@ -3245,8 +3274,13 @@ def memory_search(
             "memory_reindex() to rebuild the index."
         )
     elif _census_expected and len(vector_hits) < _census_expected:
+        # Report the measured reachability, not the pool-capped hit count: above
+        # the pool those are different quantities, and quoting the wrong one
+        # described a repaired index as broken.
+        _reached = (_post_repair_reach if _post_repair_reach is not None
+                    else len(vector_hits))
         out["degraded"] = (
-            f"Semantic search reached only {len(vector_hits)} of {_census_expected} "
+            f"Semantic search reached only {_reached} of {_census_expected} "
             f"memories — the vector index has unreachable nodes and automatic repair "
             f"did not restore them (budget spent, or rebuild ineffective). Results may "
             f"omit relevant memories. Run memory_reindex()."

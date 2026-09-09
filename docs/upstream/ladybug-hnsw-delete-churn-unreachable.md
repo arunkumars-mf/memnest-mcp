@@ -117,7 +117,19 @@ concluding safety.
 | churn only, never reopen (control A) | degrades — in-process |
 | reopen only, no churn (control B) | never degrades |
 | delete + recreate same ids (embedding-update pattern) | never degrades |
+| **insert only, no deletes at all** | **never degrades** (4 rounds of +65 into a 38-node index, both uniform and clustered geometry, 38 → 103 → 168 → 233 → 298, fully reachable throughout) |
+| insert only, on a file with prior delete history | never degrades (3 prior churn rounds, then +65: 103/103) |
 | checked: payload column / probe-reads / DETACH DELETE / clustering | none required; clustering worsens depth |
+
+The insert-only controls matter for diagnosis: a downstream report of "a batch
+insert was followed by a reachability shortfall" is **not** evidence that
+inserts damage the graph. Deletion is the only operation reproduced as
+damaging. A shortfall observed after an insert is more likely pre-existing
+damage becoming visible, because a `k = corpus` probe on a very small index is
+close to exhaustive and will report full reachability almost regardless of
+graph quality — so "reachable == embedded" is weak evidence of a sound graph
+at small sizes, and growing the corpus is what makes an existing defect
+measurable.
 
 ## Impact on applications
 

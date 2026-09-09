@@ -449,3 +449,46 @@ def test_dream_scan_does_not_rotate_while_corpus_fits(monkeypatch):
         cov = server.memory_dream.__wrapped__(force=True)["scan_coverage"]
         assert cov["offset"] == 0
         assert cov["runs_for_full_coverage"] == 1
+
+
+# --- the degraded notice must not cry wolf on the recovery path --------------
+#
+# Field report on 0.26.0: a query above the pool detected a real shortfall,
+# rebuilt successfully (stats read 103/103 immediately after, and the next
+# identical query was clean) — and still returned "automatic repair did not
+# restore them ... Run memory_reindex()". Cause: on the probe path the census
+# expectation stayed at the corpus (103) while the refilled ranked list is
+# pool-capped (100), so a repaired index tripped the comparison. This is the
+# one message a user is most likely to act on.
+
+def test_successful_repair_above_the_pool_reports_no_failure(monkeypatch):
+    monkeypatch.setattr(server, "SEARCH_CANDIDATE_POOL", 20)
+    _seed(30)  # corpus > pool -> probe mode, the field shape
+    conn = server.get_conn()
+    fake = _PartialIndex(conn, drop={3, 4, 5, 6})
+    fake.install()
+
+    out = server.memory_search.__wrapped__(query="diagnostics endpoint", top_k=2,
+                                           explain=True)
+    assert fake.broken is False, "fixture drifted: no repair happened"
+    assert "degraded" not in out, \
+        f"repaired index must not report failure: {out.get('degraded')}"
+    vi = server.memory_stats.__wrapped__()["runtime"]["vector_index"]
+    assert vi["fully_reachable"] is True
+
+
+def test_unrepaired_shortfall_above_the_pool_still_warns(monkeypatch):
+    """The other half: suppressing the false positive must not suppress the
+    true one. Budget spent, so no repair can run."""
+    monkeypatch.setattr(server, "SEARCH_CANDIDATE_POOL", 20)
+    _seed(30)
+    server._index_repair_attempts = server.INDEX_REPAIR_MAX_ATTEMPTS
+    conn = server.get_conn()
+    fake = _PartialIndex(conn, drop={3, 4, 5, 6})
+    fake.install()
+
+    out = server.memory_search.__wrapped__(query="diagnostics endpoint", top_k=2,
+                                           explain=True)
+    assert fake.broken is True, "fixture drifted: repair ran despite spent budget"
+    assert "degraded" in out, "a real unrepaired shortfall must still be reported"
+    assert "memory_reindex" in out["degraded"]
