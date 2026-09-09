@@ -263,6 +263,7 @@ All settings are optional — defaults work out of the box.
 | `MEMORY_ALLOW_DESTRUCTIVE` | `false` | Allow DELETE/DROP/TRUNCATE/REMOVE/SET/COPY through `memory_query`. **Off by default for safety.** Prefer `memory_update`, `memory_delete`, `memory_unrelate` |
 | `MEMORY_SEARCH_CANDIDATES` | `100` | Rows each search channel retrieves before fusion. Independent of `top_k`. Does not affect index-health coverage: above this size the census switches to a dedicated id-only probe |
 | `MEMORY_FUSION` | `legacy` | Channel fusion: `legacy` (raw cosine + max-normalized FTS), `normalized` (min-max vector), or `rrf` (reciprocal rank fusion — only each channel's *ordering* enters the score, so channel scales can't interact and scores stay stable when memories are added or deleted). `rrf` stays opt-in: it measured **below** `legacy` on LOCOMO (see [Fusion modes](#fusion-modes)) |
+| `MEMORY_GRAPH_WEIGHT` | `0.15` | Weight of the graph-centrality channel. This is the one **relevance-independent** channel — PageRank runs over the Memory+Topic graph, so it acts as a tag-popularity prior, and it is dormant until `memory_dream` runs. On a tag-dense corpus, setting `0` measured strictly better (MRR@20 0.354 → 0.370). Consider `0` if your memories are heavily tagged |
 | `MEMORY_RRF_K` | `60` | Rank-decay constant for `rrf` mode. Channel value is `(K+1)/(K+rank)`: 1.0 at rank 1, ~0.87 at rank 10 |
 | `MEMORY_MAX_STORE_CHARS` | `20000` | Content longer than this is truncated on store |
 | `MEMORY_MAX_BATCH` | `500` | Max items per batch call |
@@ -347,6 +348,13 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.28.0
+
+- **`memory_dream(dry_run=True)` now reports contradictions.** SCC detection on the SUPERSEDES subgraph was gated behind the write path, so a genuine cycle reported `contradictions: []` on inspection and only surfaced when run for effect — a diagnostic reading clean on a state that isn't. Detection is read-only; there was never a reason for the gate.
+- **`memory_search` surfaces a supersession cycle.** In a cycle no memory is current, so every member is equally penalised, the oldest value can rank first, and the documented current-answer query returns zero rows — which reads as "no information" rather than "contradictory information". A `supersession_cycle` field now names the members and the repair, alongside `potential_conflicts`.
+- **`MEMORY_GRAPH_WEIGHT` is configurable** (default unchanged at `0.15`). The graph channel is relevance-independent and dormant until dream runs; on a tag-dense corpus disabling it measured strictly better (hit@5 0.469 → 0.485, MRR@20 0.354 → 0.370). Deleting all 858 auto-inferred edges changed nothing, locating the effect in `ABOUT` edges to Topic nodes — i.e. tag popularity, not knowledge structure.
+- **`benchmark/anchors.py`** pins retrieval anchors for *both* graph states. The long-used "anchors bit-identical" check was only valid on a corpus where dream had never run, so it would read as a regression on any real workspace. Cold and warm values are now recorded separately and both asserted.
 
 ### 0.27.0
 

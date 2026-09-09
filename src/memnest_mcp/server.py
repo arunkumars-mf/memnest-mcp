@@ -264,6 +264,26 @@ MAX_SEARCH_RESULTS = int(os.environ.get("MEMORY_SEARCH_LIMIT", "10"))
 # ranking does not depend on the page size — see the comment at the pool
 # computation in memory_search for why this cannot change scores.
 SEARCH_CANDIDATE_POOL = int(os.environ.get("MEMORY_SEARCH_CANDIDATES", "100"))
+
+# Weight of the graph-centrality channel in fusion. Configurable because it is
+# the one channel that is RELEVANCE-INDEPENDENT: PageRank is computed over the
+# Memory+Topic bipartite graph, so in practice it behaves as a tag-popularity
+# prior — a memory with many well-populated tags scores on every query, whether
+# or not it answers one. It is also dormant until `memory_dream` runs, which is
+# why the cost went unmeasured for so long.
+#
+# Measured on a tag-dense corpus (LOCOMO conv-26, ~600 memories, warm graph,
+# 164 of 196 top-1 results carrying a graph term) turning it OFF was strictly
+# better: hit@5 0.4694 -> 0.4847, hit@20 0.5816 -> 0.5867, MRR@20 0.3541 ->
+# 0.3700. Deleting all 858 auto-inferred RELATED_TO edges changed nothing,
+# which locates the effect in the ABOUT edges to Topic nodes rather than in
+# inferred links. On a curated corpus with sparse, agent-asserted edges the
+# effect is smaller and can be neutral.
+#
+# The default is unchanged at 0.15 pending measurement on more than one corpus
+# shape — the same bar applied to the fusion mode. Set 0 to disable centrality
+# if your memories are heavily tagged.
+GRAPH_WEIGHT = float(os.environ.get("MEMORY_GRAPH_WEIGHT", "0.15"))
 MAX_LIST_RESULTS = int(os.environ.get("MEMORY_LIST_LIMIT", "20"))
 MAX_CONSOLIDATE_CLUSTERS = int(os.environ.get("MEMORY_CONSOLIDATE_CLUSTERS", "10"))
 MAX_CONSOLIDATE_SCAN = int(os.environ.get("MEMORY_CONSOLIDATE_SCAN", "1000"))
@@ -2865,7 +2885,7 @@ def memory_search(
         final = (
             vec_score * 0.4
             + fts_score * 0.3
-            + graph_score * 0.15
+            + graph_score * GRAPH_WEIGHT
             + recency_score * 0.1
             + importance_score * 0.05
         )
@@ -2882,7 +2902,7 @@ def memory_search(
                 "weighted": {
                     "vector": round(vec_score * 0.4, 4),
                     "fts": round(fts_score * 0.3, 4),
-                    "graph": round(graph_score * 0.15, 4),
+                    "graph": round(graph_score * GRAPH_WEIGHT, 4),
                     "recency": round(recency_score * 0.1, 4),
                     "importance": round(importance_score * 0.05, 4),
                 },
@@ -2911,6 +2931,33 @@ def memory_search(
         for mid in superseded:
             if mid in final_scores:
                 final_scores[mid] *= SUPERSEDED_PENALTY
+
+    # Circular SUPERSEDES leaves an agent with no way to learn the graph is
+    # self-inconsistent, because each individual behaviour is defensible and
+    # the combination is a hole. Measured on a 3-cycle: every member is
+    # superseded so the penalty cannot discriminate between them and the
+    # OLDEST value ranked first; the documented current-answer query
+    # (WHERE NOT EXISTS { ... SUPERSEDES ... }) returns zero rows, which reads
+    # as "no information" rather than "contradictory information"; and the one
+    # component that knows — dream's SCC pass — only ran on the mutating path.
+    #
+    # So say it here, where the caller is already looking. Cheap: a bounded
+    # self-returning path search over the handful of superseded ids in THIS
+    # result, not a global scan.
+    supersession_cycles: list = []
+    if len(superseded) > 1:
+        try:
+            r = conn.execute(
+                """MATCH p = (m:Memory)-[:SUPERSEDES*1..6]->(m)
+                   WHERE m.id IN $ids
+                   RETURN DISTINCT m.id;""",
+                {"ids": sorted(superseded)},
+            )
+            cycle_ids = sorted(row[0] for row in _collect_results(r))
+            if cycle_ids:
+                supersession_cycles = cycle_ids
+        except Exception as e:
+            logger.debug(f"Supersession cycle check failed (non-fatal): {e}")
 
     # Build results.
     #
@@ -3300,6 +3347,17 @@ def memory_search(
         out["related"] = related
     if conflicts:
         out["potential_conflicts"] = conflicts
+    if supersession_cycles:
+        out["supersession_cycle"] = {
+            "memory_ids": supersession_cycles,
+            "issue": ("these memories SUPERSEDE each other in a loop, so none is "
+                      "the current version and their relative ranking is "
+                      "arbitrary — the supersession data itself is unreliable "
+                      "here, not just ambiguous"),
+            "resolution": ("memory_unrelate(from_id, to_id, 'SUPERSEDES') on the "
+                           "edge that closes the loop leaves a single current "
+                           "version; memory_dream() reports the full cycle"),
+        }
     if explain:
         out["explain_meta"] = {
             "fusion_mode": FUSION_MODE,
@@ -5485,38 +5543,50 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                 logger.debug(f"Dream topic reap failed (non-fatal): {e}")
 
         # --- Phase 4: SCC contradiction detection on SUPERSEDES subgraph ---
+        #
+        # Runs in dry_run too. It used to be gated behind `not dry_run`, which
+        # meant the same graph reported contradictions: [] in preview and a
+        # real cycle when run for effect — a diagnostic reading clean on a
+        # state that is not, which is the failure shape of every serious bug in
+        # this project's history. There was never a reason for the gate:
+        # detection reads the graph, and the temporary projection it builds is
+        # dropped below. An operator checking for contradictions WITHOUT
+        # mutating anything is precisely the caller who needs the answer.
         contradictions = []
-        if not dry_run:
-            try:
-                # Check if we have SUPERSEDES edges
-                sup_result = conn.execute(
-                    "MATCH ()-[r:SUPERSEDES]->() RETURN COUNT(r);"
-                )
-                sup_count = sup_result.get_next()[0] if sup_result.has_next() else 0
+        try:
+            # Check if we have SUPERSEDES edges
+            sup_result = conn.execute(
+                "MATCH ()-[r:SUPERSEDES]->() RETURN COUNT(r);"
+            )
+            sup_count = sup_result.get_next()[0] if sup_result.has_next() else 0
 
-                if sup_count >= 2:
-                    # Scoped like every other projection: a contradiction cycle
-                    # in another project is that project's report, not this one's.
-                    _project_graph_scoped(conn, "memory_scc", WORKSPACE, ["SUPERSEDES"])
-                    result = conn.execute(
-                        "CALL STRONGLY_CONNECTED_COMPONENTS('memory_scc') "
-                        "RETURN group_id, collect(node.id) AS members;"
-                    )
-                    for row in _collect_results(result):
-                        group_id, members = row[0], row[1]
-                        if isinstance(members, list) and len(members) > 1:
-                            # SCC with >1 node = contradiction cycle
-                            contradictions.append({
-                                "group_id": group_id,
-                                "memory_ids": members,
-                                "issue": "circular SUPERSEDES — these memories contradict each other",
-                            })
-                    try:
-                        conn.execute("CALL DROP_PROJECTED_GRAPH('memory_scc');")
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.debug(f"SCC contradiction check failed (non-fatal): {e}")
+            if sup_count >= 2:
+                # Scoped like every other projection: a contradiction cycle
+                # in another project is that project's report, not this one's.
+                _project_graph_scoped(conn, "memory_scc", WORKSPACE, ["SUPERSEDES"])
+                result = conn.execute(
+                    "CALL STRONGLY_CONNECTED_COMPONENTS('memory_scc') "
+                    "RETURN group_id, collect(node.id) AS members;"
+                )
+                for row in _collect_results(result):
+                    group_id, members = row[0], row[1]
+                    if isinstance(members, list) and len(members) > 1:
+                        # SCC with >1 node = contradiction cycle
+                        contradictions.append({
+                            "group_id": group_id,
+                            "memory_ids": sorted(members),
+                            "issue": "circular SUPERSEDES — these memories contradict each other",
+                            "resolution": ("memory_unrelate(from_id, to_id, "
+                                           "'SUPERSEDES') on the edge that closes "
+                                           "the loop — usually the oldest-to-newest "
+                                           "one — leaves a single current version"),
+                        })
+                try:
+                    conn.execute("CALL DROP_PROJECTED_GRAPH('memory_scc');")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"SCC contradiction check failed (non-fatal): {e}")
 
         return {
             "status": "preview" if dry_run else "completed",

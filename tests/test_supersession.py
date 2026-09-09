@@ -249,3 +249,87 @@ def test_merge_response_reports_similarity(clean):
     if res["status"] == "updated_existing":
         assert "similarity" in res, "a merge should report the similarity that caused it"
         assert res["similarity"] >= server.DEDUP_THRESHOLD
+
+
+# --- circular SUPERSEDES ------------------------------------------------------
+#
+# A cycle means no memory is the current version. Each individual behaviour is
+# defensible and the combination was a hole: every member is superseded so the
+# penalty cannot discriminate and the OLDEST value can rank first; the
+# documented current-answer query returns zero rows, which reads as "no
+# information" rather than "contradictory information"; and the one component
+# that knows — dream's SCC pass — was gated behind `not dry_run`, so an
+# operator inspecting safely was told there were no contradictions.
+
+_CYCLE = [
+    "The Sadr ingest pipeline is throttled to 100 rps.",
+    "Correction: the Sadr ingest pipeline is throttled to 250 rps.",
+    "Correction: the Sadr ingest pipeline is throttled to 400 rps.",
+]
+
+
+def _make_cycle():
+    ids, prev = [], None
+    for v in _CYCLE:
+        kw = {"supersedes": prev} if prev else {}
+        ids.append(server.memory_store.__wrapped__(
+            content=v, tags=["sadr", "throttle"], **kw)["id"])
+        prev = ids[-1]
+    # Close the loop: the oldest supersedes the newest.
+    server.memory_relate.__wrapped__(from_id=ids[0], to_id=ids[2],
+                                     relationship="SUPERSEDES")
+    server.memory_store.__wrapped__(items=[
+        {"content": f"Filler {i} on unrelated capacity planning {i}.",
+         "tags": [f"cyc-f{i}"]} for i in range(24)])
+    return ids
+
+
+def test_dream_reports_a_cycle_identically_in_dry_run_and_for_real():
+    """A diagnostic must not read clean on a state that is not."""
+    _make_cycle()
+    dry = server.memory_dream.__wrapped__(force=True, dry_run=True)
+    wet = server.memory_dream.__wrapped__(force=True)
+
+    assert dry.get("contradictions"), \
+        "dry_run reported no contradictions on a graph that has one"
+    assert [c["memory_ids"] for c in dry["contradictions"]] == \
+           [c["memory_ids"] for c in wet["contradictions"]], \
+        "preview and real runs must agree about contradictions"
+    assert "unrelate" in dry["contradictions"][0]["resolution"].lower()
+
+
+def test_search_tells_the_agent_the_supersession_data_is_circular():
+    ids = _make_cycle()
+    out = server.memory_search.__wrapped__(query="what is the Sadr ingest throttle",
+                                           top_k=3)
+    cyc = out.get("supersession_cycle")
+    assert cyc, "a cycle must be surfaced where the caller is already looking"
+    assert set(cyc["memory_ids"]) == set(ids)
+    assert "arbitrary" in cyc["issue"], \
+        "the notice must say the ranking cannot be trusted, not merely that it is stale"
+
+
+def test_breaking_the_cycle_clears_the_flag_and_restores_a_head():
+    ids = _make_cycle()
+    server.memory_unrelate.__wrapped__(from_id=ids[0], to_id=ids[2],
+                                       relationship="SUPERSEDES")
+    out = server.memory_search.__wrapped__(query="what is the Sadr ingest throttle",
+                                           top_k=3)
+    assert "supersession_cycle" not in out, "the flag must clear once repaired"
+    assert out["results"][0]["id"] == ids[2], \
+        "with the loop broken the newest version must rank first"
+
+
+def test_a_healthy_chain_is_never_flagged_as_circular():
+    """No false positives on the ordinary correction chain this feature protects."""
+    ids, prev = [], None
+    for v in _CYCLE:
+        kw = {"supersedes": prev} if prev else {}
+        ids.append(server.memory_store.__wrapped__(
+            content=v, tags=["sadr", "throttle"], **kw)["id"])
+        prev = ids[-1]
+
+    out = server.memory_search.__wrapped__(query="what is the Sadr ingest throttle",
+                                           top_k=3)
+    assert "supersession_cycle" not in out
+    assert out["results"][0]["id"] == ids[2]
