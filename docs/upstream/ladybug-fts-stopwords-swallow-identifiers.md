@@ -43,6 +43,19 @@ Measured token-by-token against the raw index:
 | `3300`, `7734`, `2026`, `17`, `8080`, `1.29` | **no** | bare numerics |
 | `q2`, `p99` | **no** | mixed token, alpha run of 1 |
 
+The alpha-run threshold is exactly 2, and it is a hard boundary. Four tokens
+placed in a **single document** and queried against the same index:
+
+| token | alpha run | matches |
+|---|---|---|
+| `q7` | 1 | **no** |
+| `ab7` | 2 | yes |
+| `abc7` | 3 | yes |
+| `abcd7` | 4 | yes |
+
+**Complete rule: a token is indexed iff it contains an alphabetic run of at
+least two characters that is not a stopword.**
+
 So a hyphenated or spaced identifier is split, and **survives only through its
 non-stopword alphabetic parts**. Two consequences:
 
@@ -58,12 +71,31 @@ non-stopword alphabetic parts**. Two consequences:
    similarity. The caller receives a confident, well-scored, wrong region.
 
 Corpus-realistic instances of (2) are pervasive: `us-east-1`/`us-east-2`,
-`Java 17`/`Java 21`, `PostgreSQL 15`/`14`, ports `8080`/`9090`, `p50`/`p99`,
-`Kubernetes 1.29`. Temporal quarters are affected too: `Q2 2026` and `Q4 2026`
-both score fts 1.0 for the query `decommissioned in Q2 2026`, because `q2`,
-`q4` and `2026` are all unindexed and the match comes entirely from
-`decommissioned`. Any application relying on FTS to separate versions, regions,
-ports or quarters is relying on the embedding channel without knowing it.
+`Java 17`/`Java 21`, `PostgreSQL 15`/`14`, ports `8080`/`9090`.
+
+The alpha-run-of-1 rule additionally erases whole categories of technical
+shorthand that applications record verbatim:
+
+- **Quarters** — `Q1`–`Q4`, i.e. the entire temporal dimension of a roadmap.
+- **Percentiles** — `p50`, `p95`, `p99`, i.e. every latency SLO.
+- **Version prefixes** — `v1`, `v2`.
+- **Cloud instance families** — verified unindexed: `c6g`, `m5`, `t3`. The
+  family designator is where the sizing lives, so instance types are invisible.
+
+Worked example, on three documents differing **only** in the quarter
+("…decommissioned in Q2/Q3/Q4 2026") queried with `decommissioned in Q4 2026`:
+all three score fts **1.0**. The quarter contributes nothing, because `q2`,
+`q4` and `2026` are all unindexed and the entire match comes from
+`decommissioned`. Which quarter ranks first is then decided solely by embedding
+similarity — in one run of this fixture the correct one won; on a real corpus
+the same query ranked the **Q3** memory first while the correct Q4 answer was
+present and unambiguous. That is the failure mode: not a wrong answer every
+time, but a coin flip presented with a confident score, on a question the
+keyword index should have settled outright.
+
+Any application relying on FTS to separate versions, regions, ports, quarters,
+percentiles or instance types is relying on the embedding channel without
+knowing it.
 
 ### An asymmetry that localises the gap
 
@@ -141,7 +173,9 @@ with matching query rewriting — considerably more machinery than
    identifier prefixes (`INC-`, `IT-`).
 2. Index bare numeric tokens, or provide an option to. This is the item that
    fixes the confident-wrong-answer class, not just the retrieval miss.
-3. Index mixed tokens whose alphabetic run is a single character (`q2`, `p99`).
+3. Index mixed tokens whose alphabetic run is a single character. The threshold
+   is exactly 2 and can be checked against the tokenizer in one read:
+   `q7` is dropped, `ab7` is kept.
 4. Fix the segfault in the `stopWords :=` path, and in the meantime make it
    raise rather than crash.
 
