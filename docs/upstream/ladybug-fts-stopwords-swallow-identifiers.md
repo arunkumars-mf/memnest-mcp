@@ -31,6 +31,49 @@ Note `BUG-7734` matches only via `bug` — its numeric half is unindexed too, at
 an identical BM25 score. Hyphenation is *not* the problem, and neither is
 trailing punctuation: `AAA-1111:` with a colon indexes and matches normally.
 
+### The unified rule, and what it predicts
+
+Measured token-by-token against the raw index:
+
+| token in content | searchable | why |
+|---|---|---|
+| `abcd88` | yes | mixed token, alpha run ≥ 2 |
+| `bug`, `cve`, `rfc`, `sev`, `req`, `aud`, `corp` | yes | ordinary words |
+| `inc`, `ltd`, `it`, `the` | **no** | stopwords |
+| `3300`, `7734`, `2026`, `17`, `8080`, `1.29` | **no** | bare numerics |
+| `q2`, `p99` | **no** | mixed token, alpha run of 1 |
+
+So a hyphenated or spaced identifier is split, and **survives only through its
+non-stopword alphabetic parts**. Two consequences:
+
+1. If every alphabetic part is a stopword, the identifier is entirely
+   unsearchable: `INC-3300` (`inc`) and `IT-4471` (`it`). Both are among the
+   most common ticket prefixes in existence — `INC-` for incidents, `IT-` for
+   service desks.
+2. **Otherwise the identifier matches, but cannot be distinguished from any
+   variant differing only in its numeral** — and this is worse than a miss,
+   because a miss is visible. Measured: for query `eu-west-2`, both
+   `eu-west-1` and `eu-west-2` documents score fts **1.0**. The discriminating
+   numeral is never read; which one ranks first is decided by embedding
+   similarity. The caller receives a confident, well-scored, wrong region.
+
+Corpus-realistic instances of (2) are pervasive: `us-east-1`/`us-east-2`,
+`Java 17`/`Java 21`, `PostgreSQL 15`/`14`, ports `8080`/`9090`, `p50`/`p99`,
+`Kubernetes 1.29`. Temporal quarters are affected too: `Q2 2026` and `Q4 2026`
+both score fts 1.0 for the query `decommissioned in Q2 2026`, because `q2`,
+`q4` and `2026` are all unindexed and the match comes entirely from
+`decommissioned`. Any application relying on FTS to separate versions, regions,
+ports or quarters is relying on the embedding channel without knowing it.
+
+### An asymmetry that localises the gap
+
+The same numerals are perfectly legible elsewhere in the same database. A
+value-conflict detector reading the same `content` strings distinguishes
+"30 days" from "one year", "512 MB" from "2 GB", and "500 ms" from "900 ms".
+So numbers are not lost in storage — they are lost in the FTS index
+specifically, which is what makes this an index-configuration bug rather than
+anything intrinsic to the data.
+
 Why this matters more than a prose-search quirk: hyphenated identifiers are
 exactly what a memory system stores as retrieval anchors — incident IDs, ticket
 keys, CVEs, ISO dates, semver. `INC-` is the most common incident prefix in
@@ -93,8 +136,15 @@ with matching query rewriting — considerably more machinery than
 
 ## What we would ask for
 
-1. Do not treat `inc` / `ltd` as stopwords by default, or document prominently
-   that they are, since they collide with the most common identifier prefixes.
-2. Index bare numeric tokens, or provide an option to.
-3. Fix the segfault in the `stopWords :=` path, and in the meantime make it
+1. Do not treat `inc`, `ltd` or `it` as stopwords by default, or document
+   prominently that they are, since they collide with the most common
+   identifier prefixes (`INC-`, `IT-`).
+2. Index bare numeric tokens, or provide an option to. This is the item that
+   fixes the confident-wrong-answer class, not just the retrieval miss.
+3. Index mixed tokens whose alphabetic run is a single character (`q2`, `p99`).
+4. Fix the segfault in the `stopWords :=` path, and in the meantime make it
    raise rather than crash.
+
+Priority order from an application's perspective: (2) first, because a silent
+wrong answer is worse than a visible miss; then (4), because it unblocks the
+only documented workaround; then (1) and (3).
