@@ -280,9 +280,28 @@ SEARCH_CANDIDATE_POOL = int(os.environ.get("MEMORY_SEARCH_CANDIDATES", "100"))
 # inferred links. On a curated corpus with sparse, agent-asserted edges the
 # effect is smaller and can be neutral.
 #
-# The default is unchanged at 0.15 pending measurement on more than one corpus
-# shape — the same bar applied to the fusion mode. Set 0 to disable centrality
-# if your memories are heavily tagged.
+# Two further findings narrow what this channel can even see:
+#
+#   - Only RELATED_TO gives a MEMORY incoming rank. ABOUT points Memory->Topic
+#     (topics absorb the mass) and SUPERSEDES/EXPLAINS are excluded from the
+#     projection entirely — verified by A/B: a hub with 5 incoming RELATED_TO
+#     reached 2.42x the teleport floor while a structurally identical hub with
+#     5 incoming EXPLAINS sat exactly AT the floor with k_degree 0. So both
+#     graph terms are blind to two of the three agent-asserted edge types, and
+#     the one they can see is also the type the inference pass manufactures.
+#
+#   - Whether asserted-structure centrality correlates with relevance AT ALL
+#     is the question that would settle "wrong inputs" versus "wrong idea",
+#     and it is currently unmeasurable: no fixture has both curated edges and
+#     labelled answers. The 127-fact corpus carries 1 asserted edge; a fresh
+#     Helios ingest carries 0. On any benchmark-shaped corpus this channel is
+#     therefore reading almost entirely INFERRED structure, which is what the
+#     negative measurement above actually indicts. The curated case is
+#     untested, and building that fixture is the prerequisite for judging it.
+#
+# The default is unchanged at 0.15 pending that measurement — the same bar
+# applied to the fusion mode. Set 0 to disable centrality if your memories are
+# heavily tagged or your edges are mostly inferred.
 GRAPH_WEIGHT = float(os.environ.get("MEMORY_GRAPH_WEIGHT", "0.15"))
 MAX_LIST_RESULTS = int(os.environ.get("MEMORY_LIST_LIMIT", "20"))
 MAX_CONSOLIDATE_CLUSTERS = int(os.environ.get("MEMORY_CONSOLIDATE_CLUSTERS", "10"))
@@ -3045,7 +3064,19 @@ def memory_search(
         if explain and mid in explain_data:
             ex = dict(explain_data[mid])
             if mid in superseded:
-                ex["superseded_penalty"] = SUPERSEDED_PENALTY
+                # Report the multiplier only when it was actually applied.
+                # Cycle members are exempt, and printing 0.5 beside a score
+                # that was never halved is the same class of dishonest
+                # diagnostic as `status: "ok"` next to `fully_reachable:
+                # false` — individually cosmetic, collectively the reason a
+                # block stops being trusted. `superseded: true` still shows,
+                # because each member genuinely IS superseded by another; what
+                # changes is only whether a penalty was charged for it.
+                if mid in cycle_members:
+                    ex["superseded_penalty"] = None
+                    ex["superseded_penalty_exempt"] = "supersession_cycle"
+                else:
+                    ex["superseded_penalty"] = SUPERSEDED_PENALTY
             entry["explain"] = ex
 
         # Paging is applied AFTER the filters above, so offset counts results

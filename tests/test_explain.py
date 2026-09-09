@@ -106,3 +106,64 @@ def test_superseded_results_expose_the_penalty():
         assert r["explain"]["superseded_penalty"] == server.SUPERSEDED_PENALTY
         w = r["explain"]["weighted"]
         assert abs(sum(w.values()) * server.SUPERSEDED_PENALTY - r["score"]) < 0.002
+
+
+# --- the explain block must not advertise a penalty it did not apply ---------
+#
+# Cycle members are exempt from the x0.5 supersession multiplier, but the block
+# still printed `superseded_penalty: 0.5` beside a score that was never halved.
+# The sum-to-score invariant still held, so the formula was not misdescribed —
+# but a multiplier reported next to a score it was not applied to is the same
+# class of dishonest diagnostic as `status: "ok"` next to `fully_reachable:
+# false`, or a degraded notice asserting repair failure after a successful
+# repair. Individually cosmetic; collectively the reason a diagnostic block
+# stops being trusted.
+
+def _sum_weighted(entry):
+    return sum(entry["explain"]["weighted"].values())
+
+
+def test_penalised_row_reports_the_multiplier_and_the_score_reflects_it():
+    old = server.memory_store.__wrapped__(
+        content="The Menkar worker pool holds 8 threads.", tags=["menkar", "threads"])
+    server.memory_store.__wrapped__(
+        content="Correction: the Menkar worker pool now holds 32 threads.",
+        tags=["menkar", "threads"], supersedes=old["id"])
+
+    out = server.memory_search.__wrapped__(
+        query="how many threads in the Menkar worker pool", top_k=5, explain=True)
+    stale = next((r for r in out["results"] if r["id"] == old["id"]), None)
+    if stale is None:
+        pytest.skip("stale version demoted out of the window in this fusion mode")
+
+    assert stale["explain"]["superseded_penalty"] == server.SUPERSEDED_PENALTY
+    assert abs(stale["score"]
+               - _sum_weighted(stale) * server.SUPERSEDED_PENALTY) < 0.0005, \
+        "a reported multiplier must be the one the score actually used"
+
+
+def test_exempt_row_reports_no_multiplier_and_names_the_exemption():
+    ids, prev = [], None
+    for v in ("The Rukbat cache size is 256 megabytes.",
+              "Correction: the Rukbat cache size is 512 megabytes.",
+              "Correction: the Rukbat cache size is 1 gigabyte."):
+        kw = {"supersedes": prev} if prev else {}
+        ids.append(server.memory_store.__wrapped__(
+            content=v, tags=["rukbat", "cachesize"], **kw)["id"])
+        prev = ids[-1]
+    server.memory_relate.__wrapped__(from_id=ids[0], to_id=ids[2],
+                                     relationship="SUPERSEDES")
+
+    out = server.memory_search.__wrapped__(query="what is the Rukbat cache size",
+                                           top_k=3, explain=True)
+    members = [r for r in out["results"] if r["id"] in ids]
+    assert members, "cycle members must be retrievable"
+    for r in members:
+        ex = r["explain"]
+        assert r.get("superseded") is True, \
+            "each member genuinely IS superseded — that stays reported"
+        assert ex["superseded_penalty"] is None, \
+            "no multiplier may be advertised when none was charged"
+        assert ex["superseded_penalty_exempt"] == "supersession_cycle"
+        assert abs(r["score"] - _sum_weighted(r)) < 0.0005, \
+            "an exempt row's score must equal its unpenalised weighted sum"

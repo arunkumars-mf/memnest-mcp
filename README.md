@@ -359,6 +359,10 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 
 ## Changelog
 
+### 0.28.3
+
+- **`explain` no longer advertises a penalty it did not apply.** Cycle members are exempt from the ×0.5 supersession multiplier, but the block still printed `superseded_penalty: 0.5` next to a score that was never halved. It now reports `null` with `superseded_penalty_exempt: "supersession_cycle"`, and a penalised row's score is asserted to equal `sum(weighted) × penalty`. `superseded: true` still shows, because each member genuinely is superseded — what changed is only whether a penalty was charged.
+
 ### 0.28.2
 
 - **Supersession-cycle members are exempt from the ×0.5 penalty.** In a cycle every member is superseded by construction, so the flag says nothing about which is stale while the multiplier still destroys ranking. Measured: for one query the answering memory scored an unpenalised 0.769 (vector 0.857, FTS 1.0) and was halved to 0.385, below three unrelated memories at ~0.41 — so at `top_k=2` it was not returned, and because the cycle warning is scoped to returned rows the warning vanished with it. The caller asking exactly the affected question got unrelated results and no indication anything was wrong. Cycle members now rank on relevance with `supersession_cycle` attached, which fixes the same failure under `rrf`, where the compressed score spread made it unavoidable.
