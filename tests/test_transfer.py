@@ -190,3 +190,62 @@ def test_export_default_path_is_written(tmp_path, monkeypatch):
     assert out["status"] == "exported"
     assert os.path.isfile(out["path"])
     assert out["path"].startswith(str(tmp_path))
+
+
+# --- real disaster recovery ---------------------------------------------------
+#
+# The round-trip tests above restore into a fresh IN-MEMORY database, which
+# proves the import logic. It does not prove recovery: a backup you have never
+# restored to a real database file is not a backup. This exercises the actual
+# DR shape — a separate .lbug file, opened cold, with embeddings recomputed
+# because the default export deliberately omits them — and checks the property
+# that matters, which is that RETRIEVAL works afterwards rather than that the
+# counts line up.
+
+def test_restore_into_a_separate_database_file_recovers_retrieval(tmp_path,
+                                                                  monkeypatch):
+    _seed()
+    server.memory_store.__wrapped__(
+        content="The archival vault rotates signing keys every 17 days "
+                "under runbook R-9017.", tags=["vault"])
+    export = str(tmp_path / "backup.json")
+    out = server.memory_export.__wrapped__(path=export)
+    assert out["status"] == "exported"
+    assert json.load(open(export))["includes_embeddings"] is False, \
+        "the default backup omits embeddings, so restore must re-embed"
+
+    # Cold, separate, on-disk restore target.
+    server._conn = None
+    server._db = None
+    target = str(tmp_path / "restored" / "memory.lbug")
+    monkeypatch.setenv("MEMORY_DB_PATH", target)
+    monkeypatch.setattr(server, "DB_PATH", target)
+    conn = server.get_conn()
+    assert server._count_memories(conn) == 0, "restore target must start empty"
+
+    res = server.memory_import.__wrapped__(path=export)
+    assert res["status"] == "imported"
+    assert res["reused_embeddings"] is False
+
+    conn = server.get_conn()
+    total = server._count_memories(conn)
+    embedded = server._collect_results(conn.execute(
+        "MATCH (m:Memory) WHERE m.embedding IS NOT NULL RETURN COUNT(m);"))[0][0]
+    assert embedded == total, "every restored memory must be re-embedded"
+    assert server._probe_vector_index(conn, k=embedded) == embedded, \
+        "the restored index must be fully reachable"
+
+    # Retrieval, not just row counts.
+    hit = server.memory_search.__wrapped__(
+        query="archival vault signing key rotation runbook", top_k=3)
+    assert any("R-9017" in r["content"] for r in hit["results"]), \
+        "a restored memory must be findable by content"
+
+    # And the graph still does the thing the graph is for.
+    cur = server.memory_search.__wrapped__(query="what is the Vega cache TTL",
+                                           top_k=3)
+    assert "300 seconds" in cur["results"][0]["content"], \
+        "supersession must still resolve to the current value after a restore"
+
+    server._conn = None
+    server._db = None

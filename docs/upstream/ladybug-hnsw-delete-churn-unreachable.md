@@ -117,19 +117,37 @@ concluding safety.
 | churn only, never reopen (control A) | degrades — in-process |
 | reopen only, no churn (control B) | never degrades |
 | delete + recreate same ids (embedding-update pattern) | never degrades |
-| **insert only, no deletes at all** | **never degrades** (4 rounds of +65 into a 38-node index, both uniform and clustered geometry, 38 → 103 → 168 → 233 → 298, fully reachable throughout) |
-| insert only, on a file with prior delete history | never degrades (3 prior churn rounds, then +65: 103/103) |
+| insert only, no deletes at all | not reproduced in 24 trials — see below |
+| insert only, on a file with prior delete history | not reproduced (3 prior churn rounds, then +65: 103/103) |
 | checked: payload column / probe-reads / DETACH DELETE / clustering | none required; clustering worsens depth |
 
-The insert-only controls matter for diagnosis: a downstream report of "a batch
-insert was followed by a reachability shortfall" is **not** evidence that
-inserts damage the graph. Deletion is the only operation reproduced as
-damaging. A shortfall observed after an insert is more likely pre-existing
-damage becoming visible, because a `k = corpus` probe on a very small index is
-close to exhaustive and will report full reachability almost regardless of
-graph quality — so "reachable == embedded" is weak evidence of a sound graph
-at small sizes, and growing the corpus is what makes an existing defect
-measurable.
+### Insert-only: one field report, unreproduced in 24 trials
+
+Deletion is the only operation reproduced as damaging here. Insert-only was
+tried 24 times without a single degradation: 4 sequential rounds of +65 into a
+38-node index in both uniform and clustered geometry (38 → 103 → 168 → 233 →
+298, fully reachable throughout), 16 independent seeds of base-38-then-insert-65
+with the interleaved neighbour query a dedup path performs, and an insert into
+a database carrying prior delete history.
+
+Against that, one downstream field observation stands unexplained: a 38-node
+index read 38/38 reachable by an independent census, a 65-item batch insert
+followed with no deletes, and the next query measured a shortfall and rebuilt.
+A repeat of the identical sequence on the same database was clean. Since onset
+for the delete case is already known to be non-monotonic in batch size and
+seed-dependent, a stochastic insert-side trigger cannot be ruled out from
+negative trials alone.
+
+Two cautions for whoever triages this:
+
+- Do not treat "a shortfall appeared after an insert" as evidence that
+  insertion damages the graph; the reproducible trigger is deletion, and
+  chasing the insert path first will burn time.
+- Be careful with small-corpus baselines in general. A `k = corpus` probe on a
+  small index approaches an exhaustive scan, so `reachable == embedded` there
+  is weaker evidence of a sound graph than it looks. Growing a corpus can make
+  an existing defect measurable, which is easily mistaken for the growth
+  having caused it.
 
 ## Impact on applications
 
