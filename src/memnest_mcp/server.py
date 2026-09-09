@@ -3165,6 +3165,12 @@ def memory_search(
                                 f"permanently.")
 
                     conflicts.append({
+                        # Pair order is RANK order, not id order: the first id
+                        # is the memory currently winning retrieval, which is
+                        # the actionable one when the two disagree. (This is
+                        # why the pair can read ascending in one flag and
+                        # descending in another — it reflects ranking, not
+                        # insertion.)
                         "ids": [a, b],
                         "similarity": round(sim, 4),
                         "reason": reason,
@@ -3214,7 +3220,7 @@ def memory_search(
                    WHERE s.id IN $seeds AND NOT n.id IN $returned
                      AND n.workspace IN ['', $ws]
                    RETURN n.id, n.content, min(length(p)) AS hops, min(s.id) AS seed,
-                          n.embedding
+                          n.embedding, n.importance, n.updated_at
                    ORDER BY hops ASC, n.id ASC;""",
                 {"seeds": seeds, "returned": list(returned), "ws": WORKSPACE},
             )
@@ -3248,7 +3254,23 @@ def memory_search(
                 cos = (dot / (na * nb)) if na and nb else 0.0
                 return (max(0.0, cos) * (GRAPH_EXPAND_HOP_DECAY ** (hops - 1)), -hops)
 
-            candidates.sort(key=lambda row: (_sel_score(row), -row[0]), reverse=True)
+            # FULL ordering key, stated explicitly: hop-decayed relevance, then
+            # fewer hops, then importance, then recency, then id.
+            #
+            # id may only ever be the terminal element of a documented key. It
+            # was previously the sole tiebreak here — and since ids encode
+            # insertion order, which neighbour won the last capped slot depended
+            # on store order. That is the same defect found in the dream
+            # survivor choice and in the rrf rank transform; this was its third
+            # site, and the one with the most reach, because `related` decides
+            # whether the answer to a transitive question appears at all.
+            def _neighbour_key(row):
+                rel, neg_hops = _sel_score(row)
+                importance = row[5] if len(row) > 5 else None
+                updated = row[6] if len(row) > 6 else None
+                return (rel, neg_hops, importance or 0, updated or 0.0, -row[0])
+
+            candidates.sort(key=_neighbour_key, reverse=True)
 
             for row in candidates[:GRAPH_EXPAND_LIMIT]:
                 entry = {
@@ -4934,6 +4956,13 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
         # corpus larger than the cap is fully covered over successive runs
         # instead of leaving everything past the newest N unexamined forever.
         # Wraps to 0 once past the end, and stays 0 while the corpus fits.
+        #
+        # Both scans below order by (updated_at DESC, id DESC). The id is the
+        # documented TERMINAL tiebreak and it is load-bearing here, not
+        # cosmetic: a batch store stamps many memories with the same
+        # updated_at, and SKIP/LIMIT over an unstable sort can skip or repeat
+        # rows between runs — which would silently break the full-coverage
+        # guarantee this cursor exists to provide.
         _scan_skip = 0
         if memories_before > MAX_CONSOLIDATE_SCAN:
             _scan_skip = _dream_scan_cursor
@@ -4979,7 +5008,8 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     """MATCH (m:Memory)
                        RETURN m.id, m.content, m.tags, m.importance, m.embedding,
                               m.created_at, m.category, m.workspace, m.access_count
-                       ORDER BY m.updated_at DESC SKIP $skip LIMIT $limit;""",
+                       ORDER BY m.updated_at DESC, m.id DESC
+                       SKIP $skip LIMIT $limit;""",
                     {"skip": _scan_skip, "limit": MAX_CONSOLIDATE_SCAN},
                 )
                 all_mems = _collect_results(scan_result)
@@ -5269,7 +5299,8 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     """MATCH (m:Memory)
                        RETURN m.id, m.content, m.importance, m.embedding, m.workspace,
                               m.tags
-                       ORDER BY m.updated_at DESC SKIP $skip LIMIT $limit;""",
+                       ORDER BY m.updated_at DESC, m.id DESC
+                       SKIP $skip LIMIT $limit;""",
                     {"skip": _scan_skip, "limit": MAX_CONSOLIDATE_SCAN},
                 )
                 all_mems = _collect_results(scan_result)
@@ -6037,10 +6068,16 @@ def memory_list(
 
     where_clause = "WHERE " + " AND ".join(where) if where else ""
 
+    # Every sort ends in `m.id DESC` — the documented terminal tiebreak. This
+    # is load-bearing rather than cosmetic because the results are PAGINATED:
+    # SKIP/LIMIT over an unstable sort can skip or repeat rows between pages,
+    # and ties are the common case, not the exception (a batch store stamps
+    # every item in the batch with the same updated_at, and access_count is 0
+    # for everything unread).
     sort_map = {
-        "recent": "m.updated_at DESC",
-        "importance": "m.importance DESC, m.updated_at DESC",
-        "accessed": "m.access_count DESC, m.updated_at DESC",
+        "recent": "m.updated_at DESC, m.id DESC",
+        "importance": "m.importance DESC, m.updated_at DESC, m.id DESC",
+        "accessed": "m.access_count DESC, m.updated_at DESC, m.id DESC",
     }
     order_clause = f"ORDER BY {sort_map.get(sort, sort_map['recent'])}"
 

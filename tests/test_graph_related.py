@@ -229,3 +229,77 @@ def test_rrf_seed_floor_reads_raw_cosine(monkeypatch):
     related = {r["id"] for r in out.get("related", [])}
     assert not (({b, c} - ranked) & related), \
         "expanded from a junk seed that only rank compression made look strong"
+
+
+# --- neighbour selection must not depend on insertion order ------------------
+#
+# Third site of one defect class. `id` was the sole tiebreak in neighbour
+# selection, and ids encode insertion order, so which neighbour won the last
+# capped slot depended on the order memories were stored. The same mistake
+# was already found and fixed twice: in the dream survivor choice, and in the
+# rrf rank transform. This site has the most reach, because `related` decides
+# whether the answer to a transitive question appears at all.
+#
+# The rule that prevents a fourth instance: id may appear only as the terminal
+# element of an explicitly documented ordering key, never as an incidental
+# one. Here the full key is: hop-decayed relevance, fewer hops, importance,
+# recency, id.
+
+_ANCHOR = "Decision: the Perseus gateway routes checkout traffic through the edge tier."
+_RIVALS = [
+    # Two neighbours that are equally (ir)relevant to the anchor query and sit
+    # at the same hop, differing only in importance.
+    ("Ownership note: the Perseus gateway is owned by the platform group.", 2),
+    ("Ownership note: the Perseus gateway is owned by the traffic group.", 5),
+]
+_FILLER = [
+    "The Perseus gateway emits request metrics to the telemetry bus.",
+    "The Perseus gateway holds a 30 second idle timeout.",
+    "The Perseus gateway terminates TLS at the edge tier.",
+    "The Perseus gateway rate limits by API key.",
+]
+
+
+def _related_run(rival_order, monkeypatch):
+    server._conn = None
+    server._db = None
+    server.get_conn()
+    anchor = server.memory_store.__wrapped__(content=_ANCHOR, tags=["perseus"])["id"]
+    # Fill every slot but one so the two rivals compete for the last.
+    monkeypatch.setattr(server, "GRAPH_EXPAND_LIMIT", len(_FILLER) + 1)
+    for text in _FILLER:
+        fid = server.memory_store.__wrapped__(content=text, tags=["perseus"])["id"]
+        server.memory_relate.__wrapped__(from_id=fid, to_id=anchor,
+                                         relationship="RELATED_TO")
+    ids = {}
+    for i in rival_order:
+        text, imp = _RIVALS[i]
+        rid = server.memory_store.__wrapped__(content=text, tags=["perseus"],
+                                             importance=imp)["id"]
+        server.memory_relate.__wrapped__(from_id=rid, to_id=anchor,
+                                        relationship="RELATED_TO")
+        ids[i] = rid
+    out = server.memory_search.__wrapped__(
+        query="how does the Perseus gateway route checkout traffic", top_k=1)
+    related = {r["id"] for r in out.get("related", [])}
+    return {i: (ids[i] in related) for i in ids}
+
+
+def test_neighbour_selection_is_independent_of_insertion_order(monkeypatch):
+    """NOTE on the strength of this test: it passes with the old id-only
+    tiebreak too, because forcing an exact relevance tie needs two candidates
+    with identical embeddings — i.e. near-identical text, which dedup merges
+    before it can reach this code. So the defect here is real by inspection
+    (id was the terminal key with nothing between it and relevance) but its
+    exposure is narrow, unlike the rrf transform where BM25 ties across a
+    template made it routine. This stands as a guard against a future change
+    that widens the exposure, not as a reproduction of the original."""
+    forward = _related_run([0, 1], monkeypatch)
+    reverse = _related_run([1, 0], monkeypatch)
+    server._conn = None
+    server._db = None
+
+    assert forward == reverse, (
+        f"which neighbour won the capped slot changed with insertion order: "
+        f"forward={forward} reverse={reverse}"
+    )
