@@ -2927,9 +2927,40 @@ def memory_search(
         except Exception as e:
             logger.debug(f"Supersession lookup failed: {e}")
 
+    # Members of a SUPERSEDES cycle are exempt from the penalty.
+    #
+    # In a cycle every member is superseded by construction, so the flag
+    # carries no information about which is stale — while the x0.5 multiplier
+    # still destroys ranking. Measured: for "what is the Rukbat cache size" the
+    # answering memory scored vector 0.8569 / fts 1.0 for an unpenalised 0.769,
+    # halved to 0.3845, which put it BELOW three unrelated memories at ~0.41.
+    # At top_k=2 it was not returned at all — and because the cycle warning is
+    # (correctly) scoped to returned rows, the warning vanished too. So the
+    # caller asking exactly the affected question got unrelated memories and no
+    # indication anything was wrong: silence on the real question, which is
+    # worse than the over-broad warning that preceded it.
+    #
+    # The coherent behaviour is to rank cycle members on relevance and tell the
+    # caller the supersession data is unreliable. That also removes the
+    # multiplier in the case where it was most destructive under rank fusion,
+    # where a superseded memory could never clear the noise floor at all.
+    cycle_members: set[int] = set()
+    if len(superseded) > 1:
+        try:
+            r_cyc = conn.execute(
+                """MATCH p = (m:Memory)-[:SUPERSEDES*1..6]->(m)
+                   WHERE m.id IN $ids
+                   UNWIND nodes(p) AS n
+                   RETURN DISTINCT n.id;""",
+                {"ids": sorted(superseded)},
+            )
+            cycle_members = {row[0] for row in _collect_results(r_cyc)}
+        except Exception as e:
+            logger.debug(f"Supersession cycle detection failed (non-fatal): {e}")
+
     if superseded:
         for mid in superseded:
-            if mid in final_scores:
+            if mid in final_scores and mid not in cycle_members:
                 final_scores[mid] *= SUPERSEDED_PENALTY
 
     # Circular SUPERSEDES leaves an agent with no way to learn the graph is
@@ -3338,23 +3369,12 @@ def memory_search(
     # where an agent would otherwise trust a memory sitting inside a
     # contradictory loop. Requiring two also made the trigger depend on the
     # fusion mode, since rrf ranks differently and can return fewer members.
-    _returned_superseded = [r["id"] for r in results if r["id"] in superseded]
-    if _returned_superseded:
-        try:
-            # Trigger on the returned rows (that is what keeps the warning
-            # rare), but report EVERY member of the cycle: an agent cannot
-            # repair a loop it can only see part of, and once the trigger has
-            # fired the expansion is one more bounded query.
-            r_cyc = conn.execute(
-                """MATCH p = (m:Memory)-[:SUPERSEDES*1..6]->(m)
-                   WHERE m.id IN $ids
-                   UNWIND nodes(p) AS n
-                   RETURN DISTINCT n.id;""",
-                {"ids": sorted(_returned_superseded)},
-            )
-            supersession_cycles = sorted(row[0] for row in _collect_results(r_cyc))
-        except Exception as e:
-            logger.debug(f"Supersession cycle check failed (non-fatal): {e}")
+    # Trigger on the RETURNED rows — that is what keeps the warning rare — but
+    # report every member of the cycle, since an agent cannot repair a loop it
+    # can only partly see. Cycle membership was already computed above (it is
+    # needed to exempt these rows from the penalty), so this costs no query.
+    if cycle_members and any(r["id"] in cycle_members for r in results):
+        supersession_cycles = sorted(cycle_members)
 
     out: dict = {"results": results}
     if offset or more_available:

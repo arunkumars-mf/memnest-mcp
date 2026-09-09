@@ -74,14 +74,16 @@ Two further costs, both measured:
 - **No absolute quality signal.** Neither mode separates answerable from
   unanswerable questions by score, so this isn't a lost refusal signal — but
   an `rrf` score carries no information about how good the match actually is.
-- **Superseded memories become unreachable.** The supersession penalty is a
-  score multiplier (×0.5), which is coherent against `legacy`'s ~0.17 spread
-  and destructive against `rrf`'s ~0.01: the penalty dwarfs every relevance
-  difference, so a superseded memory sinks below unrelated results and cannot
-  be retrieved within a normal `top_k`. Measured on a 27-memory fixture, all
-  24 unrelated fillers outranked all 3 superseded members. A rank demotion
-  rather than a multiplier would be the coherent analogue under rank fusion;
-  until that is designed and measured, supersession and `rrf` do not compose.
+- **Superseded memories can be demoted out of the window.** The supersession
+  penalty is a score multiplier (×0.5), which is proportionate against
+  `legacy`'s ~0.17 spread and heavy against `rrf`'s ~0.01: under `rrf` a
+  superseded memory usually falls below unrelated results rather than merely
+  below its own correction. That is still a correct demotion — the current
+  version ranks first in both modes — but it means `rrf` cannot show you a
+  stale version for comparison. The pathological case, where the penalty hid
+  the *only* relevant memory, applied to supersession **cycles** and is fixed:
+  cycle members are exempt (see 0.28.2). A rank demotion rather than a
+  multiplier would be the coherent analogue under rank fusion.
 
 Use `rrf` when you want maximum recall in a window you will read entirely and
 stability under corpus edits. Keep `legacy` when you want scores that mean
@@ -356,6 +358,11 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.28.2
+
+- **Supersession-cycle members are exempt from the ×0.5 penalty.** In a cycle every member is superseded by construction, so the flag says nothing about which is stale while the multiplier still destroys ranking. Measured: for one query the answering memory scored an unpenalised 0.769 (vector 0.857, FTS 1.0) and was halved to 0.385, below three unrelated memories at ~0.41 — so at `top_k=2` it was not returned, and because the cycle warning is scoped to returned rows the warning vanished with it. The caller asking exactly the affected question got unrelated results and no indication anything was wrong. Cycle members now rank on relevance with `supersession_cycle` attached, which fixes the same failure under `rrf`, where the compressed score spread made it unavoidable.
+- Ordinary correction chains are unaffected: stale versions are still demoted.
 
 ### 0.28.1
 

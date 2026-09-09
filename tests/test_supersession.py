@@ -298,24 +298,12 @@ def test_dream_reports_a_cycle_identically_in_dry_run_and_for_real():
     assert "unrelate" in dry["contradictions"][0]["resolution"].lower()
 
 
-@pytest.mark.skipif(
-    server.FUSION_MODE == "rrf",
-    reason=(
-        "Under MEMORY_FUSION=rrf a superseded memory is not retrievable at all, "
-        "so no cycle member reaches the result list for the notice to attach to. "
-        "The superseded penalty is MULTIPLICATIVE (x0.5) while rank fusion "
-        "compresses the score spread to ~0.01, so the penalty dwarfs every "
-        "relevance difference and sinks superseded memories below unrelated "
-        "fillers — measured here: all 24 fillers outrank all 3 cycle members. "
-        "That is a real rrf limitation (a rank demotion, not a score multiplier, "
-        "would be the coherent analogue) and it is documented rather than "
-        "papered over; rrf is opt-in and already measures below legacy.")
-)
 def test_search_tells_the_agent_the_supersession_data_is_circular():
     ids = _make_cycle()
-    # top_k wide enough that a cycle member is returned under ANY fusion mode:
-    # this test is about the cycle notice, not about where a given mode ranks
-    # the members (rrf ranks them below the fillers for this query).
+    # Passes in every fusion mode since cycle members are exempt from the
+    # supersession penalty: the multiplier used to sink them below unrelated
+    # fillers (guaranteed under rrf's compressed spread, and reachable under
+    # legacy whenever the margin over the noise floor was under 2x).
     out = server.memory_search.__wrapped__(query="what is the Sadr ingest throttle",
                                            top_k=30)
     cyc = out.get("supersession_cycle")
@@ -356,11 +344,6 @@ def test_a_healthy_chain_is_never_flagged_as_circular():
         "the newest version must outrank the older ones in a healthy chain"
 
 
-@pytest.mark.skipif(
-    server.FUSION_MODE == "rrf",
-    reason="see the skip on test_search_tells_the_agent_...: under rrf no "
-           "superseded memory is retrievable, so the on-topic half of this "
-           "test has no cycle member to return")
 def test_cycle_warning_does_not_attach_to_unrelated_queries():
     """The warning must be scoped to the RETURNED rows, not to every scored
     candidate. It was originally keyed off the superseded set derived from
@@ -387,3 +370,68 @@ def test_cycle_warning_does_not_attach_to_unrelated_queries():
         "a query that returns cycle members must still warn"
     assert "supersession_cycle" not in off_topic, \
         "a query returning no cycle member must not carry the warning"
+
+
+def test_cycle_members_rank_on_relevance_not_penalised_into_invisibility():
+    """The composite failure this exemption fixes.
+
+    Measured in the field: for "what is the Rukbat cache size" the answering
+    memory scored vector 0.8569 / fts 1.0 — an unpenalised 0.769 — and the
+    x0.5 multiplier dropped it to 0.3845, below three unrelated memories at
+    ~0.41. At top_k=2 it was not returned at all, and because the cycle
+    warning is (correctly) scoped to returned rows, the warning disappeared
+    with it. The caller asking exactly the affected question received
+    unrelated memories and no indication anything was wrong.
+
+    In a cycle the superseded flag says nothing about which member is stale,
+    so the penalty is pure damage. Rank on relevance and flag the cycle.
+    """
+    V = ["The Rukbat cache size is 40 GB.",
+         "Correction: the Rukbat cache size is 80 GB.",
+         "Correction: the Rukbat cache size is 120 GB."]
+    ids, prev = [], None
+    for v in V:
+        kw = {"supersedes": prev} if prev else {}
+        ids.append(server.memory_store.__wrapped__(
+            content=v, tags=["rukbat", "cache"], **kw)["id"])
+        prev = ids[-1]
+    server.memory_relate.__wrapped__(from_id=ids[0], to_id=ids[2],
+                                     relationship="SUPERSEDES")
+    for i, txt in enumerate([
+        "INC-9100: a Selene cache stampede caused elevated latency for 40 minutes.",
+        "Manifest checksums are verified on every cache warm start.",
+        "The Vega cache is partitioned by tenant id.",
+        "Cache eviction uses LRU across all services.",
+    ]):
+        server.memory_store.__wrapped__(content=txt, tags=[f"cyc-noise{i}"])
+
+    # The narrow window is the point: this is where the answer used to vanish.
+    out = server.memory_search.__wrapped__(query="what is the Rukbat cache size",
+                                           top_k=2)
+    returned = [r["id"] for r in out["results"]]
+    assert any(m in ids for m in returned), \
+        f"the answering cycle member must be reachable at top_k=2, got {returned}"
+    assert out.get("supersession_cycle"), \
+        "and the caller must be told the supersession data is unreliable"
+
+
+def test_ordinary_superseded_memories_are_still_penalised():
+    """The exemption is for cycles only — a normal correction chain must still
+    demote its stale versions, which is the whole point of the feature."""
+    old = server.memory_store.__wrapped__(
+        content="The Izar retry budget is 3 attempts.", tags=["izar", "retry"])
+    new = server.memory_store.__wrapped__(
+        content="Correction: the Izar retry budget is 7 attempts.",
+        tags=["izar", "retry"], supersedes=old["id"])
+
+    out = server.memory_search.__wrapped__(query="what is the Izar retry budget",
+                                           top_k=5)
+    ranked = [r["id"] for r in out["results"]]
+    assert new["id"] in ranked, "the current version must be retrievable"
+    if old["id"] in ranked:
+        assert ranked.index(new["id"]) < ranked.index(old["id"]), \
+            "the current version must outrank the superseded one"
+    # Under rrf the multiplier can demote the stale version clear out of the
+    # window — a documented rrf limitation (see README), and still a correct
+    # demotion. What must NOT happen is the stale version outranking.
+    assert "supersession_cycle" not in out
