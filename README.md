@@ -49,23 +49,35 @@ answers, so `legacy` remains the default:
 
 | | `legacy` | `rrf` |
 |---|---|---|
-| LOCOMO overall | 84.4% / 85.4% | 82.4% |
-| Gold-evidence recall @20 (no LLM) | 58.2% | **64.3%** |
-| Gold-evidence MRR @20 (no LLM) | **0.354** | 0.337 |
+| LOCOMO overall | **84.4% / 85.4%** | 82.4% |
+| Gold-evidence recall @20 (no LLM) | 58.2% | **66.3%** |
+| Gold-evidence recall @5 (no LLM) | 46.9% | 46.9% |
+| Gold-evidence MRR @20 (no LLM) | **0.354** | 0.346 |
 | Top-1 score on *unanswerable* questions | 0.70 | 0.93 |
+| Score spread across top 4 | ~0.17 | ~0.01 |
 
 The retrieval-only numbers are deterministic and show the real trade: `rrf`
-surfaces more gold evidence inside the top 20 (+6.1 points recall) but ranks
-it slightly lower (−0.017 MRR). Because the answer agent already reads the
-top 20, the extra recall didn't convert into better answers.
+surfaces considerably more gold evidence inside the top 20 (+8.1 points
+recall) but ranks it slightly lower (−0.008 MRR). Because the answer agent
+already reads the top 20, the extra recall didn't convert into better answers,
+and an independent A/B on a 38-fact corpus lost two answers outright to
+top-rank precision.
 
-`rrf` also inflates absolute scores (top-1 rises 0.70 → 0.93) and compresses
-their spread, since rank 1 scores 1.0 per channel however weak the match is.
-Neither mode separates answerable from unanswerable questions by score, so
-this isn't a lost refusal signal — but it does mean `rrf` scores carry no
-information about absolute match quality. Use it when you want rank
-robustness and stability under corpus edits; keep `legacy` when you want
-scores that mean something.
+Two further costs, both measured:
+
+- **Scores stop discriminating.** `rrf` inflates absolute scores (top-1 rises
+  0.70 → 0.93) and compresses their spread to ~0.01 across the top 4, versus
+  ~0.17 under `legacy`, because rank 1 contributes 1.0 per channel however
+  weak the match is. Exact ties between adjacent results are normal. In
+  practice you cannot threshold on an `rrf` score, and ordering inside the
+  band is decided by the tiebreak rather than by relevance.
+- **No absolute quality signal.** Neither mode separates answerable from
+  unanswerable questions by score, so this isn't a lost refusal signal — but
+  an `rrf` score carries no information about how good the match actually is.
+
+Use `rrf` when you want maximum recall in a window you will read entirely and
+stability under corpus edits. Keep `legacy` when you want scores that mean
+something, which is why it is the default.
 
 ### Architecture advantages
 
@@ -335,6 +347,16 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.27.0
+
+- **Result ordering no longer depends on the order memories were stored.** Two fixes to the same defect class: the `rrf` rank transform broke channel-value ties by memory id (and ids encode insertion order, so identical BM25 scores produced arbitrary ranks that propagated into different fused scores), and the final sort broke score ties by dict order. Channel ranks now use competition ranking — equal values get equal rank — and final ties break on importance, then recency, then id. A 4-memory fixture that reordered its own results purely by store order now doesn't.
+- This was costing `rrf` measurable quality: gold-evidence recall@20 rises 64.3% → 66.3% and recall@5 45.4% → 46.9% (now equal to `legacy`). `legacy` is unaffected — it does no rank transform, and anchors are bit-identical.
+- Documents the `rrf` score-compression cost: spread across the top 4 is ~0.01 versus ~0.17 under `legacy`, so `rrf` scores cannot be thresholded.
+
+### 0.26.2
+
+- Verifies a real restore into a separate on-disk database, not just an in-memory one: embeddings recomputed, index fully reachable, restored memories findable, supersession still resolving to current.
 
 ### 0.26.0
 

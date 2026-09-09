@@ -2814,7 +2814,28 @@ def memory_search(
                  if raw_scores[m][channel] > 0 or (channel == "vector" and m in vector_hits)),
                 key=lambda m: (-raw_scores[m][channel], m),
             )
-            for rank, m in enumerate(ranked, start=1):
+            # COMPETITION ranking: equal channel values get the SAME rank.
+            #
+            # Breaking value ties by id looked harmless and was not — ids encode
+            # insertion order, so two memories with identical BM25 scores (easy
+            # to produce: same template, different subject) received arbitrary
+            # ranks, and that arbitrariness propagated into different FUSED
+            # scores. A 4-memory fixture reordered its own results purely by
+            # store order. Same defect class as the dream survivor tiebreak,
+            # where an id tiebreak leaked insertion order.
+            #
+            # Tied inputs must produce tied contributions; the final ordering
+            # then breaks on memory properties (see _rank_key below), never on
+            # storage history.
+            prev_val = None
+            prev_rank = 0
+            for pos, m in enumerate(ranked, start=1):
+                val = raw_scores[m][channel]
+                if prev_val is not None and val == prev_val:
+                    rank = prev_rank
+                else:
+                    rank = pos
+                    prev_val, prev_rank = val, pos
                 raw_scores[m][channel] = (RRF_K + 1) / (RRF_K + rank)
 
     now = time.time()
@@ -2891,11 +2912,29 @@ def memory_search(
             if mid in final_scores:
                 final_scores[mid] *= SUPERSEDED_PENALTY
 
-    # Build results
+    # Build results.
+    #
+    # Ties break on MEMORY PROPERTIES, not on insertion order. Sorting by score
+    # alone leaves equal scores to dict order — which is the order memories
+    # happened to enter the channels, so it looks stable while silently
+    # depending on corpus composition (the same trap as the dream survivor
+    # tiebreak, where an id tiebreak leaked insertion order). Exact ties are
+    # rare under 'legacy' float scores but COMMON under rank fusion, where two
+    # memories holding the same ranks across channels score identically —
+    # measured in the field at 0.715/0.715 on adjacent results. Importance then
+    # recency then id is deterministic and defensible: when relevance cannot
+    # separate two memories, prefer the one the user marked more important,
+    # then the one that changed most recently.
+    def _rank_key(item):
+        mid_, score_ = item
+        mem_ = memory_data.get(mid_) or {}
+        return (-score_, -(mem_.get("importance") or 0),
+                -(mem_.get("updated_at") or 0.0), mid_)
+
     results = []
     skipped = 0
     more_available = False
-    for mid, score in sorted(final_scores.items(), key=lambda x: -x[1]):
+    for mid, score in sorted(final_scores.items(), key=_rank_key):
         mem = memory_data.get(mid)
         if not mem:
             try:

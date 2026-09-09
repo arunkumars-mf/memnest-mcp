@@ -11,6 +11,7 @@ Metrics reported: precision@1, MRR, recall@3.
 
 import os
 import sys
+import time
 
 os.environ.setdefault("MEMORY_DB_PATH", ":memory:")
 os.environ.setdefault("MEMORY_WORKSPACE", "/retrieval-test")
@@ -125,3 +126,66 @@ def test_keyword_distractor_does_not_outrank_semantic_answer(populated):
         f"keyword distractor outranked the semantic answer (correct answer at "
         f"rank {rank}); the fusion channels are likely on incomparable scales"
     )
+
+
+# --- tie ordering must not depend on insertion order -------------------------
+#
+# Sorting by score alone left equal scores to dict order — the order memories
+# happened to enter the channels — so ranking looked stable while depending on
+# corpus composition. Exact ties are rare under 'legacy' float scores but
+# common under rank fusion, where two memories holding the same ranks across
+# channels score identically (observed in the field at 0.715/0.715 on adjacent
+# results, with the top two exactly equal). Ties now break on memory
+# properties: importance, then recency, then id.
+
+_TIE_FACTS = [
+    ("The alpha collector batches settlement rows every cycle.", 1, "alpha"),
+    ("The beta collector batches settlement rows every cycle.", 5, "beta"),
+    ("The gamma collector batches settlement rows every cycle.", 2, "gamma"),
+    ("The delta collector batches settlement rows every cycle.", 4, "delta"),
+]
+_TIE_QUERY = "collector batches settlement rows every cycle"
+
+
+def _tie_run(order):
+    server._conn = None
+    server._db = None
+    server.get_conn()
+    for i in order:
+        content, imp, tag = _TIE_FACTS[i]
+        server.memory_store.__wrapped__(content=content, tags=[tag], importance=imp)
+    # Freeze recency so it cannot silently do the tiebreaking for us.
+    server.get_conn().execute("MATCH (m:Memory) SET m.updated_at = $t;",
+                              {"t": time.time() - 30 * 86400})
+    out = server.memory_search.__wrapped__(query=_TIE_QUERY, top_k=4)
+    return [(round(r["score"], 6), r["content"].split()[1]) for r in out["results"]]
+
+
+def test_ranking_is_independent_of_insertion_order():
+    a = _tie_run([0, 1, 2, 3])
+    b = _tie_run([3, 2, 1, 0])
+    c = _tie_run([2, 0, 3, 1])
+    server._conn = None
+    server._db = None
+
+    names = [[w for _, w in r] for r in (a, b, c)]
+    assert names[0] == names[1] == names[2], \
+        f"result order changed with insertion order: {names}"
+
+
+def test_tied_scores_break_toward_higher_importance():
+    rows = _tie_run([0, 1, 2, 3])
+    server._conn = None
+    server._db = None
+    imp_of = {tag: imp for _, imp, tag in _TIE_FACTS}
+
+    groups: dict = {}
+    for score, name in rows:
+        groups.setdefault(score, []).append(name)
+
+    for score, names in groups.items():
+        if len(names) < 2:
+            continue  # not a tie
+        imps = [imp_of[n] for n in names]
+        assert imps == sorted(imps, reverse=True), \
+            f"tie at {score} ordered {imps}, expected descending importance"
