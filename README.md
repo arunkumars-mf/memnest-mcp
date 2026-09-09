@@ -177,6 +177,12 @@ That's it — zero config required. All settings have sensible defaults.
 | `memory_graph_html` | Generate an interactive HTML visualization of the graph |
 | `memory_traverse` | *Deprecated* — use `memory_query(read_only=True)` |
 
+Exports are **safe to share by default**: workspace values are absolute paths, so
+they are replaced with opaque labels (`workspace-1`) that preserve the
+distinction between workspaces without disclosing directory layout. Pass
+`include_workspace_paths=True` for a local backup where you want the real
+values. Import ignores the field either way and assigns the current workspace.
+
 ## Graph Data Model
 
 ```

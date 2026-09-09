@@ -4511,7 +4511,8 @@ EXPORT_FORMAT_VERSION = 1
 @mcp.tool()
 @_timed("memory_export")
 def memory_export(path: Optional[str] = None, include_embeddings: bool = False,
-                  global_export: bool = False) -> str:
+                  global_export: bool = False,
+                  include_workspace_paths: bool = False) -> str:
     """Write all memories AND their edges to a portable JSON file.
 
     There was no backup path at all, which is uncomfortable for a store that is
@@ -4544,6 +4545,25 @@ def memory_export(path: Optional[str] = None, include_embeddings: bool = False,
     except Exception as e:
         return {"status": "error", "message": f"Export query failed: {e}"}
 
+    # Workspace values are absolute filesystem paths, and they appear once per
+    # memory plus once in the header — so a 38-memory export disclosed the
+    # user's directory layout in 39 places. Exports are the artefact people
+    # attach to bug reports, support threads and shared fixtures, so sharing is
+    # the PRIMARY use rather than an edge case. Import never reads the field
+    # (verified), which makes scrubbing free: replace each distinct path with a
+    # stable opaque label, preserving the DISTINCTIONS a global export needs
+    # without carrying the paths. Pass include_workspace_paths=True to keep the
+    # real values for a local backup.
+    _ws_labels: dict = {}
+
+    def _ws(value: str) -> str:
+        v = value or ""
+        if include_workspace_paths or not v:
+            return v          # "" is the global-scope marker, not a path
+        if v not in _ws_labels:
+            _ws_labels[v] = f"workspace-{len(_ws_labels) + 1}"
+        return _ws_labels[v]
+
     memories = []
     ids = set()
     for r in rows:
@@ -4552,7 +4572,7 @@ def memory_export(path: Optional[str] = None, include_embeddings: bool = False,
             "id": r[0], "content": r[1], "category": r[2],
             "tags": _parse_tags(r[3]), "importance": r[4],
             "access_count": r[5] or 0, "created_at": r[6], "updated_at": r[7],
-            "workspace": r[8] or "",
+            "workspace": _ws(r[8] or ""),
         }
         if include_embeddings and len(r) > 9 and r[9] is not None:
             item["embedding"] = list(r[9])
@@ -4589,7 +4609,8 @@ def memory_export(path: Optional[str] = None, include_embeddings: bool = False,
         "format_version": EXPORT_FORMAT_VERSION,
         "exported_at": time.time(),
         "server_version": SERVER_VERSION,
-        "workspace": "*" if global_export else WORKSPACE,
+        "workspace": "*" if global_export else _ws(WORKSPACE),
+        "workspace_paths_included": include_workspace_paths,
         "embedding_model": EMBEDDING_MODEL,
         "embedding_dim": EMBEDDING_DIM,
         "includes_embeddings": include_embeddings,

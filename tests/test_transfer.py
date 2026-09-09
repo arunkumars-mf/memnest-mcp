@@ -249,3 +249,70 @@ def test_restore_into_a_separate_database_file_recovers_retrieval(tmp_path,
 
     server._conn = None
     server._db = None
+
+
+# --- exports must not disclose filesystem paths ------------------------------
+#
+# Workspace values are absolute paths, and they appeared once per memory plus
+# once in the header — a 38-memory export disclosed the user's directory layout
+# in 39 places. Exports are the artefact people attach to bug reports, support
+# threads and shared fixtures, so sharing is the primary use, not an edge case.
+# Import never reads the field, so scrubbing is free.
+
+def test_export_does_not_leak_the_workspace_path(tmp_json, monkeypatch):
+    secret = "/Users/someone/private-project-name"
+    monkeypatch.setattr(server, "WORKSPACE", secret)
+    server.memory_store.__wrapped__(content="A fact about the ledger pipeline.",
+                                    tags=["ledger"])
+
+    server.memory_export.__wrapped__(path=tmp_json)
+    raw = open(tmp_json).read()
+    assert secret not in raw, "the export discloses the workspace path"
+
+    payload = json.loads(raw)
+    assert payload["workspace"] == "workspace-1"
+    assert payload["memories"][0]["workspace"] == "workspace-1"
+    assert payload["workspace_paths_included"] is False
+
+
+def test_paths_can_be_kept_deliberately_for_a_local_backup(tmp_json, monkeypatch):
+    secret = "/Users/someone/private-project-name"
+    monkeypatch.setattr(server, "WORKSPACE", secret)
+    server.memory_store.__wrapped__(content="A fact about the ledger pipeline.",
+                                    tags=["ledger"])
+
+    server.memory_export.__wrapped__(path=tmp_json, include_workspace_paths=True)
+    payload = json.loads(open(tmp_json).read())
+    assert payload["workspace"] == secret
+    assert payload["workspace_paths_included"] is True
+
+
+def test_scrubbing_preserves_distinctions_between_workspaces(tmp_json, monkeypatch):
+    """A global export must still distinguish workspaces — labels, not paths."""
+    monkeypatch.setattr(server, "WORKSPACE", "/Users/someone/project-a")
+    server.memory_store.__wrapped__(content="Project A owns the ledger runbook.",
+                                    tags=["a"])
+    monkeypatch.setattr(server, "WORKSPACE", "/Users/someone/project-b")
+    server.memory_store.__wrapped__(content="Project B owns the gateway runbook.",
+                                    tags=["b"])
+
+    server.memory_export.__wrapped__(path=tmp_json, global_export=True)
+    raw = open(tmp_json).read()
+    assert "project-a" not in raw and "project-b" not in raw
+    labels = {m["workspace"] for m in json.loads(raw)["memories"]}
+    assert labels == {"workspace-1", "workspace-2"}, \
+        f"distinct workspaces must stay distinct after scrubbing, got {labels}"
+
+
+def test_scrubbed_export_still_round_trips(tmp_json, monkeypatch):
+    monkeypatch.setattr(server, "WORKSPACE", "/Users/someone/private-project-name")
+    server.memory_store.__wrapped__(content="A fact about the ledger pipeline.",
+                                    tags=["ledger"])
+    server.memory_export.__wrapped__(path=tmp_json)
+
+    _reset_db()
+    res = server.memory_import.__wrapped__(path=tmp_json)
+    assert res["status"] == "imported"
+    assert server.memory_search.__wrapped__(
+        query="ledger pipeline", top_k=3)["results"], \
+        "a scrubbed export must remain importable and searchable"
