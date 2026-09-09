@@ -299,6 +299,17 @@ SEARCH_CANDIDATE_POOL = int(os.environ.get("MEMORY_SEARCH_CANDIDATES", "100"))
 #     negative measurement above actually indicts. The curated case is
 #     untested, and building that fixture is the prerequisite for judging it.
 #
+#   - But the obvious fix — "add the asserted edges" — must NOT be done as a
+#     bundle, and one half of it must not be done at all. SUPERSEDES points
+#     newer -> older, so PageRank in-degree accumulates on the memory being
+#     REPLACED: measured on a 3-step correction chain, including it ranks the
+#     oldest version first (0.0772) and the CURRENT answer last (0.0300), and
+#     it would compound incoherently with the penalty that halves those same
+#     memories. EXPLAINS points rationale -> decision, so its in-degree lands
+#     on the decision being justified (0.0555 vs 0.0300) — a plausible signal.
+#     Guarded by tests in test_graph_algos.py so the exclusion is deliberate
+#     rather than incidental.
+#
 # The default is unchanged at 0.15 pending that measurement — the same bar
 # applied to the fusion mode. Set 0 to disable centrality if your memories are
 # heavily tagged or your edges are mostly inferred.

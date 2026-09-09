@@ -324,3 +324,100 @@ def test_dream_merge_migrates_edges_from_all_dropped_members():
         "MATCH (a:Memory)-[:EXPLAINS]->(b:Memory) RETURN a.id, b.id;"))
     assert len(rows) == 1 and rows[0][0] == anchor, \
         "the EXPLAINS edge must survive onto the merge survivor"
+
+
+# --- which edge types may feed centrality ------------------------------------
+#
+# The graph channel currently projects ABOUT + RELATED_TO. The obvious-looking
+# improvement — "also include the agent-asserted SUPERSEDES and EXPLAINS edges,
+# so centrality reflects curated structure" — is half wrong, and the half that
+# is wrong is wrong by DIRECTION, which no amount of tuning fixes:
+#
+#   SUPERSEDES points newer -> older. PageRank rewards in-degree, so mass flows
+#   onto the memory being REPLACED. The most-superseded memory in a chain is
+#   the oldest one, and mid-chain versions carry both an in- and an out-edge.
+#   A correction chain therefore puts MAXIMUM centrality on stale versions.
+#   Measured on a 3-step chain: oldest 0.0772, middle 0.0555, current 0.0300 —
+#   the current answer ranks LAST. It would also compound incoherently with the
+#   supersession penalty, which halves those same memories.
+#
+#   EXPLAINS points rationale -> decision, so its in-degree lands on the
+#   decision being justified: "this decision has recorded rationale", which is
+#   a plausible relevance signal. Measured: decision 0.0555, rationale 0.0300.
+#
+# So the two must never be evaluated as a bundle — mixing a useful signal with
+# an inverted one would measure as a wash and produce the right conclusion for
+# the wrong reason. These tests guard the rule rather than the current weight.
+
+def _chain_and_rationale():
+    store = server.memory_store.__wrapped__
+    v1 = store(content="Helios ran on a monolith in 2022.", tags=["helios", "arch"])["id"]
+    v2 = store(content="Correction: Helios migrated from a monolith to "
+                       "microservices in 2023.", tags=["helios", "arch"],
+               supersedes=v1)["id"]
+    v3 = store(content="Correction: Helios consolidated back to a modular "
+                       "monolith in 2025.", tags=["helios", "arch"],
+               supersedes=v2)["id"]
+    dec = store(content="Decision: the ledger-db cluster is deprecated for new "
+                        "writes.", tags=["ledger", "decision"])["id"]
+    why = store(content="INC-4400: a ledger-db failover caused twelve minutes "
+                        "of errors.", tags=["ledger", "incident"])["id"]
+    server.memory_relate.__wrapped__(from_id=why, to_id=dec, relationship="EXPLAINS")
+    return v1, v2, v3, dec, why
+
+
+def _pagerank_with(edge_types):
+    conn = server.get_conn()
+    try:
+        conn.execute("CALL DROP_PROJECTED_GRAPH('guard');")
+    except Exception:
+        pass
+    server._project_graph_scoped(conn, "guard", server.WORKSPACE, edge_types,
+                                 include_topics=False)
+    rows = server._collect_results(conn.execute(
+        "CALL PAGE_RANK('guard') RETURN node.id, rank;"))
+    try:
+        conn.execute("CALL DROP_PROJECTED_GRAPH('guard');")
+    except Exception:
+        pass
+    return {mid: rank for mid, rank in rows}
+
+
+def test_supersedes_in_centrality_would_rank_stale_above_current():
+    """Documents WHY SUPERSEDES must stay out of the projection. If this ever
+    starts failing, the edge direction or the ranking semantics changed and the
+    exclusion should be revisited."""
+    v1, v2, v3, _dec, _why = _chain_and_rationale()
+    pr = _pagerank_with(["RELATED_TO", "SUPERSEDES"])
+
+    assert pr[v1] > pr[v3], (
+        "SUPERSEDES in-degree accumulates on the REPLACED memory, so including "
+        "it ranks the oldest version above the current one — an inverted signal"
+    )
+    assert pr[v2] > pr[v3], "mid-chain (stale) also outranks current"
+
+
+def test_the_shipped_projection_excludes_supersedes():
+    """The guard that matters: the real centrality projection must not contain
+    SUPERSEDES, whatever else is added to it later."""
+    v1, _v2, v3, _dec, _why = _chain_and_rationale()
+    server.memory_dream.__wrapped__(force=True)   # computes centrality for real
+
+    rows = server._collect_results(server.get_conn().execute(
+        "MATCH (m:Memory) WHERE m.id IN $ids RETURN m.id, m.pagerank;",
+        {"ids": [v1, v3]}))
+    pr = {mid: rank for mid, rank in rows}
+    assert pr.get(v1, 0) <= pr.get(v3, 0) or pr.get(v1, 0) == pr.get(v3, 0), (
+        "the shipped projection is ranking a superseded memory above its "
+        "current version — SUPERSEDES has leaked into centrality"
+    )
+
+
+def test_explains_directs_centrality_onto_the_explained_decision():
+    """The half of the idea that survives: a decision with recorded rationale
+    gains, not the rationale itself. Recorded so a future change adds EXPLAINS
+    for the right reason."""
+    _v1, _v2, _v3, dec, why = _chain_and_rationale()
+    pr = _pagerank_with(["RELATED_TO", "EXPLAINS"])
+    assert pr[dec] > pr[why], \
+        "EXPLAINS should land mass on the decision being justified"
