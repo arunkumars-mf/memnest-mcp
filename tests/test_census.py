@@ -226,33 +226,53 @@ def test_same_engine_does_not_rebuild():
 
 # --- census completeness boundary ---------------------------------------------
 #
-# The per-query census is complete only while the candidate pool covers the
-# corpus — beyond that it verifies a pool-sized slice, which is exactly the
-# regime long-lived memory grows into (at 5,000 memories a 100-pool checks 2%).
-# A partial check must not read as a complete one, and the FULL census (probe
-# with k = every embedded memory, valid at any corpus size) must run somewhere
-# that acts: dream, at most daily.
+# Census coverage must hold at EVERY corpus size. The cheap path compares the
+# ranked vector hits against the corpus, which only works while the ranking
+# pool covers it — the regime a real workspace outgrows in weeks. That used to
+# make the census "inapplicable" above the pool, so the detector for the worst
+# bug class protected a shrinking slice (2% at 5,000 memories) exactly as the
+# graph got big enough for partial unreachability to matter. Above the pool a
+# dedicated id-only probe at k=corpus runs instead: ~10% of a search's cost,
+# 100% coverage.
 
 
-def test_search_census_declares_incompleteness_when_pool_is_smaller(monkeypatch):
+def test_search_census_covers_corpus_even_when_pool_is_smaller(monkeypatch):
     _seed(12)
     monkeypatch.setattr(server, "SEARCH_CANDIDATE_POOL", 6)
     out = server.memory_search.__wrapped__(query="diagnostics endpoint", top_k=2,
                                            explain=True)
     meta = out["explain_meta"]
-    assert meta["census_complete"] is False
-    # None, not 0: zero is a legal count and read in the field as "expected
-    # zero reachable" rather than "not applicable".
-    assert meta["vector_census_expected"] is None
-    # And crucially: no bogus degraded flag from an inapplicable comparison.
+    assert meta["census_complete"] is True, \
+        "coverage must not lapse just because the corpus outgrew the pool"
+    assert meta["census_mode"] == "probe", \
+        "above the pool the index must be probed directly"
+    # And crucially: the pool-capped ranked list must not read as a shortfall.
     assert "degraded" not in out
 
 
-def test_search_census_declares_completeness_when_pool_covers_corpus():
+def test_search_census_uses_the_free_path_when_pool_covers_corpus():
     _seed(12)
-    out = server.memory_search.__wrapped__(query="diagnostics endpoint", top_k=2,
-                                           explain=True)
-    assert out["explain_meta"]["census_complete"] is True
+    meta = server.memory_search.__wrapped__(query="diagnostics endpoint", top_k=2,
+                                            explain=True)["explain_meta"]
+    assert meta["census_complete"] is True
+    assert meta["census_mode"] == "pool", \
+        "no extra probe should be paid for when the pool already proves coverage"
+    assert meta["vector_census_expected"] == 12
+
+
+def test_small_pool_still_detects_a_real_shortfall(monkeypatch):
+    """The point of keeping coverage above the pool: damage must still be
+    caught there. Index answers from a subset, pool smaller than corpus."""
+    _seed(12)
+    monkeypatch.setattr(server, "SEARCH_CANDIDATE_POOL", 6)
+    conn = server.get_conn()
+    fake = _PartialIndex(conn, drop={3, 4, 5, 6})
+    fake.install()
+
+    server.memory_search.__wrapped__(query="diagnostics endpoint", top_k=2,
+                                     explain=True)
+    assert fake.broken is False, \
+        "a shortfall must trigger repair even when the pool cannot see it"
 
 
 def test_dream_full_census_reports_healthy_counts():
@@ -383,3 +403,49 @@ def test_delete_census_is_quiet_on_a_healthy_index():
     conn.execute = orig
     assert out["status"] == "deleted"
     assert not rebuilds, "healthy index must not be rebuilt on delete"
+
+
+# --- dream scan coverage ------------------------------------------------------
+#
+# MAX_CONSOLIDATE_SCAN bounds what one dream examines. It used to be a
+# permanent HORIZON: always the newest N by updated_at, so once a workspace
+# passed the cap everything older was never considered for merge or prune
+# again — silent coverage loss at ordinary sizes, not extreme ones. It is now
+# a rotating WINDOW: same per-run cost, full coverage over successive runs.
+
+def test_dream_scan_window_rotates_and_wraps(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "MAX_CONSOLIDATE_SCAN", 20)
+    monkeypatch.setattr(server, "_dream_scan_cursor", 0)
+    _seed(100)
+
+    offsets = []
+    for _ in range(6):
+        out = server.memory_dream.__wrapped__(force=True)
+        offsets.append(out["scan_coverage"]["offset"])
+
+    assert offsets == [0, 20, 40, 60, 80, 0], \
+        f"window must advance then wrap, got {offsets}"
+
+
+def test_dream_reports_runs_needed_for_full_coverage(monkeypatch):
+    monkeypatch.setattr(server, "MAX_CONSOLIDATE_SCAN", 20)
+    monkeypatch.setattr(server, "_dream_scan_cursor", 0)
+    _seed(100)
+
+    cov = server.memory_dream.__wrapped__(force=True)["scan_coverage"]
+    assert cov["corpus"] == 100
+    assert cov["window"] == 20
+    assert cov["runs_for_full_coverage"] == 5, \
+        "a caller must be able to see that one run is not the whole corpus"
+
+
+def test_dream_scan_does_not_rotate_while_corpus_fits(monkeypatch):
+    """No cursor churn when the window already covers everything."""
+    monkeypatch.setattr(server, "MAX_CONSOLIDATE_SCAN", 1000)
+    monkeypatch.setattr(server, "_dream_scan_cursor", 0)
+    _seed(12)
+
+    for _ in range(3):
+        cov = server.memory_dream.__wrapped__(force=True)["scan_coverage"]
+        assert cov["offset"] == 0
+        assert cov["runs_for_full_coverage"] == 1

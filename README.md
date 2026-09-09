@@ -247,9 +247,9 @@ All settings are optional — defaults work out of the box.
 | `MEMORY_DREAM_TRIVIAL_THRESHOLD` | `0.95` | Cosine similarity ≥ this is auto-merged in dream |
 | `MEMORY_DREAM_CLUSTER_LOW` | `0.88` | Cluster-review window: `[low, trivial)` is surfaced for agent review |
 | `MEMORY_CONSOLIDATE_CLUSTERS` | `10` | Max clusters returned per `memory_dream` run |
-| `MEMORY_CONSOLIDATE_SCAN` | `1000` | Max memories scanned per dream phase |
+| `MEMORY_CONSOLIDATE_SCAN` | `1000` | Memories examined per dream run — a rotating **window**, not a horizon. Above this size the window advances each run, so the whole corpus is covered over `ceil(corpus / window)` runs at unchanged per-run cost. `memory_dream` reports `scan_coverage` |
 | `MEMORY_ALLOW_DESTRUCTIVE` | `false` | Allow DELETE/DROP/TRUNCATE/REMOVE/SET/COPY through `memory_query`. **Off by default for safety.** Prefer `memory_update`, `memory_delete`, `memory_unrelate` |
-| `MEMORY_SEARCH_CANDIDATES` | `100` | Rows each search channel retrieves before fusion. Independent of `top_k` |
+| `MEMORY_SEARCH_CANDIDATES` | `100` | Rows each search channel retrieves before fusion. Independent of `top_k`. Does not affect index-health coverage: above this size the census switches to a dedicated id-only probe |
 | `MEMORY_FUSION` | `legacy` | Channel fusion: `legacy` (raw cosine + max-normalized FTS), `normalized` (min-max vector), or `rrf` (reciprocal rank fusion — only each channel's *ordering* enters the score, so channel scales can't interact and scores stay stable when memories are added or deleted). `rrf` stays opt-in: it measured **below** `legacy` on LOCOMO (see [Fusion modes](#fusion-modes)) |
 | `MEMORY_RRF_K` | `60` | Rank-decay constant for `rrf` mode. Channel value is `(K+1)/(K+rank)`: 1.0 at rank 1, ~0.87 at rank 10 |
 | `MEMORY_MAX_STORE_CHARS` | `20000` | Content longer than this is truncated on store |
@@ -335,6 +335,19 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.26.0
+
+Closes two silent coverage losses that appeared at ordinary corpus sizes, not extreme ones.
+
+- **Index-health coverage no longer lapses above the candidate pool.** The per-query census compared ranked vector hits against the corpus, which only works while the pool (100) covers it — so the detector for the worst bug class protected a shrinking slice as a workspace grew (2% at 5,000 memories). Above the pool it now runs a dedicated id-only probe at `k=corpus`: measured 19.7 ms against a 191.8 ms search, ~10% overhead, 100% coverage at every size. `explain_meta.census_mode` reports which path ran.
+- **Dream's scan cap is a rotating window, not a horizon.** It always examined the newest `MEMORY_CONSOLIDATE_SCAN` by `updated_at`, so once a workspace passed the cap everything older was never considered for merge or prune again. The window now advances each run and wraps, covering any corpus over successive runs at unchanged per-run cost. `memory_dream` reports `scan_coverage`.
+- **`memory_stats` reports `db_scope`** — whether the one-database-per-workspace invariant that makes lock-free operation safe actually holds, judged from which workspaces own memories in the file rather than from configuration. Warns when a shared `MEMORY_DB_PATH` has put unrelated projects in one graph.
+- Soak harness gains `--sessions N`: N short sessions as separate processes, each verifying what the previous one left behind. This is the realistic stress pattern for one connection per workspace, and it is where the delete-churn bug actually manifested.
+
+### 0.25.0
+
+- Dream review clusters now carry only pairs that still need a decision. Different-subject and disjoint-scope pairs are separate permanently and are dropped; same-subject value conflicts are unresolved, so they stay and are labelled `gate: "value_conflict"` with the non-destructive resolution named.
 
 ### 0.24.1
 

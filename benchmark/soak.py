@@ -34,6 +34,7 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import sys
 import time
 
@@ -45,6 +46,14 @@ parser.add_argument("--seed-size", type=int, default=1500)
 parser.add_argument("--cycles", type=int, default=10)
 parser.add_argument("--fresh", action="store_true", help="delete the soak DB first")
 parser.add_argument("--rng-seed", type=int, default=1041)
+parser.add_argument("--sessions", type=int, default=0,
+                    help="Run N short SESSIONS (separate processes) instead of "
+                         "in-process cycles. This is the realistic stress "
+                         "pattern for one-connection-per-workspace: the worst "
+                         "bug of the series was one session's deletes handing "
+                         "the next a broken index.")
+parser.add_argument("--session-child", action="store_true",
+                    help=argparse.SUPPRESS)
 args = parser.parse_args()
 
 if args.fresh and os.path.isdir(SOAK_DIR):
@@ -145,6 +154,75 @@ def check_invariants(track, cycle, phase):
     assert any("R-9017" in c for c in contents), \
         f"[c{cycle} {phase}] sentinel unfindable at corpus {actual}"
     return actual
+
+
+def session_child():
+    """One short session: open, small burst of work with churn, close.
+
+    Deliberately a separate PROCESS per session so the index is serialized and
+    deserialized between them — the boundary where inherited index damage
+    became visible in the field. Asserts the contract on entry (what the
+    previous session left behind) and on exit.
+    """
+    before = check_invariants(_adopt(), 0, "session-entry")
+    track = _adopt()
+
+    items = []
+    for i in range(15):
+        c, tags, imp = _fact(i)
+        items.append({"content": c, "tags": tags, "importance": imp})
+    track.stored(S.memory_store.__wrapped__(items=items))
+
+    # transient burst: the pattern that orphans surviving HNSW nodes
+    burst = [{"content": f"session transient {i}: {_fact(i)[0]}", "tags": ["tmp"]}
+             for i in range(12)]
+    bres = S.memory_store.__wrapped__(items=burst)
+    track.stored(bres)
+    bids = [r["id"] for r in bres["results"]
+            if r.get("status", "").startswith("stored_new")]
+    if bids:
+        S.memory_delete.__wrapped__(memory_id=bids)
+        track.deleted(len(bids))
+
+    for q in ("release train", "retention policy", "cache eviction"):
+        assert S.memory_search.__wrapped__(query=q, top_k=5)["results"]
+
+    after = check_invariants(track, 0, "session-exit")
+    print(f"  session ok: {before} -> {after} live", flush=True)
+    try:
+        S._conn.close()
+    except Exception:
+        pass
+
+
+def _adopt():
+    """Tracker seeded from what is actually in the DB (new process)."""
+    t = Tracker()
+    t.expected = _count()
+    rows = S._collect_results(S.get_conn().execute("MATCH (m:Memory) RETURN m.id;"))
+    t.ids = {r[0] for r in rows}
+    return t
+
+
+def run_sessions():
+    """Parent: spawn N short session processes in sequence."""
+    print(f"=== {args.sessions} short sessions (separate processes) ===", flush=True)
+    t0 = time.time()
+    for s in range(1, args.sessions + 1):
+        p = subprocess.run(
+            [sys.executable, "-u", os.path.abspath(__file__), "--session-child",
+             "--rng-seed", str(args.rng_seed + s)],
+            capture_output=True, text=True, timeout=900)
+        line = [l for l in p.stdout.splitlines() if "session ok" in l]
+        print(f"session {s}/{args.sessions}: {line[-1].strip() if line else '(no output)'} "
+              f"exit={p.returncode}  t={time.time() - t0:.0f}s", flush=True)
+        if p.returncode != 0:
+            print("=== SESSION FAILED ===")
+            print(p.stdout[-1500:])
+            print(p.stderr[-2500:])
+            sys.exit(1)
+    print(f"\nSESSIONS PASSED: {args.sessions} sessions, corpus {_count()}, "
+          f"{time.time() - t0:.0f}s")
 
 
 def main():
@@ -249,4 +327,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if args.session_child:
+        session_child()
+    elif args.sessions:
+        run_sessions()
+    else:
+        main()

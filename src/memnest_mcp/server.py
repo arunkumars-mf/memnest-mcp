@@ -302,6 +302,13 @@ _db: Optional[lb.Database] = None
 # Dream state tracking (in-memory, persisted to SchemaMeta)
 _dream_ops_lock = threading.Lock()
 _dream_ops_since_last: int = 0
+# Rotating start offset for the consolidation scan. MAX_CONSOLIDATE_SCAN bounds
+# what one dream examines; without a cursor the same newest N were examined
+# every run and everything older was never considered for merge or prune again
+# — a silent coverage loss the moment a workspace passed the cap. The cursor
+# advances by the window each run and wraps, so a corpus of any size is fully
+# covered over ceil(corpus / window) runs at unchanged per-run cost.
+_dream_scan_cursor: int = 0
 _dream_last_time: float = 0.0
 
 # Workspace adoption from MCP client roots.
@@ -496,6 +503,7 @@ def _persist_dream_state():
     payload = {
         "dream_ops": _dream_ops_since_last,
         "dream_last_time": _dream_last_time,
+        "scan_cursor": _dream_scan_cursor,
         "version": 1,
     }
     tmp = sidecar + ".tmp"
@@ -517,7 +525,7 @@ def _load_dream_state():
     """Restore dream counters from the sidecar (or, for backward compat, from
     SchemaMeta on databases that pre-date the sidecar).
     """
-    global _dream_ops_since_last, _dream_last_time
+    global _dream_ops_since_last, _dream_last_time, _dream_scan_cursor
 
     sidecar = _dream_state_path()
     if sidecar and os.path.exists(sidecar):
@@ -526,6 +534,7 @@ def _load_dream_state():
                 payload = json.load(f)
             _dream_ops_since_last = int(payload.get("dream_ops", 0))
             _dream_last_time = float(payload.get("dream_last_time", 0.0))
+            _dream_scan_cursor = int(payload.get("scan_cursor", 0) or 0)
             return
         except Exception as e:
             logger.debug(f"Could not load dream state from sidecar: {e}")
@@ -1249,6 +1258,54 @@ def _probe_vector_index(conn: lb.Connection, k: int = 1) -> Optional[int]:
     except Exception as e:
         logger.debug(f"Vector index probe failed: {e}")
         return None
+
+
+def _db_scope_report(conn: lb.Connection) -> dict:
+    """Is this database private to one workspace, as the design assumes?
+
+    The single-writer guarantee (one MCP connection per workspace, one database
+    per workspace) is what makes the absence of locking safe. It holds only
+    while workspace -> database is genuinely 1:1. The concurrent violation is
+    already caught loudly — LadybugDB refuses the second writer and get_conn
+    explains it. The SEQUENTIAL violation is silent: a globally pinned
+    MEMORY_DB_PATH lets project A and project B open the same file in turn,
+    landing both graphs in one database. Workspace scoping keeps retrieval
+    correct, but nothing tells the user their projects shared a brain.
+
+    So report the evidence rather than the configuration: count the distinct
+    workspaces that actually own memories here. >1 means sharing happened.
+    """
+    report: dict = {
+        "db_path": DB_PATH,
+        "workspace": WORKSPACE,
+        "workspace_source": _workspace_source,
+        "db_inside_workspace": None,
+        "workspaces_in_db": None,
+        "private_to_workspace": None,
+    }
+    try:
+        # The path comparison is meaningless for an in-memory database, but the
+        # ownership evidence still applies — a shared process can accumulate
+        # two workspaces in one ephemeral graph just as easily.
+        if WORKSPACE and DB_PATH != ":memory:":
+            report["db_inside_workspace"] = os.path.abspath(DB_PATH).startswith(
+                os.path.abspath(WORKSPACE) + os.sep)
+        rows = _collect_results(conn.execute(
+            "MATCH (m:Memory) WHERE m.workspace <> '' RETURN DISTINCT m.workspace;"))
+        owners = sorted(r[0] for r in rows if r and r[0])
+        report["workspaces_in_db"] = owners
+        report["private_to_workspace"] = len(owners) <= 1
+        if len(owners) > 1:
+            report["warning"] = (
+                f"This database holds memories from {len(owners)} workspaces "
+                f"({owners[:4]}{'...' if len(owners) > 4 else ''}). The design "
+                f"assumes one database per workspace; a shared MEMORY_DB_PATH "
+                f"puts unrelated projects in one graph. Retrieval stays "
+                f"workspace-scoped, but consider a per-workspace database."
+            )
+    except Exception as e:
+        logger.debug(f"DB scope report failed: {e}")
+    return report
 
 
 def _census_and_repair_after_churn(conn: lb.Connection) -> Optional[bool]:
@@ -2475,16 +2532,27 @@ def memory_search(
     # long-lived DB, with index_self_misses reading 0 throughout. vector_hits
     # sat at 26 on every query; this comparison would have flagged it on the
     # first search.
-    # None = census not applicable (pool smaller than corpus, or no vector
-    # channel). Deliberately not 0, which is a legal count and read as
-    # "expected zero reachable" in the field.
+    # None = census not applicable (no vector channel). Deliberately not 0,
+    # which is a legal count and read as "expected zero reachable".
+    #
+    # Coverage at scale: the fast path below is free but only works while the
+    # ranking pool (default 100) covers the corpus, which a real per-project
+    # workspace outgrows in weeks. Leaving the census "inapplicable" above
+    # that meant the detector for the worst bug class protected a shrinking
+    # fraction of the corpus — 2% at 5,000 memories — exactly as the graph got
+    # big enough for partial unreachability to matter. So above the pool we
+    # run a dedicated id-only probe at k=corpus instead of giving up.
+    # Measured: 19.7 ms at 5,000 memories against a 191.8 ms search, ~10%
+    # overhead, and it keeps detection at 100% coverage at every size.
     _census_expected = None
+    _census_mode = None
     if embedding is not None and _count_memories(conn) > 0:
         try:
             _total_embedded = _collect_results(conn.execute(
                 "MATCH (m:Memory) WHERE m.embedding IS NOT NULL RETURN COUNT(m);"
             ))[0][0] or 0
             if _pool >= _total_embedded:
+                _census_mode = "pool"
                 if global_search:
                     _census_expected = _total_embedded
                 else:
@@ -2504,6 +2572,28 @@ def memory_search(
         # exist in storage but are unreachable from fresh query points. Both
         # are unambiguous (see above), so both trigger the budgeted rebuild.
         _census_short = _census_expected and len(vector_hits) < _census_expected
+
+        # Above the pool the ranked hits cannot prove coverage (they are capped
+        # by the pool, not by what the index can reach), so ask the index
+        # directly. Global, ids only: index damage is a property of the graph,
+        # not of a workspace, and this is the same invariant stats checks.
+        if _census_expected is None and _total_embedded > 0 and vector_hits:
+            _probe_reach = _probe_vector_index(conn, k=_total_embedded)
+            if _probe_reach is not None:
+                _census_mode = "probe"
+                _census_expected = _total_embedded
+                if _probe_reach < _total_embedded:
+                    _census_short = True
+                    logger.error(
+                        f"Vector census shortfall (probe): {_probe_reach} of "
+                        f"{_total_embedded} embedded memories reachable — the "
+                        f"HNSW graph has unreachable nodes. Rebuilding..."
+                    )
+                else:
+                    # Coverage proven; the ranked list is pool-capped, so don't
+                    # let the fast-path comparison below read it as a shortfall.
+                    _census_expected = min(_census_expected, len(vector_hits))
+
         if (not vector_hits or _census_short) and _index_repair_allowed():
             if _census_short:
                 logger.error(
@@ -3136,11 +3226,13 @@ def memory_search(
             # hits < expected after repair = the index STILL has unreachable
             # nodes; run memory_reindex() and check library versions.
             "vector_census_expected": _census_expected,
-            # The per-query census is complete only while the candidate pool
-            # covers the corpus. Beyond that it verifies a pool-sized slice,
-            # and this flag keeps a partial check from reading as a complete
-            # one — the full census runs in memory_stats and at every dream.
-            "census_complete": bool(_census_expected),
+            # Coverage is now complete at every corpus size. "pool" = proven
+            # free, because the ranking pool already covered the corpus;
+            # "probe" = proven by a dedicated id-only query at k=corpus, which
+            # is what keeps coverage at 100% once the corpus outgrows the pool
+            # (it used to go inapplicable there, protecting 2% at 5,000).
+            "census_mode": _census_mode,
+            "census_complete": _census_mode is not None,
             "candidates_scored": len(raw_scores),
             "superseded_penalty": SUPERSEDED_PENALTY,
         }
@@ -4023,6 +4115,11 @@ def memory_stats() -> str:
             "fts_index": {"answering": _probe_fts_index(conn)},
             "fusion_mode": FUSION_MODE,
             "workspace_source": _workspace_source,
+            # One connection per workspace and one database per workspace is
+            # what makes the absence of locking safe. This says whether that
+            # actually holds here, using evidence (who owns memories in this
+            # file) rather than configuration.
+            "db_scope": _db_scope_report(conn),
             "client": _client_info,
             "client_supports_roots": _client_supports_roots,
             "roots_adoption": {"done": _roots_done, "attempts": _roots_attempts},
@@ -4712,7 +4809,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
     auto-merges trivial duplicates (sim>=0.95), surfaces clusters at 0.88-0.95 for agent review.
     Triggers on 10+ ops + 24h elapsed. force=True overrides; dry_run=True previews.
     """
-    global _dream_ops_since_last, _dream_last_time
+    global _dream_ops_since_last, _dream_last_time, _dream_scan_cursor
 
     # Idempotency guard: refuse concurrent dreams
     if not _dream_lock.acquire(blocking=False):
@@ -4759,6 +4856,24 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
         index_self_misses = 0
         index_rebuilt_by_audit = False
 
+        # Rotating scan window. MAX_CONSOLIDATE_SCAN bounds per-run cost; the
+        # cursor makes that a WINDOW rather than a permanent horizon, so a
+        # corpus larger than the cap is fully covered over successive runs
+        # instead of leaving everything past the newest N unexamined forever.
+        # Wraps to 0 once past the end, and stays 0 while the corpus fits.
+        _scan_skip = 0
+        if memories_before > MAX_CONSOLIDATE_SCAN:
+            _scan_skip = _dream_scan_cursor
+            if _scan_skip >= memories_before:
+                _scan_skip = 0
+        _scan_coverage = {
+            "window": MAX_CONSOLIDATE_SCAN,
+            "offset": _scan_skip,
+            "corpus": memories_before,
+            "runs_for_full_coverage": max(
+                1, -(-memories_before // MAX_CONSOLIDATE_SCAN)),
+        }
+
         # Phase 1: Auto-prune stale low-importance memories
         prune_cutoff = now - (DREAM_AUTO_PRUNE_DAYS * 86400)
         try:
@@ -4791,8 +4906,8 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     """MATCH (m:Memory)
                        RETURN m.id, m.content, m.tags, m.importance, m.embedding,
                               m.created_at, m.category, m.workspace, m.access_count
-                       ORDER BY m.updated_at DESC LIMIT $limit;""",
-                    {"limit": MAX_CONSOLIDATE_SCAN},
+                       ORDER BY m.updated_at DESC SKIP $skip LIMIT $limit;""",
+                    {"skip": _scan_skip, "limit": MAX_CONSOLIDATE_SCAN},
                 )
                 all_mems = _collect_results(scan_result)
                 # Pairs that pass every gate, resolved into components after
@@ -5081,8 +5196,8 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                     """MATCH (m:Memory)
                        RETURN m.id, m.content, m.importance, m.embedding, m.workspace,
                               m.tags
-                       ORDER BY m.updated_at DESC LIMIT $limit;""",
-                    {"limit": MAX_CONSOLIDATE_SCAN},
+                       ORDER BY m.updated_at DESC SKIP $skip LIMIT $limit;""",
+                    {"skip": _scan_skip, "limit": MAX_CONSOLIDATE_SCAN},
                 )
                 all_mems = _collect_results(scan_result)
                 visited_clusters = set()
@@ -5183,6 +5298,13 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             with _dream_ops_lock:
                 _dream_ops_since_last = 0
                 _dream_last_time = now
+                # Advance the rotating window so the next run examines the next
+                # slice. Wraps at the end of the corpus.
+                if memories_before > MAX_CONSOLIDATE_SCAN:
+                    _next = _scan_skip + MAX_CONSOLIDATE_SCAN
+                    _dream_scan_cursor = 0 if _next >= memories_before else _next
+                else:
+                    _dream_scan_cursor = 0
                 try:
                     _persist_dream_state()
                 except Exception:
@@ -5297,6 +5419,10 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "pruned": pruned_count,
             "auto_merged": merged_count,
             "topics_reaped": topics_reaped,
+            # What this run actually examined. Above the window the corpus is
+            # covered across successive runs, so say so rather than implying
+            # the whole graph was consolidated.
+            "scan_coverage": _scan_coverage,
             "protected_by_edges": protected_pairs,
             "protected_by_subject": distinct_subject_skips,
             "protected_by_value_conflict": value_conflict_skips,
