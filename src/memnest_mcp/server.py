@@ -1310,7 +1310,30 @@ def _probe_vector_index(conn: lb.Connection, k: int = 1) -> Optional[int]:
         return None
 
 
-def _db_scope_report(conn: lb.Connection) -> dict:
+def _redact_path(p: str) -> str:
+    """Basename plus a stable short hash of the full path.
+
+    memory_stats is pasted reflexively — it is the first thing anyone shares
+    when asking "is my index healthy", and this server's own guidance tells
+    people to check it before benchmarking. It carried the absolute path in
+    five places, so its disclosure surface is LARGER than the export's, which
+    at least had to be deliberately attached.
+    #
+    But unlike the export, the path here is diagnostically load-bearing: you
+    need to know which database you are inspecting. The resolution is that the
+    derived diagnostics — db_inside_workspace, private_to_workspace, the
+    workspace count — are computed server-side and stay valid regardless of
+    whether the raw path is printed. Only identity needs to survive, and
+    basename#hash gives identity: two stats calls on the same database match,
+    two different databases differ, and the tree is not named.
+    """
+    if not p or p == ":memory:":
+        return p
+    h = hashlib.sha256(p.encode()).hexdigest()[:6]
+    return f"{os.path.basename(p.rstrip(os.sep)) or 'root'}#{h}"
+
+
+def _db_scope_report(conn: lb.Connection, include_paths: bool = False) -> dict:
     """Is this database private to one workspace, as the design assumes?
 
     The single-writer guarantee (one MCP connection per workspace, one database
@@ -1326,8 +1349,8 @@ def _db_scope_report(conn: lb.Connection) -> dict:
     workspaces that actually own memories here. >1 means sharing happened.
     """
     report: dict = {
-        "db_path": DB_PATH,
-        "workspace": WORKSPACE,
+        "db_path": DB_PATH if include_paths else _redact_path(DB_PATH),
+        "workspace": WORKSPACE if include_paths else _redact_path(WORKSPACE),
         "workspace_source": _workspace_source,
         "db_inside_workspace": None,
         "workspaces_in_db": None,
@@ -1343,12 +1366,14 @@ def _db_scope_report(conn: lb.Connection) -> dict:
         rows = _collect_results(conn.execute(
             "MATCH (m:Memory) WHERE m.workspace <> '' RETURN DISTINCT m.workspace;"))
         owners = sorted(r[0] for r in rows if r and r[0])
-        report["workspaces_in_db"] = owners
+        report["workspaces_in_db"] = (
+            owners if include_paths else [_redact_path(o) for o in owners])
         report["private_to_workspace"] = len(owners) <= 1
         if len(owners) > 1:
             report["warning"] = (
                 f"This database holds memories from {len(owners)} workspaces "
-                f"({owners[:4]}{'...' if len(owners) > 4 else ''}). The design "
+                f"({report['workspaces_in_db'][:4]}"
+                f"{'...' if len(owners) > 4 else ''}). The design "
                 f"assumes one database per workspace; a shared MEMORY_DB_PATH "
                 f"puts unrelated projects in one graph. Retrieval stays "
                 f"workspace-scoped, but consider a per-workspace database."
@@ -4168,7 +4193,7 @@ def memory_topics(limit: int = 50, offset: int = 0, min_count: int = 1,
 
 @mcp.tool()
 @_timed("memory_stats")
-def memory_stats() -> str:
+def memory_stats(include_paths: bool = False) -> str:
     """Database statistics: counts, categories, importance distribution, top topics, god nodes."""
     conn = get_conn()
 
@@ -4316,7 +4341,7 @@ def memory_stats() -> str:
         "importance": imp_dist,
         "top_topics": topics,
         "top_memories": top_memories,
-        "workspace": WORKSPACE,
+        "workspace": WORKSPACE if include_paths else _redact_path(WORKSPACE),
         "dream": {
             "ops_since": _dream_ops_since_last,
             "hours_since": round(hours_since_dream, 1) if hours_since_dream is not None else None,
@@ -4324,7 +4349,7 @@ def memory_stats() -> str:
         },
         "runtime": {
             "version": SERVER_VERSION,
-            "db_path": DB_PATH,
+            "db_path": DB_PATH if include_paths else _redact_path(DB_PATH),
             "embeddings": {
                 "model": EMBEDDING_MODEL,
                 "missing": missing_embeddings,
@@ -4374,7 +4399,7 @@ def memory_stats() -> str:
             # what makes the absence of locking safe. This says whether that
             # actually holds here, using evidence (who owns memories in this
             # file) rather than configuration.
-            "db_scope": _db_scope_report(conn),
+            "db_scope": _db_scope_report(conn, include_paths=include_paths),
             "client": _client_info,
             "client_supports_roots": _client_supports_roots,
             "roots_adoption": {"done": _roots_done, "attempts": _roots_attempts},

@@ -15,6 +15,7 @@ Two ways it can break:
 The sequential case is what these tests cover.
 """
 
+import json
 import os
 import sys
 
@@ -48,7 +49,8 @@ def test_single_workspace_database_reports_private():
     server.memory_store.__wrapped__(content="Only this project's fact about shipping.")
     s = _scope()
     assert s["private_to_workspace"] is True
-    assert s["workspaces_in_db"] == ["/db-scope-test"]
+    # Identity, not path — see the redaction tests below.
+    assert s["workspaces_in_db"] == [server._redact_path("/db-scope-test")]
     assert "warning" not in s
 
 
@@ -60,7 +62,8 @@ def test_shared_database_is_reported_with_a_warning():
 
     s = _scope()
     assert s["private_to_workspace"] is False
-    assert set(s["workspaces_in_db"]) == {"/db-scope-test", "/other-project"}
+    assert set(s["workspaces_in_db"]) == {
+        server._redact_path("/db-scope-test"), server._redact_path("/other-project")}
     assert "warning" in s
     assert "one database per workspace" in s["warning"]
 
@@ -75,6 +78,61 @@ def test_scope_report_names_the_resolution_inputs():
     """A user debugging this needs to see WHY the paths resolved as they did."""
     server.memory_store.__wrapped__(content="A fact to make the database non-empty.")
     s = _scope()
-    assert s["db_path"] == server.DB_PATH
-    assert s["workspace"] == server.WORKSPACE
+    assert s["db_path"] == server._redact_path(server.DB_PATH)
+    assert s["workspace"] == server._redact_path(server.WORKSPACE)
     assert s["workspace_source"] == server._workspace_source
+
+
+# --- stats must not disclose the filesystem tree ------------------------------
+#
+# Same class as the export leak, with a LARGER surface: memory_stats carried the
+# absolute path in five places, and it is pasted reflexively — it is the first
+# thing anyone shares when asking "is my index healthy". The export at least had
+# to be deliberately attached.
+#
+# It differs in that the path is diagnostically load-bearing here, so scrubbing
+# must not cost diagnostic value. The resolution: the derived answers
+# (db_inside_workspace, private_to_workspace, the workspace count) are computed
+# server-side and stay valid regardless, so only IDENTITY needs to survive.
+# basename#hash gives identity without naming the tree.
+
+def test_stats_does_not_disclose_the_workspace_path(monkeypatch, tmp_path):
+    secret = str(tmp_path / "private-project-name")
+    monkeypatch.setattr(server, "WORKSPACE", secret)
+    server.memory_store.__wrapped__(content="A fact about the ledger pipeline.")
+
+    st = server.memory_stats.__wrapped__()
+    assert secret not in json.dumps(st), "stats discloses the workspace path"
+    assert st["workspace"].startswith("private-project-name#")
+
+
+def test_stats_keeps_every_derived_diagnostic_while_redacted(monkeypatch, tmp_path):
+    """Scrubbing must not cost diagnostic value — that is the whole design."""
+    monkeypatch.setattr(server, "WORKSPACE", str(tmp_path / "proj"))
+    server.memory_store.__wrapped__(content="A fact about the ledger pipeline.")
+
+    scope = server.memory_stats.__wrapped__()["runtime"]["db_scope"]
+    assert scope["private_to_workspace"] is True
+    assert scope["db_inside_workspace"] in (True, False, None)
+    assert len(scope["workspaces_in_db"]) == 1
+    assert scope["workspace_source"] == server._workspace_source
+
+
+def test_paths_available_on_request_for_local_debugging(monkeypatch, tmp_path):
+    secret = str(tmp_path / "private-project-name")
+    monkeypatch.setattr(server, "WORKSPACE", secret)
+    server.memory_store.__wrapped__(content="A fact about the ledger pipeline.")
+
+    st = server.memory_stats.__wrapped__(include_paths=True)
+    assert st["workspace"] == secret
+    assert st["runtime"]["db_scope"]["workspace"] == secret
+
+
+def test_redacted_identity_is_stable_and_distinguishing():
+    assert server._redact_path("/a/proj") == server._redact_path("/a/proj"), \
+        "two calls on one database must produce the same identity"
+    assert server._redact_path("/a/proj") != server._redact_path("/a/other"), \
+        "different databases must be distinguishable"
+    assert server._redact_path("/one/app") != server._redact_path("/two/app"), \
+        "same basename in a different tree must still be distinguishable"
+    assert server._redact_path(":memory:") == ":memory:"

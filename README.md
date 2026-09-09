@@ -177,6 +177,13 @@ That's it — zero config required. All settings have sensible defaults.
 | `memory_graph_html` | Generate an interactive HTML visualization of the graph |
 | `memory_traverse` | *Deprecated* — use `memory_query(read_only=True)` |
 
+`memory_stats` is also **safe to paste by default**: the workspace and database
+paths are reduced to `basename#hash`, which keeps identity (two calls on one
+database match, different databases differ) without naming your directory tree.
+Every derived diagnostic — `db_inside_workspace`, `private_to_workspace`, the
+workspace count — is computed server-side and unaffected. Pass
+`include_paths=True` when debugging locally.
+
 Exports are **safe to share by default**: workspace values are absolute paths, so
 they are replaced with opaque labels (`workspace-1`) that preserve the
 distinction between workspaces without disclosing directory layout. Pass
