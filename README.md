@@ -74,6 +74,14 @@ Two further costs, both measured:
 - **No absolute quality signal.** Neither mode separates answerable from
   unanswerable questions by score, so this isn't a lost refusal signal — but
   an `rrf` score carries no information about how good the match actually is.
+- **Superseded memories become unreachable.** The supersession penalty is a
+  score multiplier (×0.5), which is coherent against `legacy`'s ~0.17 spread
+  and destructive against `rrf`'s ~0.01: the penalty dwarfs every relevance
+  difference, so a superseded memory sinks below unrelated results and cannot
+  be retrieved within a normal `top_k`. Measured on a 27-memory fixture, all
+  24 unrelated fillers outranked all 3 superseded members. A rank demotion
+  rather than a multiplier would be the coherent analogue under rank fusion;
+  until that is designed and measured, supersession and `rrf` do not compose.
 
 Use `rrf` when you want maximum recall in a window you will read entirely and
 stability under corpus edits. Keep `legacy` when you want scores that mean
@@ -348,6 +356,11 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.28.1
+
+- **`supersession_cycle` is scoped to the returned rows.** It was keyed off the superseded set derived from *scored candidates* (the pool of 100), which on any workspace smaller than the pool is the whole corpus — so one unresolved cycle attached the warning to every unrelated search. Now it triggers only when a returned row is a cycle member, then reports the full cycle so the loop is repairable.
+- Records two findings from the graph-channel investigation: PageRank *does* propagate (a hub with 7 incoming edges reached 4× the teleport floor) but only `RELATED_TO` feeds a memory incoming rank — `ABOUT` points Memory→Topic, and `SUPERSEDES`/`EXPLAINS` are excluded from the projection entirely, so on a corpus with few asserted `RELATED_TO` edges nearly every memory sits at the floor and `k_degree` is the only varying term. And under `rrf` the multiplicative supersession penalty makes superseded memories unreachable.
 
 ### 0.28.0
 

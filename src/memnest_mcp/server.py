@@ -2941,23 +2941,16 @@ def memory_search(
     # as "no information" rather than "contradictory information"; and the one
     # component that knows — dream's SCC pass — only ran on the mutating path.
     #
-    # So say it here, where the caller is already looking. Cheap: a bounded
-    # self-returning path search over the handful of superseded ids in THIS
-    # result, not a global scan.
+    # So say it here, where the caller is already looking — but ONLY when a
+    # cycle member is actually in the results. Keying this off `superseded`
+    # was wrong: that set is derived from final_scores, which holds every
+    # SCORED CANDIDATE (the pool, default 100), not the returned rows. On a
+    # workspace smaller than the pool that is the entire corpus, so a single
+    # unresolved cycle anywhere attached the warning to every unrelated
+    # search — the same permanent-verdict noise the review clusters were
+    # fixed for, and self-defeating for a warning whose value is its rarity.
+    # The check therefore runs after ranking, over the returned ids.
     supersession_cycles: list = []
-    if len(superseded) > 1:
-        try:
-            r = conn.execute(
-                """MATCH p = (m:Memory)-[:SUPERSEDES*1..6]->(m)
-                   WHERE m.id IN $ids
-                   RETURN DISTINCT m.id;""",
-                {"ids": sorted(superseded)},
-            )
-            cycle_ids = sorted(row[0] for row in _collect_results(r))
-            if cycle_ids:
-                supersession_cycles = cycle_ids
-        except Exception as e:
-            logger.debug(f"Supersession cycle check failed (non-fatal): {e}")
 
     # Build results.
     #
@@ -3339,6 +3332,30 @@ def memory_search(
     # silently turns hybrid search into keyword-only search that still returns
     # plausible-looking scores — the caller has no way to know retrieval is
     # degraded. See _embed()/vector-search error logging above.
+    # Cycle check, scoped to what the caller actually received. Only the
+    # returned rows that are superseded can be cycle members worth reporting.
+    # ONE returned cycle member is enough to warn: that is precisely the case
+    # where an agent would otherwise trust a memory sitting inside a
+    # contradictory loop. Requiring two also made the trigger depend on the
+    # fusion mode, since rrf ranks differently and can return fewer members.
+    _returned_superseded = [r["id"] for r in results if r["id"] in superseded]
+    if _returned_superseded:
+        try:
+            # Trigger on the returned rows (that is what keeps the warning
+            # rare), but report EVERY member of the cycle: an agent cannot
+            # repair a loop it can only see part of, and once the trigger has
+            # fired the expansion is one more bounded query.
+            r_cyc = conn.execute(
+                """MATCH p = (m:Memory)-[:SUPERSEDES*1..6]->(m)
+                   WHERE m.id IN $ids
+                   UNWIND nodes(p) AS n
+                   RETURN DISTINCT n.id;""",
+                {"ids": sorted(_returned_superseded)},
+            )
+            supersession_cycles = sorted(row[0] for row in _collect_results(r_cyc))
+        except Exception as e:
+            logger.debug(f"Supersession cycle check failed (non-fatal): {e}")
+
     out: dict = {"results": results}
     if offset or more_available:
         out["offset"] = offset
