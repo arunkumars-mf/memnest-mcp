@@ -421,3 +421,56 @@ def test_explains_directs_centrality_onto_the_explained_decision():
     pr = _pagerank_with(["RELATED_TO", "EXPLAINS"])
     assert pr[dec] > pr[why], \
         "EXPLAINS should land mass on the decision being justified"
+
+
+def test_superseded_memory_never_carries_a_higher_graph_term(monkeypatch):
+    """The property that survives a penalty redesign.
+
+    The earlier guard asserted final RANKING, and on real curated data it held
+    by COUPLING rather than neutrality: a stale mid-chain memory out-scored its
+    own current version on the graph term (0.21 vs 0.0079, ~+0.03 weighted)
+    because the stale one had accumulated an incoming RELATED_TO while the
+    current one's only incoming edge was an EXPLAINS, which the projection
+    discards. The x0.5 penalty happened to cancel that advantage — so the guard
+    depended on the multiplier existing. Since the coherent analogue of that
+    penalty under rank fusion is a rank DEMOTION, replacing it would have
+    removed the cancellation and left centrality pointing at the stale version.
+
+    Fixture shape matters and mirrors real curated data: the stale version
+    carries an incoming RELATED_TO, because a superseded decision keeps getting
+    referenced by things that were true at the time. A fixture where superseded
+    memories are structurally isolated passes every guard while missing the
+    configuration that actually occurs.
+    """
+    store = server.memory_store.__wrapped__
+    old = store(content="Helios migrated from a monolith to microservices in 2023.",
+                tags=["helios", "arch"])["id"]
+    new = store(content="Correction: Helios consolidated back to a modular "
+                        "monolith in 2025.", tags=["helios", "arch"],
+                supersedes=old)["id"]
+    # Something true at the time still references the superseded decision.
+    referrer = store(content="The 2024 capacity plan assumed per-service scaling.",
+                     tags=["helios", "capacity"])["id"]
+    server.memory_relate.__wrapped__(from_id=referrer, to_id=old,
+                                     relationship="RELATED_TO")
+    # And the current decision has recorded rationale — an edge type centrality
+    # cannot see, so it earns nothing from it.
+    why = store(content="INC-5501: the microservices split tripled p99 latency.",
+                tags=["helios", "incident"])["id"]
+    server.memory_relate.__wrapped__(from_id=why, to_id=new, relationship="EXPLAINS")
+
+    server.memory_dream.__wrapped__(force=True)   # compute centrality for real
+
+    out = server.memory_search.__wrapped__(
+        query="what is the current Helios architecture", top_k=10, explain=True)
+    by_id = {r["id"]: r for r in out["results"]}
+    if old not in by_id or new not in by_id:
+        pytest.skip("both versions must be returned to compare their graph terms")
+
+    stale_graph = by_id[old]["explain"]["graph"]
+    current_graph = by_id[new]["explain"]["graph"]
+    assert stale_graph <= current_graph, (
+        f"a superseded memory carries more centrality ({stale_graph}) than its "
+        f"current version ({current_graph}) — the ranking would then depend on "
+        f"the penalty cancelling it, which a penalty redesign would remove"
+    )

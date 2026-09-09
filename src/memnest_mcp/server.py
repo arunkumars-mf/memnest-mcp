@@ -2888,6 +2888,37 @@ def memory_search(
                     prev_val, prev_rank = val, pos
                 raw_scores[m][channel] = (RRF_K + 1) / (RRF_K + rank)
 
+    # Supersession is resolved BEFORE fusion, because the graph channel needs
+    # it: centrality describes structural position in the CURRENT knowledge
+    # graph, and a superseded memory's position is historical.
+    #
+    # Field measurement that forced this. With SUPERSEDES already excluded from
+    # the projection, a stale mid-chain memory still out-scored its own current
+    # version on the graph term — 0.21 against 0.0079, worth +0.03 weighted —
+    # because the stale one had accumulated an incoming RELATED_TO while the
+    # current one's only incoming edge was an EXPLAINS, which the projection
+    # discards. The current version stayed ahead only because the x0.5
+    # supersession penalty happened to cancel that advantage.
+    #
+    # So the guard held by COUPLING, not neutrality: two errors offsetting.
+    # That is fragile in a specific, foreseeable way — the coherent analogue of
+    # the penalty under rank fusion is a rank demotion, and the moment the
+    # multiplier is replaced the cancellation disappears and centrality is left
+    # pointing at the stale version. Zeroing the term for superseded memories
+    # makes the property hold on its own: no superseded memory can carry a
+    # higher graph term than its current version, whatever the penalty does.
+    superseded: set[int] = set()
+    if raw_scores:
+        try:
+            r = conn.execute(
+                """MATCH (x:Memory)-[:SUPERSEDES]->(m:Memory)
+                   WHERE m.id IN $ids RETURN DISTINCT m.id;""",
+                {"ids": list(raw_scores)},
+            )
+            superseded = {row[0] for row in _collect_results(r)}
+        except Exception as e:
+            logger.debug(f"Supersession lookup failed: {e}")
+
     now = time.time()
     final_scores: dict[int, float] = {}
     # Per-memory fusion inputs, kept when explain=True so a caller can see WHY
@@ -2901,7 +2932,9 @@ def memory_search(
         mem = memory_data.get(mid, {})
         vec_score = channels.get("vector", 0.0)
         fts_score = channels.get("fts", 0.0)
-        graph_score = channels.get("graph", 0.0)
+        # Centrality of a superseded memory is historical, not current — see
+        # the note above the supersession lookup.
+        graph_score = 0.0 if mid in superseded else channels.get("graph", 0.0)
 
         # Recency: exponential decay, half-life of 30 days
         updated_at = mem.get("updated_at", 0.0)
@@ -2945,18 +2978,8 @@ def memory_search(
     # "Correction: now uses HALF_EVEN" for the query "how does it round?"), so
     # the outdated answer wins on relevance. Demote superseded memories so the
     # current answer surfaces without the caller writing a graph query.
-    superseded: set[int] = set()
-    if final_scores:
-        try:
-            r = conn.execute(
-                """MATCH (x:Memory)-[:SUPERSEDES]->(m:Memory)
-                   WHERE m.id IN $ids RETURN DISTINCT m.id;""",
-                {"ids": list(final_scores)},
-            )
-            superseded = {row[0] for row in _collect_results(r)}
-        except Exception as e:
-            logger.debug(f"Supersession lookup failed: {e}")
-
+    # (`superseded` was resolved before fusion — the graph channel needs it.)
+    #
     # Members of a SUPERSEDES cycle are exempt from the penalty.
     #
     # In a cycle every member is superseded by construction, so the flag
