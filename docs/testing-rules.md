@@ -118,11 +118,22 @@ a *branch* that may be wrong while its test passes.
 
 Both are the same failure at different levels: **trusting a derived artifact
 where the primary source was available and cheap to read.** A release note
-instead of the emission sites; a similarity number quoted from someone else's
-corpus instead of measuring your own fixture. (That second one is not
-hypothetical — the first write-up of rule 6 cited 0.9226, a number measured on
-a *different* corpus, when the fixture in question actually scored 0.9138. The
-conclusion held and the evidence for it did not, which is rule 1 again.)
+instead of the emission sites; a similarity number quoted from a different
+fixture instead of measuring your own.
+
+That second one is not hypothetical, and it went wrong twice. The first
+write-up of rule 6 cited 0.9226 for a fixture that actually scores 0.9138 — the
+conclusion held and the evidence for it did not, which is rule 1 again. The
+first *correction* then attributed the gap to "a different corpus", which is
+also wrong: cosine similarity is a function of the two texts and the model
+alone, so the same pair yields the same number anywhere. Verified — the 0.9226
+pair measures 0.9226 in a second environment, and still 0.9226 with 30
+unrelated memories added.
+
+The gap was a **wording** difference between two fixtures, not an environment
+difference. That distinction is practical: fixture similarities are portable, so
+`conflict_similarity` can be asserted as an exact value — which "it depends on
+your corpus" would have discouraged.
 
 This is the thread an author is least likely to notice about their own work,
 because the derived artifact is usually something they wrote themselves.

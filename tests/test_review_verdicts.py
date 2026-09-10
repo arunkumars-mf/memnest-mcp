@@ -276,3 +276,35 @@ def test_no_conflict_hint_recommends_an_edge_as_the_dismissal():
         if "RELATED_TO" in hint:
             assert "genuinely connected" in hint, \
                 f"RELATED_TO offered without its condition: {hint!r}"
+
+
+def test_conflict_similarity_is_a_portable_exact_value():
+    """Fixture similarities can be pinned, because cosine is a function of the
+    two texts and the model alone — not of what else the database holds.
+
+    This was mis-stated twice while writing the rules it belongs to: first a
+    number was quoted for the wrong fixture, then the discrepancy was blamed on
+    "a different corpus". Neither is right, and the distinction matters
+    practically — if similarity depended on corpus contents, no test could
+    assert it as an exact value.
+    """
+    a = "The Nunki relay request timeout is 250 milliseconds."
+    b = "The Nunki relay request timeout is 850 milliseconds."
+
+    server.memory_store.__wrapped__(content=a, tags=["nunki", "timeout"])
+    clean = server.memory_store.__wrapped__(content=b, tags=["nunki", "timeout"])
+
+    # Same pair again, with unrelated content in the database this time.
+    server._conn = None
+    server._db = None
+    server.get_conn()
+    server.memory_store.__wrapped__(items=[
+        {"content": f"Unrelated filler {i} about capacity planning.",
+         "tags": [f"pz{i}"]} for i in range(30)])
+    server.memory_store.__wrapped__(content=a, tags=["nunki", "timeout"])
+    crowded = server.memory_store.__wrapped__(content=b, tags=["nunki", "timeout"])
+
+    assert clean["conflict_similarity"] == crowded["conflict_similarity"], \
+        "similarity must not depend on unrelated corpus contents"
+    assert clean["conflict_similarity"] == 0.9226, \
+        "a pinned fixture similarity changed — embedding model or text drifted"
