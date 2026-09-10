@@ -201,3 +201,78 @@ def test_dream_resolution_names_callables_not_labels():
         "leave_separate was a label with no callable behind it"
     assert "memory_delete" in resolution and "SUPERSEDES" in resolution, \
         "every branch of the resolution should name what to call"
+
+
+# --- enumerate the emission sites, do not count them from a description -------
+#
+# 0.30.1 fixed four surfaces and missed a fifth. The write-time hint has TWO
+# variants — near_duplicate (>= DEDUP_THRESHOLD) and value_disagreement (below
+# it) — and the release description had already collapsed them into one
+# "write-time conflict hint", so the count came out at four. The read-time pair
+# was enumerated separately and both were fixed; the write-time pair was
+# enumerated as one and only one was fixed.
+#
+# This is not rule 4 and not a vacuous test: three tests were added, each
+# asserting its fixture fires first, and all three passed. The gap was an
+# UNENUMERATED SURFACE — there was never a test to write. The tell would have
+# been counting emission sites in the code rather than counting them from the
+# description, which is where the merge happened.
+#
+# So this test drives every branch and asserts on the set, which fails on
+# addition of a variant rather than requiring someone to notice it.
+
+def _write_time_store(content_a, content_b, tags):
+    server._conn = None
+    server._db = None
+    server.get_conn()
+    server.memory_store.__wrapped__(content=content_a, tags=tags)
+    return server.memory_store.__wrapped__(content=content_b, tags=tags)
+
+
+PAIR_A = "The Nunki service request timeout is 500ms."
+PAIR_B = "The Nunki service request timeout is 900ms."
+
+
+def test_every_write_time_conflict_variant_names_the_tool(monkeypatch):
+    """Both branches of the write-time hint, driven DETERMINISTICALLY.
+
+    The branch is chosen by `conflict_similarity >= DEDUP_THRESHOLD`, and a
+    text fixture lands wherever the embedding puts it — the first version of
+    this test scored 0.9226 against a 0.92 threshold on one machine and below
+    it on another, so it silently exercised one branch twice and passed with
+    the other branch broken. Moving the threshold forces each branch, and the
+    assertion on `conflict_similarity` proves which one ran.
+    """
+    results = {}
+
+    monkeypatch.setattr(server, "DEDUP_THRESHOLD", 0.50)
+    res = _write_time_store(PAIR_A, PAIR_B, ["nunki", "timeout"])
+    assert res.get("conflict_similarity", 0) >= 0.50, "near_duplicate branch not taken"
+    results["near_duplicate"] = res.get("hint", "")
+
+    monkeypatch.setattr(server, "DEDUP_THRESHOLD", 0.999)
+    res = _write_time_store(PAIR_A, PAIR_B, ["nunki", "timeout"])
+    assert res.get("conflict_similarity", 1) < 0.999, \
+        "value_disagreement branch not taken"
+    results["value_disagreement"] = res.get("hint", "")
+
+    for label, hint in results.items():
+        assert hint, f"fixture drifted: the write-time {label} hint did not fire"
+        assert "memory_keep_separate" in hint, \
+            f"the write-time {label} hint does not name the tool: {hint!r}"
+
+
+def test_no_conflict_hint_recommends_an_edge_as_the_dismissal():
+    """The property that generalises across every surface: an agent told to
+    resolve a both-hold pair must never be pointed at an edge-creating call as
+    THE remedy. RELATED_TO may appear only conditionally, with its cost named."""
+    hints = [
+        _write_time_store(PAIR_A, PAIR_B, ["nunki", "timeout"]).get("hint", ""),
+        _write_time_store("Izar retains audit logs for 30 days.",
+                          "Retention on Izar was extended to a full year.",
+                          ["izar", "audit"]).get("hint", ""),
+    ]
+    for hint in hints:
+        if "RELATED_TO" in hint:
+            assert "genuinely connected" in hint, \
+                f"RELATED_TO offered without its condition: {hint!r}"

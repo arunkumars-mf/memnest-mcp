@@ -2455,7 +2455,9 @@ def _store_one(conn, content: str, category: str, tags: list[str],
                 f"(similarity {conflict_sim}) but the values differ, so merging would "
                 f"have discarded one. If this supersedes it, call "
                 f"memory_relate(from_id={mem_id}, to_id={conflict_with}, "
-                f"relationship='SUPERSEDES')."
+                f"relationship='SUPERSEDES'); if both hold and are DISTINCT, call "
+                f"memory_keep_separate(memory_ids=[{mem_id}, {conflict_with}]) so "
+                f"neither search nor memory_dream asks you again."
             )
         else:
             # Below the dedup threshold nothing was at risk of being merged —
