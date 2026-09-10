@@ -1,4 +1,4 @@
-# Four rules, each earned by a bug that got past the suite
+# Six rules, each earned by a bug that got past the suite
 
 These come out of a long review series on this codebase. Every one of them
 exists because a check passed while something was wrong, so they are written as
@@ -77,3 +77,52 @@ contract you are violating, or they encode an assumption you are correcting —
 and **the diff looks identical either way**. State which it is, in the commit,
 so a later reader can tell whether a test was relaxed or re-pointed. Doing it
 silently lets the suite quietly ratify whatever the code now does.
+
+## 5. Enumerate emission sites from the code, not from your description of it
+
+A release note is a derived artifact. If it merged two things, a count taken
+from it inherits the merge.
+
+Worked example. A fix was reported as covering "four hint surfaces". There were
+five: the write-time hint has two branches — `near_duplicate` above
+`DEDUP_THRESHOLD` and `value_disagreement` below it — and the release note had
+already collapsed them into one line. The read-time pair had been enumerated
+separately and both were fixed; the write-time pair was enumerated as one and
+only one was fixed. Grepping for `hint` assignments gives three sites, one with
+two branches: five.
+
+This is not rule 4 and not a vacuous test. Three tests were added, each
+correctly asserting its fixture fires first, and all three passed. The gap was
+an **unenumerated surface**, so there was never a test to write.
+
+## 6. Control the branch selector, not the fixture
+
+When a branch is chosen by comparing a measured value against a threshold,
+never let the fixture's measured value decide which branch runs. Move the
+threshold.
+
+Worked example. A test meant to cover both write-time hint branches used text
+fixtures. Measured, they score 0.9138 and 0.7192 against a threshold of 0.92 —
+so **both** landed on `value_disagreement`, the `near_duplicate` branch was
+never exercised, and the test passed while that branch was broken. Confirmed by
+reverting the fix and watching it still pass. The repair is to monkeypatch the
+threshold (0.50 forces one branch, 0.999 the other) and to assert the measured
+similarity so the test proves which branch it ran.
+
+A straddling fixture does not fail. It reports as coverage while testing an
+arbitrary branch — the same protection-by-passing-check as rule 1, one level
+down: rule 1 is an explanation that may be wrong while its test passes, this is
+a *branch* that may be wrong while its test passes.
+
+## The thread joining 5 and 6
+
+Both are the same failure at different levels: **trusting a derived artifact
+where the primary source was available and cheap to read.** A release note
+instead of the emission sites; a similarity number quoted from someone else's
+corpus instead of measuring your own fixture. (That second one is not
+hypothetical — the first write-up of rule 6 cited 0.9226, a number measured on
+a *different* corpus, when the fixture in question actually scored 0.9138. The
+conclusion held and the evidence for it did not, which is rule 1 again.)
+
+This is the thread an author is least likely to notice about their own work,
+because the derived artifact is usually something they wrote themselves.
