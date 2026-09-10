@@ -965,6 +965,77 @@ def _same_subject(tags_a, tags_b) -> bool:
     return (len(sa & sb) / len(union)) >= MERGE_TAG_OVERLAP
 
 
+REVIEW_VERDICT_TABLE = "ReviewVerdict"
+
+
+def _pair_key(a: int, b: int) -> str:
+    lo, hi = (a, b) if a <= b else (b, a)
+    return f"{lo}:{hi}"
+
+
+def _ensure_review_table(conn: lb.Connection) -> None:
+    _safe_execute(
+        conn,
+        f"CREATE NODE TABLE {REVIEW_VERDICT_TABLE}("
+        f"pair STRING PRIMARY KEY, id_a INT64, id_b INT64, decided_at DOUBLE);",
+        expected_errors=("already exists", "duplicate"),
+    )
+
+
+def _pair_kept_separate(conn: lb.Connection, a: int, b: int) -> bool:
+    """Has an agent already judged this pair deliberately distinct?
+
+    Dream offers `leave_separate` as a resolution and nothing recorded it, so
+    the agent's judgement evaporated and the pair resurfaced on the next run —
+    the same class of noise the permanent-verdict filter addressed in 0.25.0,
+    except that filter INFERS a verdict from the gates while this records the
+    one an agent actually made. Idea taken from the Procedural Graph paper's
+    refiner, which keeps rejected edits on file so the same edit is not
+    proposed twice; the mechanism transfers even though its architecture does
+    not, because it needs neither an LLM nor labelled data.
+
+    Stored in a side table rather than as a new edge type deliberately: a new
+    edge would have to be threaded through the EDGE_TYPES allowlist, the
+    save/restore pair that carries edges across delete+recreate, the graph
+    projections, memory_get and memory_unrelate. That blast radius is how the
+    access_count drift happened.
+    """
+    try:
+        r = conn.execute(
+            f"MATCH (v:{REVIEW_VERDICT_TABLE} {{pair: $p}}) RETURN v.pair;",
+            {"p": _pair_key(a, b)},
+        )
+        return r.has_next()
+    except Exception:
+        return False   # table absent on an old database — nothing is dismissed
+
+
+def _reap_orphan_verdicts(conn: lb.Connection) -> int:
+    """Drop verdicts whose memories no longer both exist.
+
+    Same lesson as the Topic leak: a side table that is never collected grows
+    without bound on a long-lived database.
+    """
+    try:
+        rows = _collect_results(conn.execute(
+            f"MATCH (v:{REVIEW_VERDICT_TABLE}) RETURN v.pair, v.id_a, v.id_b;"))
+        dead = []
+        for pair, a, b in rows:
+            live = _collect_results(conn.execute(
+                "MATCH (m:Memory) WHERE m.id IN [$a, $b] RETURN COUNT(m);",
+                {"a": a, "b": b}))
+            if not live or (live[0][0] or 0) < 2:
+                dead.append(pair)
+        for pair in dead:
+            conn.execute(
+                f"MATCH (v:{REVIEW_VERDICT_TABLE} {{pair: $p}}) DETACH DELETE v;",
+                {"p": pair})
+        return len(dead)
+    except Exception as e:
+        logger.debug(f"Verdict reap failed (non-fatal): {e}")
+        return 0
+
+
 def _conflict_dismissed(conn: lb.Connection, a: int, b: int) -> Optional[str]:
     """Whether an agent has already resolved the relationship between a and b.
 
@@ -986,6 +1057,11 @@ def _conflict_dismissed(conn: lb.Connection, a: int, b: int) -> Optional[str]:
     linked = _semantically_linked(conn, a, b)
     if linked:
         return linked
+    # An explicit "these are distinct" verdict silences the flag for the same
+    # reason an asserted RELATED_TO does: the agent looked at the pair and
+    # decided, so repeating the warning is advice it already took.
+    if _pair_kept_separate(conn, a, b):
+        return "kept_separate"
     try:
         r = conn.execute(
             """MATCH (x:Memory)-[e:RELATED_TO]-(y:Memory)
@@ -3731,6 +3807,9 @@ def memory_delete(memory_id: int | list[int]) -> str:
                    DELETE t;""")
         except Exception as e:
             logger.debug(f"Orphan topic reap failed (non-fatal): {e}")
+        # Same reasoning for review verdicts: a side table nobody collects
+        # grows without bound on a long-lived database.
+        _reap_orphan_verdicts(conn)
 
         # Deletes are the damage source for HNSW unreachability: reproduced
         # standalone (docs/upstream/ladybug-hnsw-delete-churn-unreachable.md),
@@ -3916,6 +3995,69 @@ def _unrelate_one(conn, from_id: int, to_id: int,
                 "searched": types,
                 "message": "No such edge between these memories."}
     return {"status": "deleted", "from": from_id, "to": to_id, "removed": removed}
+
+
+@mcp.tool()
+@_timed("memory_keep_separate")
+def memory_keep_separate(memory_ids: list[int]) -> str:
+    """Record that memories are deliberately DISTINCT, not duplicates.
+
+    Use this for the `leave_separate` resolution that memory_dream offers on a
+    review cluster, and to silence a `potential_conflicts` flag on a pair that
+    genuinely holds both ways.
+
+    Without it the judgement is lost: dream re-offers the same cluster on its
+    next run and search re-flags the same pair, so an agent is asked a question
+    it already answered. Recording the verdict makes the decision durable.
+
+    This creates NO edge — that is the point. memory_relate(RELATED_TO) says
+    "these are connected"; this says "these are separate and I checked". Pass
+    2+ ids; every pair among them is recorded. Verdicts are dropped
+    automatically once either memory is deleted.
+    """
+    conn = get_conn()
+    ids = [i for i in (memory_ids or []) if isinstance(i, int) and not isinstance(i, bool)]
+    if len(ids) < 2:
+        return {"status": "error",
+                "message": "Pass at least two memory ids to mark as distinct."}
+    if len(ids) > MAX_BATCH_ITEMS:
+        return {"status": "error",
+                "message": f"Too many ids ({len(ids)}, limit {MAX_BATCH_ITEMS})."}
+
+    found = {r[0] for r in _collect_results(conn.execute(
+        "MATCH (m:Memory) WHERE m.id IN $ids RETURN m.id;", {"ids": ids}))}
+    missing = sorted(set(ids) - found)
+    live = sorted(found)
+    if len(live) < 2:
+        return {"status": "error", "not_found": missing,
+                "message": "Fewer than two of those memories exist."}
+
+    _ensure_review_table(conn)
+    now = time.time()
+    recorded, already = [], []
+    for i in range(len(live)):
+        for j in range(i + 1, len(live)):
+            a, b = live[i], live[j]
+            if _pair_kept_separate(conn, a, b):
+                already.append([a, b])
+                continue
+            try:
+                conn.execute(
+                    f"CREATE (:{REVIEW_VERDICT_TABLE} {{pair: $p, id_a: $a, "
+                    f"id_b: $b, decided_at: $t}});",
+                    {"p": _pair_key(a, b), "a": a, "b": b, "t": now},
+                )
+                recorded.append([a, b])
+            except Exception as e:
+                logger.debug(f"Verdict write failed for {a}/{b}: {e}")
+
+    out = {"status": "recorded" if recorded else "unchanged",
+           "pairs_recorded": recorded, "pairs_already_recorded": already,
+           "effect": ("these pairs will no longer appear in memory_dream review "
+                      "clusters or as potential_conflicts")}
+    if missing:
+        out["not_found"] = missing
+    return out
 
 
 @mcp.tool()
@@ -5576,6 +5718,12 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                                 visited_clusters.add(row[0])
                                 continue
 
+                            # An agent already ruled on this pair. Re-offering
+                            # it is asking the same question twice.
+                            if _pair_kept_separate(conn, mid, row[0]):
+                                visited_clusters.add(row[0])
+                                continue
+
                             # Review is for pairs where an agent still has a
                             # DECISION to make. The merge gates already know
                             # which pairs those are, and two of their verdicts
@@ -5705,6 +5853,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
         # memory_delete's orphan reap — collect childless Topic nodes here so
         # maintenance leaves the graph clean regardless of the delete path.
         topics_reaped = 0
+        verdicts_reaped = 0
         if not dry_run:
             try:
                 before_t = conn.execute(
@@ -5718,6 +5867,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                 topics_reaped = max(0, before_t - after_t)
             except Exception as e:
                 logger.debug(f"Dream topic reap failed (non-fatal): {e}")
+            verdicts_reaped = _reap_orphan_verdicts(conn)
 
         # --- Phase 4: SCC contradiction detection on SUPERSEDES subgraph ---
         #
@@ -5770,6 +5920,7 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
             "pruned": pruned_count,
             "auto_merged": merged_count,
             "topics_reaped": topics_reaped,
+            "verdicts_reaped": verdicts_reaped,
             # What this run actually examined. Above the window the corpus is
             # covered across successive runs, so say so rather than implying
             # the whole graph was consolidated.

@@ -175,6 +175,7 @@ That's it — zero config required. All settings have sensible defaults.
 | `memory_import` | Restore an export — ids remapped, edges rewired, dedup applied |
 | `memory_set_workspace` | Pin the workspace scope and database location |
 | `memory_graph_html` | Generate an interactive HTML visualization of the graph |
+| `memory_keep_separate` | Record that memories are deliberately distinct — silences review clusters and conflict flags for that pair without creating an edge |
 | `memory_traverse` | *Deprecated* — use `memory_query(read_only=True)` |
 
 `memory_stats` is also **safe to paste by default**: the workspace and database
@@ -371,6 +372,22 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.30.0
+
+- **`memory_keep_separate`** makes an agent's `leave_separate` verdict durable. `memory_dream` offered that resolution and recorded nothing, so the judgement evaporated: the same cluster was re-offered next run and the same pair re-flagged on the next search. 0.25.0 reduced that noise by *inferring* permanent verdicts from the merge gates; this records the verdict an agent actually made, which is the case the gates cannot infer — two facts that read alike, share a subject, and genuinely both hold. Creates no edge (the distinction from `memory_relate`), is idempotent, and verdicts are collected automatically once either memory is deleted.
+
+### 0.29.3
+
+- Filesystem paths are scrubbed at the single serialization boundary, covering the ~17 sites that return engine error text verbatim. `memory_export` also returns `filename`, since the scrub reaches its own returned path.
+
+### 0.29.2
+
+- `memory_stats` redacts paths by default as `basename#hash`, keeping identity while every derived diagnostic (`db_inside_workspace`, `private_to_workspace`) stays valid. `include_paths=True` restores them.
+
+### 0.29.1
+
+- Exports no longer embed the workspace path (39 occurrences on a 38-memory export). Distinct workspaces become opaque labels, preserving multi-workspace fidelity. `include_workspace_paths=True` opts back in.
 
 ### 0.28.3
 
