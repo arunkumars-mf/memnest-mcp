@@ -2467,8 +2467,10 @@ def _store_one(conn, content: str, category: str, tags: list[str],
                 f"differently to look like duplicates, so resolve it now while you "
                 f"have the context: if this replaces it, call "
                 f"memory_relate(from_id={mem_id}, to_id={conflict_with}, "
-                f"relationship='SUPERSEDES'); if both hold in different scopes, make "
-                f"that explicit in the content."
+                f"relationship='SUPERSEDES'); if both hold, make the distinction "
+                f"explicit in the content and call "
+                f"memory_keep_separate(memory_ids=[{mem_id}, {conflict_with}]) so "
+                f"neither search nor memory_dream asks you again."
             )
 
     # Wire the correction chain in the same call, so a new version can never be
@@ -3396,9 +3398,11 @@ def memory_search(
                         hint = (f"Near-identical memories with no edge marking which is "
                                 f"current. If one replaces the other, re-store the current "
                                 f"version with memory_store(..., supersedes=<old_id>). If both "
-                                f"are true, call memory_relate(from_id={a}, to_id={b}, "
-                                f"relationship='RELATED_TO') — that dismisses this flag "
-                                f"permanently.")
+                                f"are true and DISTINCT, call "
+                                f"memory_keep_separate(memory_ids=[{a}, {b}]) — that records the "
+                                f"verdict and dismisses this flag permanently WITHOUT creating "
+                                f"an edge. Use memory_relate(RELATED_TO) only if they are "
+                                f"genuinely connected, since that adds graph structure.")
                     else:
                         _v = _name_vocab(text_a, text_b)
                         differing = sorted(
@@ -3420,10 +3424,12 @@ def memory_search(
                         hint = (f"These are about the same subject and {detail}. They are not "
                                 f"phrased alike, so nothing else would flag them. If one "
                                 f"replaces the other, re-store it with "
-                                f"memory_store(..., supersedes=<old_id>). If both are true, "
-                                f"call memory_relate(from_id={a}, to_id={b}, "
-                                f"relationship='RELATED_TO') — that dismisses this flag "
-                                f"permanently.")
+                                f"memory_store(..., supersedes=<old_id>). If both are true and "
+                                f"DISTINCT, call memory_keep_separate(memory_ids=[{a}, {b}]) — "
+                                f"that records the verdict and dismisses this flag permanently "
+                                f"WITHOUT creating an edge. Use memory_relate(RELATED_TO) only "
+                                f"if they are genuinely connected, since that adds graph "
+                                f"structure.")
 
                     conflicts.append({
                         # Pair order is RANK order, not id order: the first id
@@ -5773,7 +5779,11 @@ def memory_dream(force: bool = False, dry_run: bool = False) -> str:
                             # edge, OR distinct facts that merely read alike.
                             # Members carrying gate="value_conflict" are the
                             # unresolved contradictions; start with those.
-                            "resolution": "merge_duplicate | link_with_supersedes | leave_separate",
+                            "resolution": (
+                                "merge_duplicate: memory_delete the redundant one | "
+                                "link_with_supersedes: memory_relate(..., 'SUPERSEDES') | "
+                                "leave_separate: memory_keep_separate(memory_ids=[...]) "
+                                "— records the verdict so this pair is not offered again"),
                         })
                         if len(clusters) >= MAX_CONSOLIDATE_CLUSTERS:
                             break

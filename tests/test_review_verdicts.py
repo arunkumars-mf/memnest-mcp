@@ -145,3 +145,59 @@ def test_bad_input_is_rejected_clearly():
     res = server.memory_keep_separate.__wrapped__(memory_ids=[a, 999999])
     assert res["status"] == "error"
     assert res["not_found"] == [999999]
+
+
+# --- the remedy must be named where the problem is reported -------------------
+#
+# 0.30.0 shipped the tool and left every hint pointing elsewhere. The read-time
+# hint was the bad case: it named memory_relate(RELATED_TO) as the dismissal,
+# which does dismiss the flag but MEANS "these are connected" and feeds
+# traversal and centrality — so an agent following the advice on a both-hold
+# pair creates graph structure it never intended. That is the 0.19.0
+# closed-loop bug (a hint recommending an ineffective action) one step further:
+# a hint recommending an action with unintended side effects.
+#
+# A resolution an agent cannot call is not a resolution.
+
+VALUE_PAIR = ("Izar retains audit logs for 30 days.",
+              "Retention on Izar was extended to a full year.")
+
+
+def test_write_time_hint_names_the_tool():
+    server.memory_store.__wrapped__(content=VALUE_PAIR[0], tags=["izar", "audit"])
+    second = server.memory_store.__wrapped__(content=VALUE_PAIR[1],
+                                             tags=["izar", "audit"])
+    hint = second.get("hint", "")
+    assert hint, "fixture drifted: the write-time conflict hint did not fire"
+    assert "memory_keep_separate" in hint
+
+
+def test_read_time_hint_names_the_tool_and_deprecates_the_edge_route():
+    server.memory_store.__wrapped__(content=VALUE_PAIR[0], tags=["izar", "audit"])
+    server.memory_store.__wrapped__(content=VALUE_PAIR[1], tags=["izar", "audit"])
+    server.memory_store.__wrapped__(items=[
+        {"content": f"Filler {i} on capacity planning.", "tags": [f"hf{i}"]}
+        for i in range(6)])
+
+    out = server.memory_search.__wrapped__(query="Izar audit log retention", top_k=5)
+    conflicts = out.get("potential_conflicts") or []
+    assert conflicts, "fixture drifted: no conflict flagged"
+    hint = conflicts[0]["hint"]
+
+    assert "memory_keep_separate" in hint, \
+        "the both-hold branch must name the tool that records the verdict"
+    assert "genuinely connected" in hint, \
+        "RELATED_TO must survive only as a caveat, not as the recommended route"
+
+
+def test_dream_resolution_names_callables_not_labels():
+    a, b = _unlinked_pair()
+    res = server.memory_dream.__wrapped__(force=True, dry_run=True)
+    clusters = res.get("clusters_for_review") or []
+    assert clusters, "fixture drifted: no review cluster offered"
+    resolution = clusters[0]["resolution"]
+
+    assert "memory_keep_separate" in resolution, \
+        "leave_separate was a label with no callable behind it"
+    assert "memory_delete" in resolution and "SUPERSEDES" in resolution, \
+        "every branch of the resolution should name what to call"
