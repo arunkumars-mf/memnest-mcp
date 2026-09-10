@@ -628,11 +628,35 @@ def _serialize(obj) -> str:
     """
     if RESPONSE_FORMAT == "toon" and _TOON_AVAILABLE:
         try:
-            return _toon_encode(obj)
+            return _scrub_paths(_toon_encode(obj))
         except Exception as e:
             logger.debug(f"TOON encode failed, falling back to JSON: {e}")
     # Compact JSON (no indent), default=str for things like floats
-    return json.dumps(obj, default=str)
+    return _scrub_paths(json.dumps(obj, default=str))
+
+
+def _scrub_paths(text: str) -> str:
+    """Replace this database's filesystem paths with their redacted identities.
+
+    Applied at the single serialization boundary rather than at each return
+    site. Two disclosure bugs in this class were already fixed by editing the
+    code that BUILDS a response (export, stats), but ~17 sites return engine
+    error text verbatim via str(e), and engine errors embed file paths on IO
+    and lock failures. Patching those individually is the partial fix rule 3
+    warns about, because the next str(e) someone adds reopens the hole.
+    Scrubbing on the way out covers every tool, present and future.
+
+    Deliberately narrow: it substitutes only THIS server's known paths, so it
+    cannot corrupt unrelated content, and it leaves the redacted identity
+    behind so a locked-database error still says WHICH database.
+    """
+    out = str(text)
+    seen = set()
+    for p in (DB_PATH, WORKSPACE, os.path.dirname(DB_PATH or "")):
+        if p and p not in (":memory:", ".", os.sep) and p not in seen:
+            seen.add(p)
+            out = out.replace(p, _redact_path(p))
+    return out
 
 
 def _timed(operation: str):
@@ -4655,7 +4679,12 @@ def memory_export(path: Optional[str] = None, include_embeddings: bool = False,
 
     return {
         "status": "exported",
+        # `path` is scrubbed at the serialization boundary like every other
+        # path, so `filename` is carried separately: it contains no directory
+        # component, cannot disclose the tree, and is what the caller actually
+        # needs to locate the file inside a workspace it already knows.
         "path": path,
+        "filename": os.path.basename(path),
         "memories": len(memories),
         "edges": {k: len(v) for k, v in edges.items()},
         "includes_embeddings": include_embeddings,

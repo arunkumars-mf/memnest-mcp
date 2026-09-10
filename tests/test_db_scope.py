@@ -136,3 +136,37 @@ def test_redacted_identity_is_stable_and_distinguishing():
     assert server._redact_path("/one/app") != server._redact_path("/two/app"), \
         "same basename in a different tree must still be distinguishable"
     assert server._redact_path(":memory:") == ":memory:"
+
+
+# --- the scrub happens at the serialization boundary, not per call site -------
+#
+# Rule 3 applied to the whole class rather than to the two sites that had
+# already bitten. ~17 places return engine error text verbatim via str(e), and
+# engine errors embed file paths on IO and lock failures — so patching the
+# places that build responses would leave the next str(e) free to reopen the
+# hole. Scrubbing on the way out covers every tool, present and future.
+
+def test_engine_error_text_is_scrubbed():
+    faked = f"IO error: could not read {server.DB_PATH} (errno 5)"
+    scrubbed = server._scrub_paths(faked)
+    if server.DB_PATH != ":memory:":
+        assert server.DB_PATH not in scrubbed
+    assert "IO error" in scrubbed, "scrubbing must not destroy the message"
+
+
+def test_scrub_leaves_unrelated_content_alone():
+    """Deliberately narrow: only THIS server's paths are substituted."""
+    text = "The user mentioned /etc/hosts and C:\\Windows in a memory."
+    assert server._scrub_paths(text) == text
+
+
+def test_export_returns_a_filename_the_caller_can_use():
+    """The scrub reaches the export's own returned path, so the filename is
+    carried separately — it has no directory component to disclose, and it is
+    what the caller needs to find the file inside a workspace it knows."""
+    import tempfile
+    p = os.path.join(tempfile.mkdtemp(), "backup.json")
+    server.memory_store.__wrapped__(content="A fact about the ledger pipeline.")
+    out = server.memory_export.__wrapped__(path=p)
+    assert out["filename"] == "backup.json"
+    assert os.sep not in out["filename"]
