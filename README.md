@@ -157,7 +157,7 @@ That's it — zero config required. All settings have sensible defaults.
 
 | Tool | What it does |
 |------|-------------|
-| `memory_store` | Store a memory (single or batch) with auto-dedup, auto-link to Topic nodes |
+| `memory_store` | Store a memory (single or batch) with auto-dedup, auto-link to Topic nodes. Flags injection-like content as `untrusted_content` without altering it |
 | `memory_search` | Hybrid semantic + keyword search, ranked by relevance |
 | `memory_update` | Update content, importance, or tags (single or batch) |
 | `memory_delete` | Delete one or more memories and their relationships |
@@ -169,7 +169,7 @@ That's it — zero config required. All settings have sensible defaults.
 | `memory_schema` | Inspect live DB schema: tables, columns, indexes, extensions |
 | `memory_topics` | List all topics (tags) with memory counts |
 | `memory_stats` | Database statistics: counts, categories, topics, top memories, runtime health |
-| `memory_dream` | Periodic consolidation — auto-prune stale, auto-merge trivial duplicates, surface clusters for review |
+| `memory_dream` | Periodic consolidation — auto-prune stale, auto-merge trivial duplicates, surface clusters for review, re-embed unembedded or stale-model rows |
 | `memory_reindex` | Rebuild both search indexes (vector HNSW and full-text BM25) |
 | `memory_export` | Write all memories and edges to a portable JSON file |
 | `memory_import` | Restore an export — ids remapped, edges rewired, dedup applied |
@@ -372,6 +372,24 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.31.0
+
+Three mechanisms borrowed from [kirocrew](https://github.com/kirodotdev/kirocrew)'s memory implementation. Each closes a *silent* failure — the kind this project already spends effort detecting — rather than adding a feature.
+
+- **Prompt-injection screening on stored and returned content.** Memory content is whatever an agent decided to keep: a scraped page, a PR body, a log line. It is then replayed into another agent's context, in a later session, with no human in the loop — so a memory containing `ignore previous instructions` is a persistent, cross-session injection carrier, and the only "injection" this server screened for was Cypher. Flagged, never rewritten and never refused: the content may legitimately be *about* prompt injection (this project stores several such memories), and silently mutating a caller's data would be worse than the risk. `memory_store` returns `untrusted_content` with the matched markers while the caller still has context; `memory_search` screens what it is actually **returning**, which also covers memories written before screening existed.
+- **Per-row embedding signature.** `_verify_embedding_dim` catches a *dimension* change, which is the loud case. A same-dimension model swap is silent: vectors stay present, reachable, and individually valid while being mutually meaningless — similarity degrades and every health field still reads green, because the index is intact and only the vectors' *meaning* changed. Each row now records the model that embedded it (`memory_stats` → `runtime.embeddings.signature` / `stale_signature`), making drift detectable and repairable **per row** instead of requiring a full rebuild. `healthy` folds the count in, so it cannot read `true` beside `stale_signature: 2`.
+- **Embedding backfill** (`memory_dream`, bounded at 25 rows/run, reported as `embedding_backfill`). This closes a hole with no prior repair path at all: when the model fails to load, `memory_store` creates the row without an embedding — `memory_stats` counted those rows and `memory_reindex` rebuilt the *index*, but nothing ever re-embedded the **rows**, so a memory stored during a model-load blip stayed invisible to vector search permanently. The per-query census could not flag it either, because it compares hits against rows that *have* embeddings. Backfill also repairs stale-signature rows. Bounded because each row costs an embed plus a delete+recreate (the engine cannot update an indexed embedding in place), and that churn is what damages the HNSW graph — so the post-delete census runs afterwards.
+
+Schema v4 (`Memory.embed_sig`). Existing databases migrate on open and backfill lazily as `memory_dream` runs; no manual step. Not adopted from kirocrew, and why: soft deletes (the index keeps growing and every query must filter; the post-delete census already covers the failure they address), stale-episodic retirement (a destructive edit to stored history at a 0.7 cosine threshold — our worst bug class), and MMR diversity reranking (a real gap, but it changes ranking, so it belongs in its own measured pass).
+
+### 0.30.2
+
+- A **fifth** hint surface named the new tool. The write-time conflict hint has two variants — `value_disagreement` and `near_duplicate` — and 0.30.1's count of four treated them as one, because it was taken from the release description rather than from the emission sites in the code. The `near_duplicate` variant offered supersession or nothing, so an agent holding two facts that both hold could only wrongly mark one stale or leave the flag firing on every later search.
+
+### 0.30.1
+
+- Four hint surfaces named `memory_relate(RELATED_TO)` as the way to dismiss a conflict flag, which creates graph structure the agent did not intend and does not actually clear the flag. They now name `memory_keep_separate`, state that it records the verdict **without** creating an edge, and demote `RELATED_TO` to a conditional for genuinely connected memories.
 
 ### 0.30.0
 
