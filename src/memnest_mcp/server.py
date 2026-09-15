@@ -1714,8 +1714,42 @@ def _set_schema_version(conn: lb.Connection, version: int):
         logger.warning(f"Failed to record schema version: {e}")
 
 
+def _ensure_embed_sig_column(conn: lb.Connection) -> bool:
+    """Ensure Memory.embed_sig exists, whatever the recorded version claims.
+
+    A missing column is not cosmetic: every query naming it raises a Binder
+    exception, and both callers swallow that — `_count_stale_embed_sig` returns
+    None and `_backfill_embeddings` returns a zero report — so the backfill
+    silently does nothing on precisely the databases that need it.
+    """
+    try:
+        conn.execute("MATCH (m:Memory) RETURN m.embed_sig LIMIT 1;")
+        return True
+    except Exception:
+        pass  # Binder exception: the property does not exist.
+    try:
+        conn.execute("ALTER TABLE Memory ADD embed_sig STRING DEFAULT '';")
+        logger.info("Added missing Memory.embed_sig column")
+        return True
+    except Exception as e:
+        if any(t in str(e).lower() for t in ("already exists", "duplicate",
+                                             "already has property")):
+            return True
+        logger.warning(f"Could not add Memory.embed_sig column: {e}")
+        return False
+
+
 def _apply_migrations(conn: lb.Connection):
     """Run only migrations newer than the recorded schema version."""
+    # Verified before the version gate, on purpose. 0.31.0 shipped this column's
+    # ALTER inside the `current < 1` block, so every database at v1-v3 skipped it
+    # and was then stamped v4 by the tail of this function — recording a
+    # migration that never ran. Those databases report a CURRENT version, so no
+    # version-gated repair can ever reach them; the only way back is to check for
+    # the column itself. Same reason the post-delete census counts reachable
+    # nodes instead of trusting that delete maintenance behaved.
+    _ensure_embed_sig_column(conn)
+
     current = _get_schema_version(conn)
     if current >= SCHEMA_VERSION:
         return
@@ -1724,9 +1758,6 @@ def _apply_migrations(conn: lb.Connection):
 
     # v1: add workspace column to Memory
     if current < 1:
-        _safe_execute(conn, "ALTER TABLE Memory ADD embed_sig STRING DEFAULT '';",
-                      expected_errors=("already exists", "duplicate",
-                                       "already has property"))
         _safe_execute(conn, "ALTER TABLE Memory ADD workspace STRING DEFAULT '';",
                       expected_errors=("already exists", "duplicate", "already has property"))
 
@@ -4703,7 +4734,14 @@ def memory_stats(include_paths: bool = False) -> str:
                     missing_embeddings == 0
                     and vector_index_live is not False
                     and (vector_reachable is None or vector_reachable >= embedded_total)
-                    and not (_stale_sig_count or 0)
+                    # `== 0`, not `not (... or 0)`: an unknown count (None,
+                    # from a query that raised) must not read as green. That is
+                    # the same sentinel-as-ok defect the comment above warns
+                    # about, and 0.31.0 shipped it — a database whose embed_sig
+                    # column was missing reported healthy: true precisely
+                    # because the count that would have contradicted it could
+                    # not be computed.
+                    and _stale_sig_count == 0
                 ),
                 "queryable": vector_index_live,
             },

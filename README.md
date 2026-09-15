@@ -373,6 +373,18 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 
 ## Changelog
 
+### 0.31.1
+
+**Fixes a 0.31.0 bug that affected every pre-existing database. Upgrade past 0.31.0 rather than to it.**
+
+0.31.0 added `Memory.embed_sig`, but put its `ALTER TABLE` inside the `current < 1` migration block — so it ran only for version-0 (brand new) databases, which are the ones that need no migration. Every database at v1–v3 skipped it, and the tail of `_apply_migrations` then stamped the version as v4 regardless, recording a migration that never ran. Because those databases report a *current* version, no version-gated repair could ever reach them again.
+
+The damage was silent in both directions, which is why 401 passing tests did not catch it. Queries naming the missing column raise a Binder exception; `_count_stale_embed_sig` swallowed it and returned `None`; `healthy` evaluated `not (None or 0)` as `True`; and `_backfill_embeddings` returned a zero report. So the new feature did nothing at all on precisely the databases it was written for, while `memory_stats` reported `healthy: true` next to `stale_signature: null`. Verified against a real 38-memory database: before the fix, `stale_signature: None` and `scanned: 0`; after, 38 stale rows found and re-embedded.
+
+- The column is now ensured by **probe** (`_ensure_embed_sig_column`), before the version gate can short-circuit, so databases already mis-stamped v4 by 0.31.0 self-repair on open. Same reasoning as the post-delete census: check the thing, do not infer it from a counter that claims it happened.
+- `healthy` now requires `stale_signature == 0` rather than `not (count or 0)`, so an *uncomputable* count no longer reads as green. That sentinel-as-ok pattern is one this project has now fixed four times, and 0.31.0 shipped a fifth instance directly beneath a comment claiming to prevent it.
+- Three tests cover the migration path, which previously had none: every test builds a fresh database, so the column was always present under test and always absent in the field.
+
 ### 0.31.0
 
 Three mechanisms borrowed from [kirocrew](https://github.com/kirodotdev/kirocrew)'s memory implementation. Each closes a *silent* failure — the kind this project already spends effort detecting — rather than adding a feature.

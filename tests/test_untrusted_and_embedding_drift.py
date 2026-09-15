@@ -206,3 +206,86 @@ def test_dream_reports_the_backfill():
     assert bf, "dream must report what it re-embedded"
     assert bf["reembedded"] >= 1
     assert bf["signature"] == server._embed_signature()
+
+
+# --- migration path -----------------------------------------------------------
+#
+# 0.31.0 passed 401 tests and was still broken on every pre-existing database.
+# The ALTER for `embed_sig` sat in the `current < 1` block, so it ran only for
+# version-0 (brand new) databases — and every test uses a brand new database, so
+# the column was always present under test and always absent in the field. The
+# tail of _apply_migrations then stamped the version as current, meaning no
+# version-gated repair could ever reach those databases again.
+#
+# The observable damage was silent in both directions: queries naming the column
+# raise a Binder exception, `_count_stale_embed_sig` swallows it and returns
+# None, `healthy` read `not (None or 0)` as True, and `_backfill_embeddings`
+# returned a zero report — so the feature did nothing, on exactly the databases
+# it existed for, while reporting green.
+
+
+def _simulate_legacy_db(conn):
+    """A database shaped like one written before embed_sig existed."""
+    try:
+        conn.execute("ALTER TABLE Memory DROP embed_sig;")
+    except Exception as e:  # pragma: no cover - engine capability guard
+        pytest.skip(f"engine cannot drop columns, cannot simulate: {e}")
+
+
+def test_column_is_repaired_when_the_recorded_version_is_already_current():
+    """The 0.31.0 victim case: version says v4, column is absent."""
+    server.memory_store.__wrapped__(content=CLEAN, tags=["ledger"])
+    conn = server.get_conn()
+    _simulate_legacy_db(conn)
+
+    assert server._get_schema_version(conn) >= 4, \
+        "precondition: the version must already be current, so version gating " \
+        "cannot be what repairs this"
+    with pytest.raises(Exception):
+        conn.execute("MATCH (m:Memory) RETURN m.embed_sig LIMIT 1;")
+
+    assert server._ensure_embed_sig_column(conn) is True
+    conn.execute("MATCH (m:Memory) RETURN m.embed_sig LIMIT 1;")  # no raise
+
+
+def test_migration_repairs_the_column_and_backfill_then_works():
+    """Note for anyone checking this test's anti-vacuity: the obvious stub —
+    deleting the `_ensure_embed_sig_column(conn)` call from `_apply_migrations` —
+    does not make this test fail, it makes it SKIP. With the misplaced v1 ALTER
+    removed, that probe is the only code that ever creates the column, so
+    removing it leaves nothing for `_simulate_legacy_db`'s DROP to remove. The
+    skip is the evidence, not a gap. The repair itself is verified directly by
+    the test above, and was verified against a real 38-memory database that
+    0.31.0 had already mis-stamped as v4.
+    """
+    server.memory_store.__wrapped__(items=[
+        {"content": f"Legacy fact {i} about the ledger stage {i}.", "tags": [f"L{i}"]}
+        for i in range(6)])
+    conn = server.get_conn()
+    _simulate_legacy_db(conn)
+
+    # What the field saw: an unknown count, a green health field, a no-op backfill.
+    assert server._count_stale_embed_sig(conn) is None
+    assert server._backfill_embeddings(conn)["scanned"] == 0
+
+    server._apply_migrations(conn)
+
+    stale = server._count_stale_embed_sig(conn)
+    assert isinstance(stale, int) and stale >= 6, \
+        f"every pre-existing row should be stale after repair, got {stale}"
+    out = server._backfill_embeddings(conn)
+    assert out["reembedded"] >= 1, f"backfill still does nothing: {out}"
+
+
+def test_unknown_stale_count_is_not_reported_healthy():
+    """`not (None or 0)` is True — an uncomputable count must not read green."""
+    server.memory_store.__wrapped__(content=CLEAN, tags=["ledger"])
+    conn = server.get_conn()
+    _simulate_legacy_db(conn)
+
+    assert server._count_stale_embed_sig(conn) is None
+    emb = server.memory_stats.__wrapped__()["runtime"]["embeddings"]
+    assert emb["stale_signature"] is None
+    assert emb["healthy"] is False, \
+        "health must not read true on the strength of a count that could not " \
+        "be computed"
