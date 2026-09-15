@@ -289,3 +289,25 @@ def test_unknown_stale_count_is_not_reported_healthy():
     assert emb["healthy"] is False, \
         "health must not read true on the strength of a count that could not " \
         "be computed"
+
+
+def test_version_is_reported_with_provenance():
+    """`version` reads installed distribution metadata, so it describes the
+    running code only when the running code IS the installed distribution.
+    Launched from a checkout via PYTHONPATH — the ordinary developer setup — it
+    reports whatever wheel happens to be in the venv; observed in the field as
+    `version: 0.2.0` from code that was 0.31.1. Since the version is what gets
+    quoted in a bug report and used to decide whether a fix is present, it needs
+    to say which of the two it is.
+    """
+    rt = server.memory_stats.__wrapped__()["runtime"]
+    assert "version_source" in rt, \
+        "a version without provenance cannot be checked against the code"
+    assert rt["version_source"] in ("installed", "source-tree", "unknown")
+
+    # These tests import the package from the source tree, so anything but
+    # "installed" is required here: asserting the value rather than its presence
+    # is what distinguishes this from a test that passes on a hardcoded string.
+    assert rt["version_source"] != "installed", (
+        "tests run against src/ via the repo checkout; reporting 'installed' "
+        f"would mean provenance is not actually being computed: {rt}")

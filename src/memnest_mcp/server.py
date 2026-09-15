@@ -165,9 +165,36 @@ def _resolve_workspace() -> str:
 
 try:
     from importlib.metadata import version as _pkg_version
+    from importlib.metadata import distribution as _pkg_dist
     SERVER_VERSION = _pkg_version("memnest-mcp")
 except Exception:  # pragma: no cover - dev checkouts without install
     SERVER_VERSION = "unknown"
+    _pkg_dist = None  # type: ignore[assignment]
+
+
+def _version_provenance() -> str:
+    """Say whether SERVER_VERSION actually describes the code that is running.
+
+    SERVER_VERSION reads installed *distribution metadata*, which is wrong
+    whenever the server is launched from a source tree via PYTHONPATH -- the
+    ordinary developer setup, and how an MCP client is usually pointed at a
+    checkout. Observed in the field: `version: 0.2.0` reported by code that was
+    0.31.1, because a stale wheel happened to be installed in the same venv.
+
+    A version number is the first thing quoted in a bug report and the thing
+    used to decide whether a fix is present, so stating it without provenance is
+    the same defect class as reporting `healthy: true` beside a count that could
+    not be computed. Returns "installed", "source-tree" (metadata may be stale),
+    or "unknown".
+    """
+    if _pkg_dist is None:
+        return "unknown"
+    try:
+        dist_root = Path(_pkg_dist("memnest-mcp").locate_file("")).resolve()
+        here = Path(__file__).resolve()
+        return "installed" if dist_root in here.parents else "source-tree"
+    except Exception:
+        return "unknown"
 
 # How the current WORKSPACE value was determined:
 # env | cwd | global | roots | manual (see memory_set_workspace)
@@ -4708,6 +4735,10 @@ def memory_stats(include_paths: bool = False) -> str:
         },
         "runtime": {
             "version": SERVER_VERSION,
+            # "source-tree" means the number above came from installed metadata
+            # while the running code was imported from a checkout, so it may not
+            # describe this process. See _version_provenance.
+            "version_source": _version_provenance(),
             "db_path": DB_PATH if include_paths else _redact_path(DB_PATH),
             "embeddings": {
                 "model": EMBEDDING_MODEL,

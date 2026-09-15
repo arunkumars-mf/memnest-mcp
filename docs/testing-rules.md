@@ -137,3 +137,42 @@ your corpus" would have discouraged.
 
 This is the thread an author is least likely to notice about their own work,
 because the derived artifact is usually something they wrote themselves.
+
+## 7. Test the shape you are upgrading from, not the shape you create
+
+Every test in this suite builds a fresh database. That is convenient and it is
+also why 0.31.0 shipped a schema migration that was broken for **every existing
+user** with 401 tests passing.
+
+The new column's `ALTER TABLE` was placed inside the `current < 1` migration
+block, so it ran only for version-0 databases — brand new ones, the only
+databases that need no migration at all. Databases at v1–v3 skipped it, and the
+tail of the migration function stamped the version as current regardless,
+recording a migration that never ran. Under test the column therefore always
+existed; in the field it never did. Greenfield coverage cannot see an upgrade
+path, and a suite made entirely of greenfield cases will report the inverse of
+the truth with complete confidence.
+
+Two properties made it silent rather than loud, which is why nothing downstream
+caught it either:
+
+- Every query naming the absent column raised, both callers swallowed the
+  exception, and the count that would have contradicted the health field became
+  `None` — so `not (None or 0)` reported `healthy: true`. The feature did
+  nothing, on exactly the databases it was written for, while reporting green.
+- The version had been stamped as current, so no version-gated repair could ever
+  reach those databases again. The fix had to *probe for the column* instead of
+  inferring its presence from a counter claiming it was added — the same move as
+  counting reachable nodes after a delete instead of trusting delete maintenance.
+
+The rule has a corollary about *where* verification happens: this was found by
+opening a copy of a real 38-memory database with the published wheel over real
+MCP stdio, after the release was already public. No fixture would have found it,
+because the defect was in the difference between a fixture and an artifact. When
+a change touches persistent state, the last verification step belongs on a real
+artifact, and it belongs **before** the upload rather than after it.
+
+The generalisation of rules 5, 6 and 7 together: prefer the primary source at
+every level — the emission sites over your description of them, the measured
+value over a quoted one, and the actual stored database over the one your tests
+construct.

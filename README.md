@@ -373,6 +373,11 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 
 ## Changelog
 
+### 0.31.2
+
+- **`memory_stats` reports `runtime.version_source`.** `version` reads installed *distribution metadata*, so it describes the running code only when the running code is the installed distribution. Launched from a checkout via `PYTHONPATH` — the ordinary developer setup, and how an MCP client is usually pointed at a working tree — it reports whatever wheel happens to be in the venv. Observed here: `version: 0.2.0` reported by code that was 0.31.1, because a stale wheel sat in the same venv. The version is the first thing quoted in a bug report and the thing used to decide whether a fix is present, so it now says whether it is `installed`, `source-tree` (metadata may be stale), or `unknown`.
+- Seventh methodological rule in [`docs/testing-rules.md`](docs/testing-rules.md): *test the shape you are upgrading from, not the shape you create.* Every test in this suite builds a fresh database, which is why 0.31.0's broken migration passed 401 tests — under test the new column always existed, in the field it never did. The corollary is where verification happens: that bug was found by opening a copy of a real 38-memory database with the published wheel, so when a change touches persistent state the last check belongs on a real artifact, and before the upload rather than after it.
+
 ### 0.31.1
 
 **Fixes a 0.31.0 bug that affected every pre-existing database. Upgrade past 0.31.0 rather than to it.**
