@@ -65,7 +65,7 @@ Tips:
 - Set `global_search=True` to search across all workspaces
 - Adjust `preview_chars` (default 200) if you need more context per result
 - `top_k` caps at 10; use 5 for focused retrieval, 10 when exploring
-- Use `memory_get(memory_id=42)` for full untruncated content after search returns previews
+- Use `memory_get(memory_id=42)` for full untruncated content after search returns previews. It also takes a list — `memory_get(memory_id=[42, 43, 44])` is one call, which is the usual case since conflict flags, review clusters and supersession cycles all report several ids at once
 - Use `memory_topics(limit=20, min_count=2)` to discover existing tag filters
 
 **If the response contains a `degraded` field**, semantic search is dead and
@@ -254,6 +254,13 @@ Omit `relationship` to drop every edge between the pair, or name one to drop
 just that type. The memories are untouched. This is also how you break a
 circular `SUPERSEDES` chain if `memory_dream` reports one under
 `contradictions`.
+
+**Resolving several clusters at once:** `memory_keep_separate` takes either
+shape, and the difference is not cosmetic. `memory_ids=[a, b, c]` is a **clique**
+— every pair among them is recorded. `pairs=[[a, b], [c, d]]` records exactly
+those pairs. Use `pairs` whenever the ids come from more than one cluster:
+passing them all to `memory_ids` would record verdicts on cross-cluster pairs you
+never examined, permanently suppressing genuine conflicts between them.
 
 **Inspecting what a memory is connected to:** `memory_get(memory_id=42)` returns
 an `edges` block with both directions, plus `superseded: true` and

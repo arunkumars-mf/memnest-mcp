@@ -4218,7 +4218,8 @@ def _unrelate_one(conn, from_id: int, to_id: int,
 
 @mcp.tool()
 @_timed("memory_keep_separate")
-def memory_keep_separate(memory_ids: list[int]) -> str:
+def memory_keep_separate(memory_ids: Optional[list[int]] = None,
+                         pairs: Optional[list[list[int]]] = None) -> str:
     """Record that memories are deliberately DISTINCT, not duplicates.
 
     Use this for the `leave_separate` resolution that memory_dream offers on a
@@ -4230,45 +4231,96 @@ def memory_keep_separate(memory_ids: list[int]) -> str:
     it already answered. Recording the verdict makes the decision durable.
 
     This creates NO edge — that is the point. memory_relate(RELATED_TO) says
-    "these are connected"; this says "these are separate and I checked". Pass
-    2+ ids; every pair among them is recorded. Verdicts are dropped
+    "these are connected"; this says "these are separate and I checked".
+    RELATED_TO also silences the search-time flag, but the cluster is still
+    re-offered on every dream run, so it does not end the question.
+
+    Two shapes, and the difference matters:
+
+    - `memory_ids=[a, b, c]` is a CLIQUE: every pair among them is recorded
+      (a-b, a-c, b-c). Correct for one review cluster whose members are all
+      mutually distinct.
+    - `pairs=[[a, b], [c, d]]` records EXACTLY those pairs. Use this to resolve
+      several unrelated clusters in one call. Passing all their ids to
+      `memory_ids` instead would record verdicts on cross-cluster pairs nobody
+      examined, permanently suppressing conflicts between them — a silent
+      correctness loss, not merely wasted writes.
+
+    Both may be given; the union is recorded, deduplicated. Verdicts are dropped
     automatically once either memory is deleted.
     """
     conn = get_conn()
-    ids = [i for i in (memory_ids or []) if isinstance(i, int) and not isinstance(i, bool)]
-    if len(ids) < 2:
+
+    def _clean(seq) -> list:
+        return [i for i in (seq or [])
+                if isinstance(i, int) and not isinstance(i, bool)]
+
+    explicit: list[tuple] = []
+    for entry in (pairs or []):
+        got = _clean(entry)
+        if len(got) != 2 or got[0] == got[1]:
+            return {"status": "error", "bad_pair": entry,
+                    "message": "Each entry of `pairs` must be two distinct "
+                               "memory ids, e.g. pairs=[[4, 9], [12, 15]]."}
+        explicit.append((got[0], got[1]))
+
+    ids = _clean(memory_ids)
+    if not ids and not explicit:
+        return {"status": "error",
+                "message": "Pass memory_ids=[a, b, ...] for one cluster, or "
+                           "pairs=[[a, b], [c, d]] for several."}
+    if ids and len(ids) < 2:
         return {"status": "error",
                 "message": "Pass at least two memory ids to mark as distinct."}
-    if len(ids) > MAX_BATCH_ITEMS:
+    if len(ids) > MAX_BATCH_ITEMS or len(explicit) > MAX_BATCH_ITEMS:
         return {"status": "error",
-                "message": f"Too many ids ({len(ids)}, limit {MAX_BATCH_ITEMS})."}
+                "message": f"Too many entries (limit {MAX_BATCH_ITEMS})."}
 
+    referenced = sorted(set(ids) | {i for p in explicit for i in p})
     found = {r[0] for r in _collect_results(conn.execute(
-        "MATCH (m:Memory) WHERE m.id IN $ids RETURN m.id;", {"ids": ids}))}
-    missing = sorted(set(ids) - found)
-    live = sorted(found)
-    if len(live) < 2:
+        "MATCH (m:Memory) WHERE m.id IN $ids RETURN m.id;",
+        {"ids": referenced}))}
+    missing = sorted(set(referenced) - found)
+
+    live = sorted(i for i in ids if i in found)
+    if ids and len(live) < 2:
         return {"status": "error", "not_found": missing,
                 "message": "Fewer than two of those memories exist."}
+
+    wanted: list[tuple] = []
+    for i in range(len(live)):
+        for j in range(i + 1, len(live)):
+            wanted.append((live[i], live[j]))
+    skipped_pairs = []
+    for a, b in explicit:
+        if a in found and b in found:
+            wanted.append((a, b) if a < b else (b, a))
+        else:
+            skipped_pairs.append([a, b])
+
+    # Deduplicated so overlapping shapes cost one write, not two.
+    wanted = list(dict.fromkeys(wanted))
+    if not wanted:
+        return {"status": "error", "not_found": missing,
+                "skipped_pairs": skipped_pairs,
+                "message": "No pair had both of its memories present."}
 
     _ensure_review_table(conn)
     now = time.time()
     recorded, already = [], []
-    for i in range(len(live)):
-        for j in range(i + 1, len(live)):
-            a, b = live[i], live[j]
-            if _pair_kept_separate(conn, a, b):
-                already.append([a, b])
-                continue
-            try:
-                conn.execute(
-                    f"CREATE (:{REVIEW_VERDICT_TABLE} {{pair: $p, id_a: $a, "
-                    f"id_b: $b, decided_at: $t}});",
-                    {"p": _pair_key(a, b), "a": a, "b": b, "t": now},
-                )
-                recorded.append([a, b])
-            except Exception as e:
-                logger.debug(f"Verdict write failed for {a}/{b}: {e}")
+    for a, b in wanted:
+        if _pair_kept_separate(conn, a, b):
+            already.append([a, b])
+            continue
+        try:
+            conn.execute(
+                f"CREATE (:{REVIEW_VERDICT_TABLE} {{pair: $p, id_a: $a, "
+                f"id_b: $b, decided_at: $t}});",
+                {"p": _pair_key(a, b), "a": a, "b": b, "t": now},
+            )
+            recorded.append([a, b])
+        except Exception as e:
+            logger.debug(f"Verdict write failed for {a}/{b}: {e}")
 
     out = {"status": "recorded" if recorded else "unchanged",
            "pairs_recorded": recorded, "pairs_already_recorded": already,
@@ -4276,6 +4328,8 @@ def memory_keep_separate(memory_ids: list[int]) -> str:
                       "clusters or as potential_conflicts")}
     if missing:
         out["not_found"] = missing
+    if skipped_pairs:
+        out["skipped_pairs"] = skipped_pairs
     return out
 
 
@@ -6579,21 +6633,14 @@ function resetView() {{
 # by a stale comment here.
 # ----------------------------------------------------------------------------
 
-@mcp.tool()
-@_timed("memory_get")
-def memory_get(memory_id: int, include_edges: bool = True) -> str:
-    """Get one memory in full — untruncated content, metadata, and its edges.
+def _get_one(conn: lb.Connection, memory_id: int,
+             include_edges: bool = True) -> dict:
+    """Full record for one memory. Shared by memory_get's single and list paths.
 
-    This is the right tool for "show me memory 42 completely". Search returns
-    truncated previews; this does not.
-
-    include_edges=True (the default) adds an `edges` block listing the memory's
-    RELATED_TO / SUPERSEDES / EXPLAINS links in both directions, plus a
-    `superseded_by` convenience field. Without it, answering "what does this
-    replace?" or "is this still current?" required hand-written Cypher, even
-    though edges are the whole point of storing memory as a graph.
+    Extracted rather than duplicated: the access_count bump and the edge
+    block are exactly the kind of detail a second copy loses, which is how
+    the access_count drift that _recreate_memory_node exists to end began.
     """
-    conn = get_conn()
     if not isinstance(memory_id, int) or isinstance(memory_id, bool):
         return {"status": "error", "message": "memory_id must be an integer."}
 
@@ -6668,6 +6715,58 @@ def memory_get(memory_id: int, include_edges: bool = True) -> str:
             out["edges_error"] = str(e)[:200]
 
     return out
+
+
+@mcp.tool()
+@_timed("memory_get")
+def memory_get(memory_id, include_edges: bool = True) -> str:
+    """Get one or more memories in full — untruncated content, metadata, edges.
+
+    This is the right tool for "show me memory 42 completely". Search returns
+    truncated previews; this does not.
+
+    `memory_id` accepts an int or a list of ints, the same shape memory_delete
+    takes. A list costs one round trip instead of N, which matters because the
+    places that report ids — a conflict flag, a dream review cluster, a
+    supersession cycle — report several at once, and reading each separately was
+    the common case.
+
+    include_edges=True (the default) adds an `edges` block listing the memory's
+    RELATED_TO / SUPERSEDES / EXPLAINS links in both directions, plus a
+    `superseded_by` convenience field. Without it, answering "what does this
+    replace?" or "is this still current?" required hand-written Cypher, even
+    though edges are the whole point of storing memory as a graph.
+
+    A single int returns the memory object directly, unchanged. A list returns
+    {"results": [...], "count": n, "not_found": [...]}; the envelope appears only
+    for lists, so existing single-id callers see no difference.
+    """
+    conn = get_conn()
+
+    if isinstance(memory_id, list):
+        ids = [i for i in memory_id
+               if isinstance(i, int) and not isinstance(i, bool)]
+        if not ids:
+            return {"status": "error",
+                    "message": "Pass an integer id, or a list of integer ids."}
+        if len(ids) > MAX_BATCH_ITEMS:
+            return {"status": "error",
+                    "message": f"Too many ids ({len(ids)}, "
+                               f"limit {MAX_BATCH_ITEMS})."}
+        results, not_found = [], []
+        for i in list(dict.fromkeys(ids)):
+            got = _get_one(conn, i, include_edges)
+            if got.get("status") == "found":
+                results.append(got)
+            else:
+                not_found.append(i)
+        out = {"status": "found" if results else "not_found",
+               "results": results, "count": len(results)}
+        if not_found:
+            out["not_found"] = not_found
+        return out
+
+    return _get_one(conn, memory_id, include_edges)
 
 
 @mcp.tool()

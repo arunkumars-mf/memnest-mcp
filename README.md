@@ -161,7 +161,7 @@ That's it — zero config required. All settings have sensible defaults.
 | `memory_search` | Hybrid semantic + keyword search, ranked by relevance |
 | `memory_update` | Update content, importance, or tags (single or batch) |
 | `memory_delete` | Delete one or more memories and their relationships |
-| `memory_get` | Read one memory in full — untruncated content plus its edges |
+| `memory_get` | Read one or more memories in full — untruncated content plus edges. `memory_id` takes an int or a list |
 | `memory_list` | Enumerate memories by recency / category / topic / importance (no ranking, pages to any depth) |
 | `memory_relate` | Create RELATED_TO / SUPERSEDES / EXPLAINS relationships (single or batch, idempotent) |
 | `memory_unrelate` | Remove a relationship — one type or all types between a pair |
@@ -175,7 +175,7 @@ That's it — zero config required. All settings have sensible defaults.
 | `memory_import` | Restore an export — ids remapped, edges rewired, dedup applied |
 | `memory_set_workspace` | Pin the workspace scope and database location |
 | `memory_graph_html` | Generate an interactive HTML visualization of the graph |
-| `memory_keep_separate` | Record that memories are deliberately distinct — silences review clusters and conflict flags for that pair without creating an edge |
+| `memory_keep_separate` | Record that memories are deliberately distinct — silences review clusters and conflict flags for that pair without creating an edge. `memory_ids` is a clique; `pairs=[[a,b],[c,d]]` records exactly those pairs |
 | `memory_traverse` | *Deprecated* — use `memory_query(read_only=True)` |
 
 `memory_stats` is also **safe to paste by default**: the workspace and database
@@ -372,6 +372,17 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 [MIT](LICENSE)
 
 ## Changelog
+
+### 0.32.0
+
+**Batch shapes audited across all 20 tools.** Five already took batches — `memory_store` (`items`), `memory_update` (`updates`), `memory_relate` and `memory_unrelate` (`relations`), `memory_delete` (`memory_id` as int *or* list). Two gaps remained, and they were not equivalent.
+
+- **`memory_keep_separate` accepts `pairs=[[a, b], [c, d]]`.** It already took a list, which made it *look* batched, but the list is a **clique**: every pair among the ids is recorded. So an agent resolving three `memory_dream` clusters in one call by passing all their ids would record verdicts on cross-cluster pairs it never examined — permanently suppressing genuine conflicts between them. That is a silent correctness loss dressed as an optimisation, which is worse than having no batch path at all. `memory_ids` keeps clique semantics for a single cluster (the right shape when all members are mutually distinct); `pairs` records exactly what it is given. Both may be passed, the union is deduplicated, and `[b, a]` is recognised as the same verdict as `[a, b]`.
+- **`memory_get` accepts a list**, matching `memory_delete`'s int-or-list parameter. Every surface that reports ids — conflict flags, review clusters, supersession cycles — reports several at once, so reading them back was N round trips. A single int returns the memory object unchanged; a list returns `{"results": [...], "count": n, "not_found": [...]}`, so existing callers see no difference. The batch path shares one `_get_one` helper with the single path rather than duplicating it: a second copy is how the `access_count` drift that `_recreate_memory_node` exists to end began, and a batch path that quietly lost the `superseded` flag would present a stale memory as current.
+
+Deliberately not batched: `memory_search` (batching queries raises result-merging questions a caller can answer better than the server) and `memory_export`/`memory_import` (one file per call is the unit).
+
+The dream steering, the persist hook and the getting-started skill now name `pairs` where they resolve more than one cluster, since that is the workflow in which the clique shape is actively wrong.
 
 ### 0.31.3
 
