@@ -114,10 +114,17 @@ Resolve it rather than picking one silently:
 - If one replaces the other → re-store the current version with
   `memory_store(..., supersedes=<old_id>)`
 - If both are true (different scopes, environments, time periods) →
-  `memory_relate(from_id=<a>, to_id=<b>, relationship="RELATED_TO")`. **That
-  dismisses the flag permanently** — it is the recorded answer to "I looked, and
-  both hold", so the pair is never reported again. Do not use `SUPERSEDES` for
-  this: it would demote a true fact out of results.
+  `memory_keep_separate(memory_ids=[<a>, <b>])`. That is the recorded answer to
+  "I looked, and both hold": it dismisses the search-time flag **and** stops
+  `memory_dream` re-offering the pair, and it creates no edge. Do not use
+  `SUPERSEDES` for this: it would demote a true fact out of results.
+
+  `memory_relate(..., relationship="RELATED_TO")` also clears the search-time
+  flag, but only that one — measured, the cluster is still surfaced on every
+  dream run, so you would answer the same question forever. It also asserts the
+  two memories are connected, which for facts that merely share a subject is a
+  claim you may not want in the graph. Use it when they genuinely are related,
+  in addition to the verdict rather than instead of it.
 - If you cannot tell → ask the user; do not guess which is current
 
 This is flagged as *potential* because the server does no LLM inference: it knows
@@ -136,9 +143,9 @@ right. Deliberately **not** flagged:
 **Known limitation:** two measurements of the *same* dimension under different
 qualifiers ("connect timeout 500ms" / "read timeout 2000ms") will flag even
 though both are true — telling a qualifier from a synonym needs semantics the
-server does not have. One `memory_relate(..., relationship="RELATED_TO")`
-dismisses it for good, which is why the detector errs toward flagging: a
-dismissal costs one call, a miss serves a stale value as the answer.
+server does not have. One `memory_keep_separate(memory_ids=[<a>, <b>])` dismisses
+it for good, which is why the detector errs toward flagging: a dismissal costs
+one call, a miss serves a stale value as the answer.
 
 ### Step 3: Store new information
 

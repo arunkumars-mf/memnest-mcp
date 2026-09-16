@@ -308,3 +308,66 @@ def test_conflict_similarity_is_a_portable_exact_value():
         "similarity must not depend on unrelated corpus contents"
     assert clean["conflict_similarity"] == 0.9226, \
         "a pinned fixture similarity changed — embedding model or text drifted"
+
+
+# --- what RELATED_TO actually does, measured ---------------------------------
+#
+# Two shipped statements about this were wrong in opposite directions. The
+# getting-started skill said `memory_relate(RELATED_TO)` "dismisses the flag
+# permanently... so the pair is never reported again"; the 0.30.1 release note
+# said it "does not actually clear the flag". Neither held: it clears the
+# search-time flag and dream re-offers the cluster on every run.
+#
+# That split is the whole argument for preferring keep_separate, and it was
+# asserted in both directions before anyone measured it, so it is pinned here.
+
+
+def _conflicting_pair():
+    a = server.memory_store.__wrapped__(
+        content="The Nunki relay request timeout is 250 milliseconds.",
+        tags=["nunki"])["id"]
+    b = server.memory_store.__wrapped__(
+        content="The Nunki relay request timeout is 850 milliseconds.",
+        tags=["nunki"])["id"]
+    return a, b
+
+
+def _search_flags():
+    r = server.memory_search.__wrapped__(query="Nunki relay request timeout",
+                                         top_k=5)
+    return r.get("potential_conflicts") or []
+
+
+def _review_clusters():
+    return server.memory_dream.__wrapped__(force=True).get(
+        "clusters_for_review") or []
+
+
+def test_unresolved_pair_is_flagged_by_search_and_offered_by_dream():
+    _conflicting_pair()
+    assert _search_flags(), "precondition: the pair must be flagged at all"
+    assert _review_clusters(), "precondition: dream must offer the cluster"
+
+
+def test_related_to_clears_the_search_flag_but_dream_still_re_offers():
+    a, b = _conflicting_pair()
+    server.memory_relate.__wrapped__(from_id=b, to_id=a,
+                                     relationship="RELATED_TO")
+
+    assert not _search_flags(), (
+        "RELATED_TO does clear the search-time flag — the 0.30.1 note claiming "
+        "otherwise was wrong")
+    assert _review_clusters(), (
+        "...but dream still re-offers the cluster, so the skill's 'never "
+        "reported again' was also wrong. This asymmetry is why keep_separate "
+        "exists and why instructions should not send an agent here")
+
+
+def test_keep_separate_clears_both():
+    a, b = _conflicting_pair()
+    server.memory_keep_separate.__wrapped__(memory_ids=[a, b])
+
+    assert not _search_flags()
+    assert not _review_clusters(), (
+        "the verdict must survive into dream; that is the difference from "
+        "RELATED_TO")

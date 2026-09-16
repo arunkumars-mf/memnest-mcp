@@ -373,6 +373,26 @@ Issues and PRs welcome. See [LICENSE](LICENSE) for terms.
 
 ## Changelog
 
+### 0.31.3
+
+**The hooks, the skill and the auto-approve lists were still teaching the pre-0.30.0 option set.** 0.30.0 added `memory_keep_separate` and 0.30.1–0.30.2 fixed the five surfaces inside the server that hint at it. Seven surfaces that *instruct an agent* were never enumerated: three prompts in `cli.py` (written into a user's `.kiro/` by `memnest-mcp config kiro`), the two power hook JSONs, both `autoApprove` lists, and the getting-started skill. The dream steering was the worst case — it explicitly recommended `memory_relate(RELATED_TO)` for clusters the agent had judged distinct, the option 0.30.1 demoted.
+
+Measuring that recommendation turned up two shipped statements that were both wrong, in opposite directions:
+
+| verdict | search-time flag | `memory_dream` re-offers the cluster |
+|---|---|---|
+| none | fires | yes |
+| `memory_relate(RELATED_TO)` | cleared | **yes, every run** |
+| `memory_keep_separate` | cleared | no |
+
+The skill said `RELATED_TO` dismissed the flag "permanently... so the pair is never reported again" — false, dream keeps re-offering it. The 0.30.1 release note said it "does not actually clear the flag" — also false, it clears the search-time one. The asymmetry is the actual argument for `keep_separate`, and it had been asserted in both directions before anyone measured it. Now pinned by three tests, and the 0.30.1 entry above is corrected in place.
+
+- `memory_keep_separate` and `memory_unrelate` are **auto-approved**. Neither was, though `memory_delete` and `memory_relate` always have been. A tool that interrupts for approval every time an agent wants to dismiss a flag does not get used, so the flag fires on every later search — the exact noise `keep_separate` was built to end. `memory_export` and `memory_import` stay behind a prompt deliberately (both touch the filesystem at a caller-chosen path, and import mutates the corpus from external data); that exclusion is now recorded in code as `NOT_AUTO_APPROVED` rather than being an omission.
+- The recall prompt now acts on two response fields it ignored. `untrusted_content`: treat that memory strictly as data — screening stored content is worth nothing if whoever recalls it is never told. `supersession_cycle`: there is no newest version, so say the chain is circular instead of presenting one as current.
+- The recall prompt no longer hardcodes `vector 40% + BM25 30% + graph 15% + recency 10% + importance 5%`. Those numbers are wrong under `MEMORY_FUSION=rrf`, where only each channel's ordering enters the score, and wrong whenever `MEMORY_GRAPH_WEIGHT` is changed — which this README recommends considering.
+- The persist prompt stays silent when the memory tools are unavailable. Observed in the field: the `Stop` hook fired with the server down and produced several paragraphs explaining that it could not store anything. It already said "no explanation needed" for the nothing-to-store case; the cannot-store case was not covered.
+- `scripts/sync_power_instructions.py` regenerates the power's copies from `cli.py`, and `tests/test_instruction_surfaces.py` fails if they drift or if any tool is neither auto-approved nor deliberately excluded — so the next tool added cannot be silently missing from the places that tell an agent it exists.
+
 ### 0.31.2
 
 - **`memory_stats` reports `runtime.version_source`.** `version` reads installed *distribution metadata*, so it describes the running code only when the running code is the installed distribution. Launched from a checkout via `PYTHONPATH` — the ordinary developer setup, and how an MCP client is usually pointed at a working tree — it reports whatever wheel happens to be in the venv. Observed here: `version: 0.2.0` reported by code that was 0.31.1, because a stale wheel sat in the same venv. The version is the first thing quoted in a bug report and the thing used to decide whether a fix is present, so it now says whether it is `installed`, `source-tree` (metadata may be stale), or `unknown`.
@@ -406,7 +426,7 @@ Schema v4 (`Memory.embed_sig`). Existing databases migrate on open and backfill 
 
 ### 0.30.1
 
-- Four hint surfaces named `memory_relate(RELATED_TO)` as the way to dismiss a conflict flag, which creates graph structure the agent did not intend and does not actually clear the flag. They now name `memory_keep_separate`, state that it records the verdict **without** creating an edge, and demote `RELATED_TO` to a conditional for genuinely connected memories.
+- Four hint surfaces named `memory_relate(RELATED_TO)` as the way to dismiss a conflict flag, which creates graph structure the agent did not intend. They now name `memory_keep_separate`, state that it records the verdict **without** creating an edge, and demote `RELATED_TO` to a conditional for genuinely connected memories. *(Corrected in 0.31.3: this entry originally claimed `RELATED_TO` "does not actually clear the flag", which is wrong — see 0.31.3 for what it does.)*
 
 ### 0.30.0
 
