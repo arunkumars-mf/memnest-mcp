@@ -33,11 +33,18 @@ SCORES_PATH = RESULTS_DIR / "scores.json"
 sys.path.insert(0, str(ROOT))
 
 
+# LOCOMO category codes. Verified against the dataset itself rather than assumed:
+# cat 1 carries 3.13 evidence items on average (98% have >1) — multi-hop;
+# cat 4 carries 1.07 (5% have >1) and is the largest category at 841/1986 — single-hop;
+# cat 3 is the smallest (96) and its questions require world knowledge and
+# commonsense inference ("Would Caroline likely have Dr. Seuss books?") — open-domain.
+# Codes 1, 3 and 4 were previously mislabelled here, which permuted three of the
+# five rows in every published per-category scorecard.
 CATEGORY_NAMES = {
-    1: "single_hop",
+    1: "multi_hop",
     2: "temporal",
-    3: "multi_hop",
-    4: "open_domain",
+    3: "open_domain",
+    4: "single_hop",
     5: "adversarial",
 }
 

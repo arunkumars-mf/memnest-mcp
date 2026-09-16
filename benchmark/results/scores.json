@@ -1,34 +1,34 @@
 {
   "by_category": {
     "temporal": {
-      "correct": 31,
+      "correct": 34,
       "total": 37,
-      "score_pct": 83.78
+      "score_pct": 91.89
     },
-    "multi_hop": {
+    "open_domain": {
       "correct": 11,
       "total": 13,
       "score_pct": 84.62
     },
-    "single_hop": {
+    "multi_hop": {
       "correct": 23,
       "total": 32,
       "score_pct": 71.88
     },
-    "open_domain": {
-      "correct": 58,
+    "single_hop": {
+      "correct": 63,
       "total": 70,
-      "score_pct": 82.86
+      "score_pct": 90.0
     },
     "adversarial": {
-      "correct": 38,
+      "correct": 39,
       "total": 47,
-      "score_pct": 80.85
+      "score_pct": 82.98
     }
   },
   "overall": {
-    "correct": 161,
+    "correct": 170,
     "total": 199,
-    "score_pct": 80.9
+    "score_pct": 85.43
   }
 }

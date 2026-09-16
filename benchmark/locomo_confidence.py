@@ -17,7 +17,7 @@ from memnest_mcp import server as S
 qa = json.load(open(
     "/Users/arunkse/test/ladybug-memory-mcp/benchmark/data/locomo10.json"))[0]["qa"]
 
-# category 5 = adversarial (unanswerable); category 1 = single_hop (answerable)
+# category 5 = adversarial (unanswerable); category 1 = multi_hop (answerable)
 unanswerable = [q["question"] for q in qa if q.get("category") == 5][:40]
 answerable = [q["question"] for q in qa if q.get("category") == 1][:40]
 
